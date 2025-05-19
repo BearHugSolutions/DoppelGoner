@@ -1,13 +1,19 @@
-// src/matching/url.rs (Optimized)
+// src/matching/url.rs
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use futures::future::try_join_all;
+use futures::future::{self, try_join_all};
 use log::{debug, error, info, trace, warn};
-use std::collections::{HashMap, HashSet};
+use lru::LruCache;
+use num_cpus;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZero;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::Mutex;
-use url::Url as StdUrl; // Renamed to avoid conflict
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::time::sleep;
+use url::Url as StdUrl;
 use uuid::Uuid;
 
 use crate::config;
@@ -20,429 +26,160 @@ use crate::reinforcement::{self, MatchingOrchestrator};
 use crate::results::{AnyMatchResult, MatchMethodStats, UrlMatchResult};
 use serde_json;
 
-// SQL query for inserting into entity_group
+// Confidence score tiers (unchanged)
+const CONFIDENCE_DOMAIN_ONLY: f64 = 0.70;
+const CONFIDENCE_DOMAIN_PLUS_ONE_SLUG: f64 = 0.80;
+const CONFIDENCE_DOMAIN_PLUS_TWO_SLUGS: f64 = 0.88;
+const CONFIDENCE_DOMAIN_PLUS_THREE_OR_MORE_SLUGS: f64 = 0.92;
+const CONFIDENCE_DOMAIN_FULL_PATH_MATCH: f64 = 0.96;
+
+// Batch parameters - adjusted for better performance
+const LARGE_DOMAIN_BATCH_SIZE: usize = 50;
+const MEDIUM_DOMAIN_BATCH_SIZE: usize = 100;
+const SMALL_DOMAIN_BATCH_SIZE: usize = 200;
+const MAX_PAIRS_TO_PROCESS: usize = 10000;
+
+// Parallelization settings
+const DEFAULT_CONCURRENT_DOMAINS: usize = 8; // Default to 8 concurrent domains, can be overridden
+const FEATURE_CACHE_SIZE: usize = 10000;  // LRU cache size for feature vectors
+
+// Domain size categories
+const LARGE_DOMAIN_THRESHOLD: usize = 100;
+const MEDIUM_DOMAIN_THRESHOLD: usize = 20;
+
+// Geospatial filter settings - Only consider entities within this distance
+const MAX_LOCATION_DISTANCE_METERS: f64 = 2000.0; // 2km
+
+// High-volume domains that require special handling (unchanged)
+const HIGH_VOLUME_DOMAINS: [&str; 10] = [
+    "kingcounty.gov",
+    "seamar.org",
+    "ccsww.org",
+    "providence.org",
+    "plannedparenthood.org",
+    "seattle.gov",
+    "vmfh.org",
+    "uwmedicine.org",
+    "extension.wsu.edu", 
+    "neighborcare.org",
+];
+
+// Domain types that should use location-aware matching (unchanged)
+const LOCATION_SENSITIVE_DOMAINS: [&str; 5] = [
+    ".gov", ".org", ".edu", ".us", ".net"
+];
+
+// SQL query for inserting into entity_group (unchanged)
 const INSERT_ENTITY_GROUP_SQL: &str = "
     INSERT INTO public.entity_group
 (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, 
  pre_rl_confidence_score)
-VALUES ($1, $2, $3, $4, $5, $6, $7)";
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING";
 
-// Confidence score tiers for URL matching
-const CONFIDENCE_DOMAIN_ONLY: f64 = 0.70; // Base match on just the domain
-const CONFIDENCE_DOMAIN_PLUS_ONE_SLUG: f64 = 0.80;
-const CONFIDENCE_DOMAIN_PLUS_TWO_SLUGS: f64 = 0.88;
-const CONFIDENCE_DOMAIN_PLUS_THREE_OR_MORE_SLUGS: f64 = 0.92; // For 3 or more matching slugs but not full path
-const CONFIDENCE_DOMAIN_FULL_PATH_MATCH: f64 = 0.96; // Domain and full path match
+// SQL for creating the domain processing status table
+const CREATE_DOMAIN_STATUS_TABLE_SQL: &str = "
+CREATE TABLE IF NOT EXISTS clustering_metadata.domain_processing_status (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    domain TEXT NOT NULL,
+    pipeline_run_id TEXT NOT NULL,
+    status TEXT NOT NULL, -- 'pending', 'in_progress', 'completed', 'error'
+    total_entities INTEGER NOT NULL,
+    processed_entity_pairs INTEGER NOT NULL DEFAULT 0,
+    last_processed_entity_id TEXT,
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT,
+    UNIQUE (domain, pipeline_run_id)
+);
 
-// Batch size for database operations
-const BATCH_INSERT_SIZE: usize = 100;
+CREATE INDEX IF NOT EXISTS idx_domain_processing_pipeline_run
+ON clustering_metadata.domain_processing_status(pipeline_run_id);
+";
 
-// Minimum confidence needed for RL feature extraction
-const MIN_CONFIDENCE_FOR_RL: f64 = 0.65;
-
-// Struct to hold the data needed for inserting an entity group
-struct EntityGroupInsertData {
-    entity_id_1: EntityId,
-    entity_id_2: EntityId,
-    match_values: MatchValues,
-    confidence_score: f64,
-    pre_rl_confidence_score: f64,
-}
-
-// Struct to hold normalized URL data from cache
+// Cached data for URL normalization (unchanged)
 #[derive(Clone)]
 struct NormalizedUrlData {
     domain: String,
     path_slugs: Vec<String>,
     original_url: String,
+    domain_type: DomainType,
 }
 
-// Optimized batch insert function for entity groups
-async fn batch_insert_entity_groups(
-    pool: &PgPool,
-    entity_groups: Vec<EntityGroupInsertData>,
-) -> Result<Vec<EntityGroupId>> {
-    if entity_groups.is_empty() {
-        return Ok(Vec::new());
-    }
+// Domain categorization for specialized handling (unchanged)
+#[derive(Clone, PartialEq, Debug)]
+enum DomainType {
+    Government,
+    Healthcare,
+    Education,
+    Commercial,
+    Social,
+    Other,
+}
 
-    let mut conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection from pool for URL batch insert")?;
+// Structure to hold entity information for processing (unchanged)
+#[derive(Clone)]
+struct EntityUrlInfo {
+    entity_id: EntityId,
+    original_url: String,
+    normalized_data: NormalizedUrlData,
+    entity_name: Option<String>,
+    has_location_data: bool,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
 
-    let tx = conn
-        .transaction()
-        .await
-        .context("Failed to start transaction for URL entity_group batch insert")?;
+// Structure for locationless URL matching (unchanged)
+struct DomainEntityMap<'a> {
+    domain: String,
+    entity_urls: Vec<&'a EntityUrlInfo>,
+}
 
-    let mut entity_group_ids = Vec::with_capacity(entity_groups.len());
-    let mut successful_inserts = 0;
+// NEW: Structure for domain processing status
+#[derive(Debug, Clone)]
+struct DomainProcessingStatus {
+    domain: String,
+    status: String,
+    total_entities: usize,
+    processed_entity_pairs: usize,
+    last_processed_entity_id: Option<String>,
+}
 
-    for group_data in &entity_groups {
-        let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
-        entity_group_ids.push(new_entity_group_id.clone());
+// NEW: Helper structure for spatial binning
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct SpatialBin {
+    x: i32,
+    y: i32,
+}
 
-        let match_values_json = serde_json::to_value(&group_data.match_values)
-            .context("Failed to serialize match_values for URL insert")?;
+// NEW: Task item for domain worker queue
+struct DomainTask {
+    domain: String,
+    entities: Vec<EntityUrlInfo>,
+    domain_size_category: String, // "large", "medium", "small"
+    status_id: String,
+}
 
-        match tx
-            .execute(
-                INSERT_ENTITY_GROUP_SQL,
-                &[
-                    &new_entity_group_id.0,
-                    &group_data.entity_id_1.0,
-                    &group_data.entity_id_2.0,
-                    &MatchMethodType::Url.as_str(),
-                    &match_values_json,
-                    &group_data.confidence_score,
-                    &group_data.pre_rl_confidence_score,
-                ],
-            )
-            .await
-        {
-            Ok(_) => {
-                successful_inserts += 1;
-            }
-            Err(e) => {
-                // Log error but continue with other inserts
-                if let Some(db_err) = e.as_db_error() {
-                    if db_err.constraint() == Some("uq_entity_pair_method") {
-                        debug!(
-                            "URL pair ({}, {}) already exists (constraint violation).",
-                            group_data.entity_id_1.0, group_data.entity_id_2.0
-                        );
-                    } else {
-                        warn!(
-                            "DB error inserting URL entity_group for pair ({}, {}): {:?}",
-                            group_data.entity_id_1.0, group_data.entity_id_2.0, db_err
-                        );
-                    }
-                } else {
-                    warn!(
-                        "Error inserting URL entity_group for pair ({}, {}): {}",
-                        group_data.entity_id_1.0, group_data.entity_id_2.0, e
-                    );
-                }
-                // Remove this failed ID from the list
-                entity_group_ids.pop();
-            }
-        }
-    }
-
-    match tx.commit().await {
-        Ok(_) => {
-            debug!(
-                "Successfully inserted {} out of {} URL entity groups",
-                successful_inserts,
-                entity_groups.len()
-            );
-            Ok(entity_group_ids)
-        }
-        Err(e) => {
-            error!(
-                "Failed to commit transaction for URL entity_group batch insert: {}",
-                e
-            );
-            Err(anyhow!(e))
+impl DomainTask {
+    fn get_batch_size(&self) -> usize {
+        match self.domain_size_category.as_str() {
+            "large" => LARGE_DOMAIN_BATCH_SIZE,
+            "medium" => MEDIUM_DOMAIN_BATCH_SIZE,
+            _ => SMALL_DOMAIN_BATCH_SIZE,
         }
     }
 }
 
-/// Optimized list of common social media and URL shortening domains to ignore.
-fn is_ignored_domain(domain: &str) -> bool {
-    // Convert to a HashSet for O(1) lookups instead of iterating through array
-    static IGNORED_DOMAINS: [&str; 52] = [
-        "facebook.com",
-        "fb.com",
-        "messenger.com",
-        "twitter.com",
-        "x.com",
-        "instagram.com",
-        "threads.net",
-        "linkedin.com",
-        "youtube.com",
-        "youtu.be",
-        "tiktok.com",
-        "bit.ly",
-        "t.co",
-        "goo.gl",
-        "tinyurl.com",
-        "ow.ly",
-        "shorturl.at",
-        "buff.ly",
-        "rebrand.ly",
-        "cutt.ly",
-        "tiny.cc",
-        "medium.com",
-        "wordpress.com",
-        "blogger.com",
-        "tumblr.com",
-        "pinterest.com",
-        "reddit.com",
-        "snapchat.com",
-        "whatsapp.com",
-        "telegram.org",
-        "discord.com",
-        "discord.gg",
-        "twitch.tv",
-        "googleusercontent.com",
-        "forms.gle",
-        "docs.google.com",
-        "drive.google.com",
-        "sites.google.com",
-        "blogspot.com",
-        "wordpress.org",
-        "wix.com",
-        "weebly.com",
-        "squarespace.com",
-        "godaddysites.com",
-        "jimdofree.com",
-        "eventbrite.com",
-        "meetup.com",
-        "zoom.us",
-        "linktr.ee",
-        "calendly.com",
-        "github.io",
-        "gitlab.io",
-    ];
-
-    // Fast check for exact match
-    if IGNORED_DOMAINS.contains(&domain) {
-        return true;
-    }
-
-    // Check for subdomains only if not an exact match
-    for &ignored in &IGNORED_DOMAINS {
-        if domain.ends_with(&format!(".{}", ignored)) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Normalize a URL, extract the domain and path slugs - optimized version.
-/// Returns Option<NormalizedUrlData>
-fn normalize_url_with_slugs(url_str: &str) -> Option<NormalizedUrlData> {
-    let trimmed_url = url_str.trim();
-    if trimmed_url.is_empty()
-        || trimmed_url.starts_with("mailto:")
-        || trimmed_url.starts_with("tel:")
-        || trimmed_url.starts_with("ftp:")
-    {
-        return None;
-    }
-
-    // Fast path for common URL patterns
-    if let Some(domain_and_path) = fast_parse_url(trimmed_url) {
-        return Some(domain_and_path);
-    }
-
-    // Fall back to full parsing for complex URLs
-    let url_with_scheme = if !trimmed_url.contains("://") {
-        format!("https://{}", trimmed_url)
-    } else {
-        trimmed_url.to_string()
-    };
-
-    match StdUrl::parse(&url_with_scheme) {
-        Ok(parsed_url) => {
-            let domain_opt = parsed_url.host_str().and_then(|host| {
-                let host_lower = host.to_lowercase();
-                let domain_candidate = host_lower.trim_start_matches("www.").to_string();
-                if domain_candidate.is_empty()
-                    || !domain_candidate.contains('.')
-                    || is_ip_address(&domain_candidate)
-                {
-                    None
-                } else {
-                    Some(domain_candidate)
-                }
-            });
-
-            domain_opt.map(|domain| {
-                let path_slugs: Vec<String> =
-                    parsed_url
-                        .path_segments()
-                        .map_or_else(Vec::new, |segments| {
-                            segments
-                                .filter(|s| !s.is_empty()) // Filter out empty segments
-                                .map(str::to_string)
-                                .collect()
-                        });
-                NormalizedUrlData {
-                    domain,
-                    path_slugs,
-                    original_url: url_str.to_string(),
-                }
-            })
-        }
-        Err(parse_err) => {
-            warn!(
-                "Failed to parse URL '{}' with scheme '{}' using 'url' crate: {}. Falling back to basic extraction for domain only.",
-                url_str, url_with_scheme, parse_err
-            );
-
-            // Simplified fallback for domain extraction
-            let without_scheme_or_auth = trimmed_url
-                .split("://")
-                .nth(1)
-                .unwrap_or(trimmed_url)
-                .split('@')
-                .nth(1)
-                .unwrap_or_else(|| trimmed_url.split("://").nth(1).unwrap_or(trimmed_url));
-
-            let domain_part = without_scheme_or_auth
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .split('?')
-                .next()
-                .unwrap_or("")
-                .split('#')
-                .next()
-                .unwrap_or("")
-                .split(':')
-                .next()
-                .unwrap_or("");
-
-            if domain_part.is_empty() || !domain_part.contains('.') || is_ip_address(domain_part) {
-                None
-            } else {
-                let normalized_domain = domain_part
-                    .to_lowercase()
-                    .trim_start_matches("www.")
-                    .to_string();
-                if normalized_domain.is_empty() {
-                    None
-                } else {
-                    // Fallback: no reliable slugs from this basic extraction
-                    Some(NormalizedUrlData {
-                        domain: normalized_domain,
-                        path_slugs: Vec::new(),
-                        original_url: url_str.to_string(),
-                    })
-                }
-            }
-        }
-    }
-}
-
-/// Fast URL parser for common cases to avoid using the url crate when possible
-fn fast_parse_url(url_str: &str) -> Option<NormalizedUrlData> {
-    // Handle http(s)://domain.com/path format efficiently
-    let url_parts: Vec<&str> = if url_str.contains("://") {
-        let parts: Vec<&str> = url_str.splitn(2, "://").collect();
-        if parts.len() < 2 {
-            return None;
-        }
-        parts[1].splitn(2, '/').collect()
-    } else {
-        // Handle domain.com/path format
-        url_str.splitn(2, '/').collect()
-    };
-
-    if url_parts.is_empty() {
-        return None;
-    }
-
-    // Extract domain
-    let mut domain = url_parts[0].to_lowercase();
-
-    // Handle potential auth part (user@domain)
-    if domain.contains('@') {
-        let auth_parts: Vec<&str> = domain.splitn(2, '@').collect();
-        if auth_parts.len() < 2 {
-            return None;
-        }
-        domain = auth_parts[1].to_string();
-    }
-
-    // Handle query parameters
-    if domain.contains('?') {
-        domain = domain.splitn(2, '?').next().unwrap_or("").to_string();
-    }
-
-    // Handle fragments
-    if domain.contains('#') {
-        domain = domain.splitn(2, '#').next().unwrap_or("").to_string();
-    }
-
-    // Handle port
-    if domain.contains(':') {
-        domain = domain.splitn(2, ':').next().unwrap_or("").to_string();
-    }
-
-    // Remove www prefix
-    domain = domain.trim_start_matches("www.").to_string();
-
-    // Basic validation
-    if domain.is_empty() || !domain.contains('.') || is_ip_address(&domain) {
-        return None;
-    }
-
-    // Extract path slugs if present
-    let mut path_slugs = Vec::new();
-    if url_parts.len() > 1 && !url_parts[1].is_empty() {
-        let path = url_parts[1];
-
-        // Handle query parameters and fragments in path
-        let clean_path = if path.contains('?') {
-            path.splitn(2, '?').next().unwrap_or("")
-        } else if path.contains('#') {
-            path.splitn(2, '#').next().unwrap_or("")
-        } else {
-            path
-        };
-
-        // Split path into segments
-        path_slugs = clean_path
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-    }
-
-    Some(NormalizedUrlData {
-        domain,
-        path_slugs,
-        original_url: url_str.to_string(),
-    })
-}
-
-/// Helper to check if a string looks like an IP address - optimized
-fn is_ip_address(domain: &str) -> bool {
-    // Fast path for IPv4 check
-    let parts: Vec<&str> = domain.split('.').collect();
-    if parts.len() == 4 && parts.iter().all(|&p| p.parse::<u8>().is_ok()) {
-        if let Ok(ip) = domain.parse::<std::net::Ipv4Addr>() {
-            return !ip.is_loopback()
-                && !ip.is_private()
-                && !ip.is_link_local()
-                && !ip.is_broadcast()
-                && !ip.is_documentation()
-                && !ip.is_unspecified();
-        }
-    }
-
-    // Check for IPv6 (simplified)
-    if domain.contains(':') {
-        if let Ok(ip) = domain.parse::<std::net::Ipv6Addr>() {
-            return !ip.is_loopback() && !ip.is_unspecified() && !(ip.segments()[0] == 0xfe80);
-        }
-    }
-
-    false
-}
-
+// Main entry point for URL matching (significantly refactored)
 pub async fn find_matches(
     pool: &PgPool,
-    reinforcement_orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+    reinforcement_orchestrator: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
 ) -> Result<AnyMatchResult> {
+    let start_time = Instant::now();
     info!(
-        "Starting optimized pairwise URL matching with slug-based confidence (run ID: {}){}...",
+        "Starting optimized URL matching (run ID: {}){}...",
         pipeline_run_id,
         if reinforcement_orchestrator.is_some() {
             " with ML guidance"
@@ -450,462 +187,1525 @@ pub async fn find_matches(
             ""
         }
     );
-    let start_time = Instant::now();
 
-    let mut conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection for URL matching")?;
+    // Ensure domain processing status table exists
+    ensure_domain_status_table_exists(pool).await?;
 
-    debug!("Fetching existing URL-matched pairs...");
-    let existing_pairs_query = "
-        SELECT entity_id_1, entity_id_2
-        FROM public.entity_group
-        WHERE method_type = $1";
-    let existing_pair_rows = conn
-        .query(existing_pairs_query, &[&MatchMethodType::Url.as_str()])
-        .await
-        .context("Failed to query existing URL-matched pairs")?;
-
-    let mut existing_processed_pairs: HashSet<(String, String)> = HashSet::new();
-    for row in existing_pair_rows {
-        let id1: String = row.get("entity_id_1");
-        let id2: String = row.get("entity_id_2");
-        if id1 < id2 {
-            existing_processed_pairs.insert((id1, id2));
-        } else {
-            existing_processed_pairs.insert((id2, id1));
-        }
-    }
+    // Step 1: Fetch existing pairs to avoid reprocessing
+    let existing_processed_pairs = fetch_existing_pairs(pool).await?;
     info!(
-        "Found {} existing URL-matched pairs.",
+        "URL: Found {} existing URL-matched pairs to skip.",
         existing_processed_pairs.len()
     );
 
-    // Optimize the query by adding an index if needed
-    let url_query = "
-        SELECT 'organization' as source_table, e.id as entity_id, o.url
-        FROM public.entity e
-        JOIN public.organization o ON e.organization_id = o.id
-        WHERE o.url IS NOT NULL AND o.url != '' AND o.url !~ '^\\s*$'
-        UNION ALL
-        SELECT 'service' as source_table, e.id as entity_id, s.url
-        FROM public.entity e
-        JOIN public.entity_feature ef ON e.id = ef.entity_id
-        JOIN public.service s ON ef.table_id = s.id AND ef.table_name = 'service'
-        WHERE s.url IS NOT NULL AND s.url != '' AND s.url !~ '^\\s*$'
-    ";
-    debug!("Executing URL query for all entities...");
-    let url_rows = conn
-        .query(url_query, &[])
-        .await
-        .context("Failed to query entities with URLs")?;
-    info!("Found {} URL records across all entities.", url_rows.len());
-
-    // Create a cache for normalized URLs to avoid redundant normalizations
-    type UrlCache = HashMap<String, Option<NormalizedUrlData>>;
-    let mut url_cache: UrlCache = HashMap::with_capacity(url_rows.len());
-
-    // Map: normalized_domain -> {entity_id -> (url_cache_key)}
-    // This reduces memory by storing references to the cache instead of full URLs
-    let mut domain_map: HashMap<String, HashMap<EntityId, String>> = HashMap::new();
-    let mut ignored_urls_count = 0;
-    let mut normalization_failures = 0;
-
-    // Pre-process all URLs in one pass
-    for row in &url_rows {
-        let entity_id = EntityId(row.get("entity_id"));
-        let url_str: String = row.get("url");
-
-        // Check cache first to avoid redundant normalization
-        let normalized_data = if let Some(cached) = url_cache.get(&url_str) {
-            cached.clone()
-        } else {
-            let result = normalize_url_with_slugs(&url_str);
-            url_cache.insert(url_str.clone(), result.clone());
-            result
-        };
-
-        if let Some(url_data) = normalized_data {
-            if is_ignored_domain(&url_data.domain) {
-                trace!(
-                    "Ignoring URL '{}' (domain: '{}') for entity {}",
-                    url_data.original_url,
-                    url_data.domain,
-                    entity_id.0
-                );
-                ignored_urls_count += 1;
-                continue;
-            }
-
-            // Store reference to url_cache instead of duplicating data
-            domain_map
-                .entry(url_data.domain.clone())
-                .or_default()
-                .insert(entity_id, url_str);
-        } else {
-            trace!(
-                "Could not normalize URL '{}' for entity {}",
-                url_str,
-                entity_id.0
-            );
-            normalization_failures += 1;
-        }
-    }
-
+    // Step 2: Fetch entity info with URLs and location data
+    let entities_with_urls = fetch_entities_with_urls_and_locations(pool).await?;
     info!(
-        "Processed {} unique, non-ignored normalized domains. Ignored {} URLs. {} URLs failed normalization.",
-        domain_map.len(),
-        ignored_urls_count,
-        normalization_failures
+        "URL: Found {} entities with URLs for processing.",
+        entities_with_urls.len()
     );
 
-    debug!("Starting pairwise URL matching with optimized batch processing.");
-    let now = Utc::now().naive_utc();
-    let mut new_pairs_created_count = 0;
-    let mut entities_in_new_pairs: HashSet<EntityId> = HashSet::new();
-    let mut confidence_scores_for_stats: Vec<f64> = Vec::new();
+    // Create domain statistics for logging
+    let mut domain_stats: HashMap<String, usize> = HashMap::new();
+    for entity in &entities_with_urls {
+        *domain_stats.entry(entity.normalized_data.domain.clone()).or_insert(0) += 1;
+    }
+    
+    // Log top domains for monitoring
+    let mut domain_count_vec: Vec<_> = domain_stats.iter().collect();
+    domain_count_vec.sort_by(|a, b| b.1.cmp(a.1));
+    info!("URL: Top 10 domains by entity count:");
+    for (idx, (domain, count)) in domain_count_vec.iter().take(10).enumerate() {
+        info!("URL: #{}: {} - {} entities", idx + 1, domain, count);
+    }
 
-    // Structure to collect entity groups to insert in batches
-    let mut entity_groups_to_insert: Vec<EntityGroupInsertData> =
-        Vec::with_capacity(BATCH_INSERT_SIZE);
-    let mut suggestions_to_create: Vec<NewSuggestedAction> = Vec::with_capacity(BATCH_INSERT_SIZE);
-
-    // Process each domain in parallel using a work pool
-    let num_domains = domain_map.len();
-    let mut domain_count = 0;
-
-    // For parallelism, we could split domains into chunks and process in parallel
-    // But for simplicity in this example, we'll process serially - replace with parallel version if needed
-    for (normalized_shared_domain, current_entity_map) in domain_map {
-        domain_count += 1;
-        if domain_count % 100 == 0 || domain_count == num_domains {
-            info!(
-                "URL matching progress: {}/{} domains processed",
-                domain_count, num_domains
-            );
-        }
-
-        if current_entity_map.len() < 2 {
+    // NEW: Create domain tasks and update status
+    let domain_entities_map = group_entities_by_domain(&entities_with_urls);
+    
+    // Initialize task queues for different domain sizes
+    let large_domain_queue = Arc::new(Mutex::new(VecDeque::new()));
+    let medium_domain_queue = Arc::new(Mutex::new(VecDeque::new()));
+    let small_domain_queue = Arc::new(Mutex::new(VecDeque::new()));
+    
+    // Create a global state for tracking progress
+    let completed_domains = Arc::new(AtomicUsize::new(0));
+    let total_domains = domain_entities_map.len();
+    let new_pairs = Arc::new(Mutex::new(Vec::new()));
+    let entities_in_new_pairs = Arc::new(Mutex::new(HashSet::new()));
+    let confidence_scores = Arc::new(Mutex::new(Vec::new()));
+    
+    // NEW: Check for domains that have already been processed in this run
+    let processed_domains = fetch_processed_domains(pool, pipeline_run_id).await?;
+    info!("URL: Found {} domains already processed in this run", processed_domains.len());
+    
+    // Create tasks for unprocessed domains
+    for (domain, entities) in domain_entities_map {
+        if processed_domains.contains(&domain) {
+            info!("URL: Skipping already processed domain: {}", domain);
             continue;
         }
+        
+        if entities.len() < 2 {
+            continue; // Skip domains with only one entity
+        }
+        
+        // Insert domain status
+        let status_id = insert_domain_status(
+            pool, 
+            &domain, 
+            pipeline_run_id, 
+            entities.len()
+        ).await?;
+        
+        // Calculate domain size category before moving entities
+        let entities_len = entities.len();
+        let domain_size_category = if entities_len > LARGE_DOMAIN_THRESHOLD {
+            "large".to_string()
+        } else if entities_len > MEDIUM_DOMAIN_THRESHOLD {
+            "medium".to_string()
+        } else {
+            "small".to_string()
+        };
 
-        let entities_sharing_domain: Vec<_> = current_entity_map.iter().collect();
-
-        for i in 0..entities_sharing_domain.len() {
-            for j in (i + 1)..entities_sharing_domain.len() {
-                let (entity_id1, url_key1) = entities_sharing_domain[i];
-                let (entity_id2, url_key2) = entities_sharing_domain[j];
-
-                // Ensure consistent ordering for checking existing pairs
-                let (e1_id, e1_url_key, e2_id, e2_url_key) = if entity_id1.0 < entity_id2.0 {
-                    (entity_id1, url_key1, entity_id2, url_key2)
-                } else {
-                    (entity_id2, url_key2, entity_id1, url_key1)
-                };
-
-                // Check if this pair already exists using optimized lookup
-                if existing_processed_pairs.contains(&(e1_id.0.clone(), e2_id.0.clone())) {
-                    debug!(
-                        "Pair ({}, {}) already processed by URL method. Skipping.",
-                        e1_id.0, e2_id.0
-                    );
-                    continue;
-                }
-
-                if e1_id == e2_id {
-                    continue;
-                }
-
-                // Get the normalized URL data from cache
-                let url_data1 = url_cache.get(e1_url_key).unwrap().as_ref().unwrap();
-                let url_data2 = url_cache.get(e2_url_key).unwrap().as_ref().unwrap();
-
-                // Calculate matching slug count
-                let mut matching_slug_count = 0;
-                let min_slugs_len = url_data1.path_slugs.len().min(url_data2.path_slugs.len());
-                for k in 0..min_slugs_len {
-                    if url_data1.path_slugs[k] == url_data2.path_slugs[k] {
-                        matching_slug_count += 1;
-                    } else {
-                        break; // Slugs must match from the beginning of the path
-                    }
-                }
-
-                let is_full_path_match = matching_slug_count == url_data1.path_slugs.len()
-                    && matching_slug_count == url_data2.path_slugs.len()
-                    && !url_data1.path_slugs.is_empty(); // Ensure there's at least one slug for full path match
-
-                // Determine confidence score based on slug match depth
-                let mut base_confidence_score = if is_full_path_match {
-                    CONFIDENCE_DOMAIN_FULL_PATH_MATCH
-                } else {
-                    match matching_slug_count {
-                        0 => CONFIDENCE_DOMAIN_ONLY,
-                        1 => CONFIDENCE_DOMAIN_PLUS_ONE_SLUG,
-                        2 => CONFIDENCE_DOMAIN_PLUS_TWO_SLUGS,
-                        _ => CONFIDENCE_DOMAIN_PLUS_THREE_OR_MORE_SLUGS, // 3 or more
-                    }
-                };
-
-                // If one path is empty and the other is not, it's a domain-only match
-                // If both paths are empty, it's a full path match of an empty path
-                if url_data1.path_slugs.is_empty() && url_data2.path_slugs.is_empty() {
-                    base_confidence_score = CONFIDENCE_DOMAIN_FULL_PATH_MATCH; // Both are root, strong match
-                } else if (url_data1.path_slugs.is_empty() != url_data2.path_slugs.is_empty())
-                    && matching_slug_count == 0
-                {
-                    base_confidence_score = CONFIDENCE_DOMAIN_ONLY;
-                }
-
-                // Initialize confidence score and pre_rl confidence
-                let mut final_confidence_score = base_confidence_score;
-                let pre_rl_confidence = base_confidence_score;
-
-                // Only perform RL feature extraction for high enough confidence scores
-                if base_confidence_score >= MIN_CONFIDENCE_FOR_RL
-                    && reinforcement_orchestrator.is_some()
-                {
-                    // Extract features and apply RL tuning
-                    let features_for_rl = match MatchingOrchestrator::extract_pair_context_features(
-                        pool, e1_id, e2_id,
-                    )
-                    .await
-                    {
-                        Ok(f) => Some(f),
-                        Err(e) => {
-                            warn!("Failed to extract context features for pair ({}, {}): {}. Proceeding without RL tuning.", 
-                                e1_id.0, e2_id.0, e);
-                            None
-                        }
-                    };
-
-                    // Apply RL tuning if features are available
-                    if let (Some(orch_arc), Some(ref extracted_features)) = (
-                        reinforcement_orchestrator.as_ref(),
-                        features_for_rl.as_ref(),
-                    ) {
-                        if !extracted_features.is_empty() {
-                            // Lock orchestrator for minimal time
-                            let orchestrator_guard = orch_arc.lock().await;
-                            match orchestrator_guard.get_tuned_confidence(
-                                &MatchMethodType::Url,
-                                pre_rl_confidence,
-                                extracted_features,
-                            ) {
-                                Ok(tuned_score) => {
-                                    final_confidence_score = tuned_score;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to get tuned confidence for pair ({}, {}): {}. Using pre-RL score.", 
-                                        e1_id.0, e2_id.0, e);
-                                }
-                            }
-                            // Release orchestrator lock immediately
-                            drop(orchestrator_guard);
-                        }
-                    }
-                }
-
-                // Create match values
-                let match_values = MatchValues::Url(UrlMatchValue {
-                    original_url1: url_data1.original_url.clone(),
-                    original_url2: url_data2.original_url.clone(),
-                    normalized_shared_domain: normalized_shared_domain.clone(),
-                    matching_slug_count,
-                });
-
-                // Add to entity groups batch
-                entity_groups_to_insert.push(EntityGroupInsertData {
-                    entity_id_1: e1_id.clone(),
-                    entity_id_2: e2_id.clone(),
-                    match_values,
-                    confidence_score: final_confidence_score,
-                    pre_rl_confidence_score: pre_rl_confidence,
-                });
-
-                // Create suggestion for low confidence matches
-                if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-                    let priority =
-                        if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
-                            2 // High priority for critical
-                        } else {
-                            1 // Medium priority for moderate
-                        };
-
-                    let details_json = serde_json::json!({
-                        "method_type": MatchMethodType::Url.as_str(),
-                        "matched_value": &normalized_shared_domain,
-                        "original_url1": url_data1.original_url,
-                        "original_url2": url_data2.original_url,
-                        "matching_slug_count": matching_slug_count,
-                        "entity_group_id": "pending", // Will be filled in after insert
-                        "rule_based_confidence": base_confidence_score,
-                        "final_confidence": final_confidence_score,
-                    });
-
-                    let reason_message = format!(
-                        "Pair ({}, {}) matched by URL with confidence {:.4} ({} matching slugs).",
-                        e1_id.0, e2_id.0, final_confidence_score, matching_slug_count
-                    );
-
-                    suggestions_to_create.push(NewSuggestedAction {
-                        pipeline_run_id: Some(pipeline_run_id.to_string()),
-                        action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
-                        entity_id: None,
-                        group_id_1: None, // Will be filled in after entity group is created
-                        group_id_2: None,
-                        cluster_id: None,
-                        triggering_confidence: Some(final_confidence_score),
-                        details: Some(details_json),
-                        reason_code: Some("LOW_URL_MATCH_CONFIDENCE".to_string()),
-                        reason_message: Some(reason_message),
-                        priority,
-                        status: SuggestionStatus::PendingReview.as_str().to_string(),
-                        reviewer_id: None,
-                        reviewed_at: None,
-                        review_notes: None,
-                    });
-                }
-
-                // Process in batches
-                if entity_groups_to_insert.len() >= BATCH_INSERT_SIZE {
-                    // Batch insert entity groups
-                    let start_insert = Instant::now();
-                    match batch_insert_entity_groups(pool, entity_groups_to_insert).await {
-                        Ok(entity_group_ids) => {
-                            // Update statistics
-                            new_pairs_created_count += entity_group_ids.len();
-
-                            // Map suggestions to their entity groups
-                            let suggestion_len =
-                                suggestions_to_create.len().min(entity_group_ids.len());
-                            for i in 0..suggestion_len {
-                                if let Some(details) = &mut suggestions_to_create[i].details {
-                                    // Update the entity_group_id field in the details JSON
-                                    if let Some(obj) = details.as_object_mut() {
-                                        obj.insert(
-                                            "entity_group_id".to_string(),
-                                            serde_json::json!(entity_group_ids[i].0.clone()),
-                                        );
-                                    }
-                                }
-                                suggestions_to_create[i].group_id_1 =
-                                    Some(entity_group_ids[i].0.clone());
-                            }
-
-                            // Process suggestions in a separate batch
-                            // First get and store the connection
-                            let mut conn = pool.get().await?;
-                            // Then get the transaction from the connection
-                            let suggestions_tx = conn.transaction().await?;
-                            for suggestion in &suggestions_to_create {
-                                match db::insert_suggestion(&suggestions_tx, suggestion).await {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        warn!("Failed to insert suggestion: {}", e);
-                                    }
-                                }
-                            }
-                            suggestions_tx.commit().await?;
-
-                            // Log ML logging details when applicable
-                            // This would be a separate process after inserts
-                        }
-                        Err(e) => {
-                            error!("Failed to batch insert entity groups: {}", e);
-                        }
-                    }
-                    debug!("Batch processing took {:?}", start_insert.elapsed());
-
-                    // Reset batch collections
-                    entity_groups_to_insert = Vec::with_capacity(BATCH_INSERT_SIZE);
-                    suggestions_to_create = Vec::with_capacity(BATCH_INSERT_SIZE);
-                }
-            }
+        // Now create task with the pre-calculated category
+        let task = DomainTask {
+            domain: domain.clone(),
+            entities,
+            domain_size_category,
+            status_id,
+        };
+        
+        // Add to appropriate queue
+        if task.domain_size_category == "large" {
+            large_domain_queue.lock().await.push_back(task);
+        } else if task.domain_size_category == "medium" {
+            medium_domain_queue.lock().await.push_back(task);
+        } else {
+            small_domain_queue.lock().await.push_back(task);
         }
     }
-
-    // Process any remaining entity groups
-    if !entity_groups_to_insert.is_empty() {
-        match batch_insert_entity_groups(pool, entity_groups_to_insert).await {
-            Ok(entity_group_ids) => {
-                // Update statistics
-                new_pairs_created_count += entity_group_ids.len();
-
-                // Map suggestions to their entity groups
-                let suggestion_len = suggestions_to_create.len().min(entity_group_ids.len());
-                for i in 0..suggestion_len {
-                    if let Some(details) = &mut suggestions_to_create[i].details {
-                        // Update the entity_group_id field in the details JSON
-                        if let Some(obj) = details.as_object_mut() {
-                            obj.insert(
-                                "entity_group_id".to_string(),
-                                serde_json::json!(entity_group_ids[i].0.clone()),
-                            );
-                        }
-                    }
-                    suggestions_to_create[i].group_id_1 = Some(entity_group_ids[i].0.clone());
-                }
-
-                // Process suggestions in a separate batch
-                if !suggestions_to_create.is_empty() {
-                    // First get and store the connection
-                    let mut conn = pool.get().await?;
-                    // Then get the transaction from the connection
-                    let suggestions_tx = conn.transaction().await?;
-                    for suggestion in &suggestions_to_create {
-                        match db::insert_suggestion(&suggestions_tx, suggestion).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!("Failed to insert suggestion: {}", e);
-                            }
-                        }
-                    }
-                    suggestions_tx.commit().await?;
-                }
-            }
-            Err(e) => {
-                error!("Failed to batch insert remaining entity groups: {}", e);
-            }
+    
+    // Determine optimal concurrency based on system resources
+    let cpu_count = num_cpus::get();
+    let concurrent_domains = std::cmp::min(
+        DEFAULT_CONCURRENT_DOMAINS,
+        std::cmp::max(1, cpu_count - 2)
+    );
+    
+    // Create semaphores to limit concurrent domain processing
+    let large_domain_semaphore = Arc::new(Semaphore::new(1)); // Only process 1 large domain at a time
+    let medium_domain_semaphore = Arc::new(Semaphore::new(2)); // Process 2 medium domains concurrently
+    let small_domain_semaphore = Arc::new(Semaphore::new(concurrent_domains)); // Use remaining concurrency for small domains
+    
+    // Track domain workers
+    let mut domain_workers = Vec::new();
+    
+    // Create a shared feature cache - UPDATED to use tokio::sync::Mutex
+    let feature_cache = Arc::new(Mutex::new(LruCache::new(NonZero::new(FEATURE_CACHE_SIZE).unwrap())));
+    
+    // Process large domains
+    {
+        let large_queue = large_domain_queue.clone();
+        let semaphore = large_domain_semaphore.clone();
+        let pool_clone = pool.clone();
+        let rl_clone = reinforcement_orchestrator.clone();
+        let run_id = pipeline_run_id.to_string();
+        let completed = completed_domains.clone();
+        let pairs = new_pairs.clone();
+        let entities = entities_in_new_pairs.clone();
+        let scores = confidence_scores.clone();
+        let existing = existing_processed_pairs.clone();
+        let cache = feature_cache.clone();
+        
+let worker = tokio::spawn(async move {
+    process_domain_queue(
+        "large",
+        large_queue,
+        semaphore,
+        pool_clone,  // Pass owned PgPool (no &)
+        rl_clone,
+        run_id,      // Pass owned String (no &)
+        completed,
+        total_domains,
+        pairs,
+        entities,
+        scores,
+        existing,
+        cache,
+    ).await
+});
+        
+        domain_workers.push(worker);
+    }
+    
+    // Process medium domains
+    {
+        let medium_queue = medium_domain_queue.clone();
+        let semaphore = medium_domain_semaphore.clone();
+        let pool_clone = pool.clone();
+        let rl_clone = reinforcement_orchestrator.clone();
+        let run_id = pipeline_run_id.to_string();
+        let completed = completed_domains.clone();
+        let pairs = new_pairs.clone();
+        let entities = entities_in_new_pairs.clone();
+        let scores = confidence_scores.clone();
+        let existing = existing_processed_pairs.clone();
+        let cache = feature_cache.clone();
+        
+let worker = tokio::spawn(async move {
+    process_domain_queue(
+        "medium",
+        medium_queue,
+        semaphore,
+        pool_clone,  // Pass owned PgPool (no &)
+        rl_clone,
+        run_id,      // Pass owned String (no &)
+        completed,
+        total_domains,
+        pairs,
+        entities,
+        scores,
+        existing,
+        cache,
+    ).await
+});
+        
+        domain_workers.push(worker);
+    }
+    
+    // Process small domains
+    {
+        let small_queue = small_domain_queue.clone();
+        let semaphore = small_domain_semaphore.clone();
+        let pool_clone = pool.clone();
+        let rl_clone = reinforcement_orchestrator.clone();
+        let run_id = pipeline_run_id.to_string();
+        let completed = completed_domains.clone();
+        let pairs = new_pairs.clone();
+        let entities = entities_in_new_pairs.clone();
+        let scores = confidence_scores.clone();
+        let existing = existing_processed_pairs.clone();
+        let cache = feature_cache.clone();
+        
+let worker = tokio::spawn(async move {
+    process_domain_queue(
+        "small",
+        small_queue,
+        semaphore,
+        pool_clone,  // Pass owned PgPool (no &)
+        rl_clone,
+        run_id,      // Pass owned String (no &)
+        completed,
+        total_domains,
+        pairs,
+        entities,
+        scores,
+        existing,
+        cache,
+    ).await
+});
+        
+        domain_workers.push(worker);
+    }
+    
+    // Wait for all domain processing to complete
+    for worker in domain_workers {
+        if let Err(e) = worker.await {
+            warn!("URL: Domain worker failed: {}", e);
         }
     }
-
-    debug!("Finished processing URL pairs.");
-
-    // Calculate average confidence - would be populated during batch inserts in actual implementation
-    let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
-        confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
+    
+    // Calculate stats
+    let new_pairs = new_pairs.lock().await;
+    let entities_in_new_pairs = entities_in_new_pairs.lock().await;
+    let confidence_scores = confidence_scores.lock().await;
+    
+    let total_new_pairs = new_pairs.len();
+    let avg_confidence = if !confidence_scores.is_empty() {
+        confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64
     } else {
         0.0
     };
-
-    // Prepare method statistics
+    
     let method_stats = MatchMethodStats {
         method_type: MatchMethodType::Url,
-        groups_created: new_pairs_created_count,
+        groups_created: total_new_pairs,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 {
-            2.0
-        } else {
-            0.0
-        },
+        avg_group_size: if total_new_pairs > 0 { 2.0 } else { 0.0 },
     };
-
-    // Log summary and return result
+    
     let elapsed = start_time.elapsed();
     info!(
-        "Optimized pairwise URL matching complete in {:.2?}: created {} new pairs. Avg confidence: {:.4}",
-        elapsed,
-        method_stats.groups_created,
-        method_stats.avg_confidence,
+        "URL matching complete in {:.2?}: created {} new pairs with avg confidence {:.4}",
+        elapsed, total_new_pairs, avg_confidence
     );
-
-    let url_result = UrlMatchResult {
-        groups_created: method_stats.groups_created,
+    
+    Ok(AnyMatchResult::Url(UrlMatchResult {
+        groups_created: total_new_pairs,
         stats: method_stats,
-    };
+    }))
+}
 
-    Ok(AnyMatchResult::Url(url_result))
+// NEW: Main worker function for processing domain queues - UPDATED signature for the feature cache
+async fn process_domain_queue(
+    category: &str,
+    queue: Arc<Mutex<VecDeque<DomainTask>>>,
+    semaphore: Arc<Semaphore>,
+    pool: PgPool,  // Changed from &PgPool to PgPool (owned)
+    reinforcement_orchestrator: Option<Arc<Mutex<MatchingOrchestrator>>>,
+    pipeline_run_id: String,  // Changed from &str to String (owned)
+    completed_domains: Arc<AtomicUsize>,
+    total_domains: usize,
+    new_pairs: Arc<Mutex<Vec<(EntityId, EntityId)>>>,
+    entities_in_new_pairs: Arc<Mutex<HashSet<EntityId>>>,
+    confidence_scores: Arc<Mutex<Vec<f64>>>,
+    existing_processed_pairs: HashSet<(EntityId, EntityId)>,
+    feature_cache: Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+) -> Result<()> {
+    loop {
+        // Get next task
+        let task_opt = {
+            let mut queue_guard = queue.lock().await;
+            queue_guard.pop_front()
+        };
+        
+        let Some(task) = task_opt else {
+            // No more tasks in queue
+            break;
+        };
+        
+        // Acquire semaphore
+        let _permit = semaphore.acquire().await?;
+        
+        info!("URL: Processing {} domain: {} with {} entities", 
+            category, task.domain, task.entities.len());
+        
+        // Update domain status to in_progress
+        update_domain_status(
+            &pool,
+            &task.status_id,
+            "in_progress",
+            None,
+            None,
+            None,
+        ).await?;
+        
+        // Process domain
+        let domain_start = Instant::now();
+        let result = match process_domain_task(
+            &task,
+            &pool,
+            reinforcement_orchestrator.as_ref(),
+            &pipeline_run_id,
+            &existing_processed_pairs,
+            &feature_cache,
+        ).await {
+            Ok(pairs) => {
+                // Update local state with results
+                let mut pairs_guard = new_pairs.lock().await;
+                let mut entities_guard = entities_in_new_pairs.lock().await;
+                let mut scores_guard = confidence_scores.lock().await;
+                
+                let mut pair_count = 0;
+                
+                for (entity_id_1, entity_id_2, conf) in pairs {
+                    pairs_guard.push((entity_id_1.clone(), entity_id_2.clone()));
+                    entities_guard.insert(entity_id_1);
+                    entities_guard.insert(entity_id_2);
+                    scores_guard.push(conf);
+                    pair_count += 1;
+                }
+                
+                // Update domain status to completed
+                update_domain_status(
+                    &pool,
+                    &task.status_id,
+                    "completed",
+                    Some(task.entities.len()),
+                    Some(pair_count),
+                    None,
+                ).await?;
+                
+                Ok(pair_count)
+            },
+            Err(e) => {
+                // Update domain status to error
+                update_domain_status(
+                    &pool,
+                    &task.status_id,
+                    "error",
+                    None,
+                    None,
+                    Some(&e.to_string()),
+                ).await?;
+                
+                Err(e)
+            }
+        };
+        
+        // Report progress
+        let completed = completed_domains.fetch_add(1, Ordering::SeqCst) + 1;
+        
+        match result {
+            Ok(pairs_created) => {
+                info!("URL: Completed {} domain: {} in {:.2?}. Created {} pairs. Progress: [{}/{}]",
+                    category, task.domain, domain_start.elapsed(), pairs_created, completed, total_domains);
+            },
+            Err(e) => {
+                warn!("URL: Failed to process {} domain: {}. Error: {}. Progress: [{}/{}]",
+                    category, task.domain, e, completed, total_domains);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// NEW: Process a single domain task with optimized algorithm - UPDATED signature for the feature cache
+async fn process_domain_task(
+    task: &DomainTask,
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
+    pipeline_run_id: &str,
+    existing_processed_pairs: &HashSet<(EntityId, EntityId)>,
+    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+) -> Result<Vec<(EntityId, EntityId, f64)>> {
+    let domain = task.domain.clone();
+    let entities_owned = task.entities.clone();
+    let batch_size = task.get_batch_size();
+    
+    // Convert for handling
+    let entities: Vec<&EntityUrlInfo> = entities_owned.iter().collect();
+    
+    // Use appropriate processing strategy based on domain characteristics
+    let is_high_volume = HIGH_VOLUME_DOMAINS.iter().any(|d| *d == domain);
+    let is_location_sensitive = LOCATION_SENSITIVE_DOMAINS.iter()
+        .any(|suffix| domain.ends_with(suffix));
+    
+    let mut new_pairs = Vec::new();
+    
+    if is_high_volume || entities.len() > LARGE_DOMAIN_THRESHOLD || is_location_sensitive {
+        // Use spatial binning for large or location-sensitive domains
+        process_domain_with_spatial_binning(
+            &domain,
+            &entities,
+            existing_processed_pairs,
+            pool,
+            reinforcement_orchestrator,
+            pipeline_run_id,
+            feature_cache,
+            &mut new_pairs,
+        ).await?;
+    } else {
+        // Use batch processing for regular domains
+        process_domain_in_batches(
+            &domain,
+            &entities,
+            batch_size,
+            existing_processed_pairs,
+            pool,
+            reinforcement_orchestrator,
+            pipeline_run_id,
+            feature_cache,
+            &mut new_pairs,
+        ).await?;
+    }
+    
+    Ok(new_pairs)
+}
+
+// NEW: Process a domain with spatial binning for large/location-sensitive domains - UPDATED signature for the feature cache
+async fn process_domain_with_spatial_binning(
+    domain: &str,
+    entities: &[&EntityUrlInfo],
+    existing_processed_pairs: &HashSet<(EntityId, EntityId)>,
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    new_pairs: &mut Vec<(EntityId, EntityId, f64)>,
+) -> Result<()> {
+    // Separate entities with and without location data
+    let mut entities_with_location: Vec<&EntityUrlInfo> = Vec::new();
+    let mut entities_without_location: Vec<&EntityUrlInfo> = Vec::new();
+    
+    for entity in entities {
+        if entity.has_location_data {
+            entities_with_location.push(*entity);
+        } else {
+            entities_without_location.push(*entity);
+        }
+    }
+    
+    // Create spatial bins for entities with location data
+    let mut spatial_bins: HashMap<SpatialBin, Vec<&EntityUrlInfo>> = HashMap::new();
+    
+    // Bin size in degrees (approximate conversion - 111km per degree)
+    let bin_size_deg = MAX_LOCATION_DISTANCE_METERS / 111000.0;
+    
+    for entity in &entities_with_location {
+        if !entity.has_location_data {
+            continue;
+        }
+        
+        let lat = entity.latitude.unwrap();
+        let lon = entity.longitude.unwrap();
+        
+        let bin_x = (lon / bin_size_deg).floor() as i32;
+        let bin_y = (lat / bin_size_deg).floor() as i32;
+        
+        let bin = SpatialBin { x: bin_x, y: bin_y };
+        spatial_bins.entry(bin).or_default().push(*entity);
+    }
+    
+    // Process each spatial bin
+    for (bin, bin_entities) in &spatial_bins {
+        // Also include entities from neighboring bins
+        let mut combined_entities = bin_entities.clone();
+        
+        // Add neighboring bins
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue; // Skip the current bin
+                }
+                
+                let neighbor_bin = SpatialBin { 
+                    x: bin.x + dx, 
+                    y: bin.y + dy 
+                };
+                
+                if let Some(neighbor_entities) = spatial_bins.get(&neighbor_bin) {
+                    combined_entities.extend(neighbor_entities);
+                }
+            }
+        }
+        
+        // Remove duplicates
+        combined_entities.sort_by_key(|e| e.entity_id.0.clone());
+        combined_entities.dedup_by_key(|e| e.entity_id.0.clone());
+        
+        // Process entities in this bin
+        process_entity_batch(
+            domain,
+            &combined_entities,
+            existing_processed_pairs,
+            pool,
+            reinforcement_orchestrator,
+            pipeline_run_id,
+            feature_cache,
+            new_pairs,
+        ).await?;
+    }
+    
+    // Process entities without location data
+    if !entities_without_location.is_empty() {
+        // 1. Match against entities with location (if any)
+        for entity1 in &entities_without_location {
+            // Take samples from each bin to compare with
+            let mut sample_entities = Vec::new();
+            for (_, bin_entities) in &spatial_bins {
+                // Take up to 10 samples from each bin
+                for entity in bin_entities.iter().take(10) {
+                    sample_entities.push(*entity);
+                }
+            }
+            
+            // Process this entity against the samples
+            for entity2 in &sample_entities {
+                // Skip if already processed
+                let pair = if entity1.entity_id.0 < entity2.entity_id.0 {
+                    (entity1.entity_id.clone(), entity2.entity_id.clone())
+                } else {
+                    (entity2.entity_id.clone(), entity1.entity_id.clone())
+                };
+                
+                if existing_processed_pairs.contains(&pair) {
+                    continue;
+                }
+                
+                // Process potential match
+                process_potential_match(
+                    *entity1,
+                    *entity2,
+                    pool,
+                    reinforcement_orchestrator,
+                    pipeline_run_id,
+                    feature_cache,
+                    new_pairs,
+                ).await?;
+            }
+        }
+        
+        // 2. Match entities without location against each other
+        // Process in reasonable-sized batches
+        let batch_size = 100;
+        for i in 0..entities_without_location.len() {
+            let end = std::cmp::min(i + batch_size, entities_without_location.len());
+            let batch = &entities_without_location[i..end];
+            
+            process_entity_batch(
+                domain,
+                batch,
+                existing_processed_pairs,
+                pool,
+                reinforcement_orchestrator,
+                pipeline_run_id,
+                feature_cache,
+                new_pairs,
+            ).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+// NEW: Process a domain in batches for regular domains - UPDATED signature for the feature cache
+async fn process_domain_in_batches(
+    domain: &str,
+    entities: &[&EntityUrlInfo],
+    batch_size: usize,
+    existing_processed_pairs: &HashSet<(EntityId, EntityId)>,
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    new_pairs: &mut Vec<(EntityId, EntityId, f64)>,
+) -> Result<()> {
+    // Process in batches
+    for i in 0..entities.len() {
+        let end = std::cmp::min(i + batch_size, entities.len());
+        let batch = &entities[i..end];
+        
+        process_entity_batch(
+            domain,
+            batch,
+            existing_processed_pairs,
+            pool,
+            reinforcement_orchestrator,
+            pipeline_run_id,
+            feature_cache,
+            new_pairs,
+        ).await?;
+    }
+    
+    Ok(())
+}
+
+// NEW: Process a batch of entities for potential matches - UPDATED signature for the feature cache
+async fn process_entity_batch(
+    domain: &str,
+    entities: &[&EntityUrlInfo],
+    existing_processed_pairs: &HashSet<(EntityId, EntityId)>,
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    new_pairs: &mut Vec<(EntityId, EntityId, f64)>,
+) -> Result<()> {
+    // Collect all potential matches
+    let mut batch_pairs = Vec::new();
+    
+    // Check all pairs in batch
+    for (i, entity1) in entities.iter().enumerate() {
+        for entity2 in entities.iter().skip(i + 1) {
+            // Skip if already processed
+            let pair = if entity1.entity_id.0 < entity2.entity_id.0 {
+                (entity1.entity_id.clone(), entity2.entity_id.clone())
+            } else {
+                (entity2.entity_id.clone(), entity1.entity_id.clone())
+            };
+            
+            if existing_processed_pairs.contains(&pair) {
+                continue;
+            }
+            
+            // Pre-check to see if worth comparing
+            if !should_compare_entities(*entity1, *entity2, domain) {
+                continue;
+            }
+            
+            batch_pairs.push((*entity1, *entity2));
+        }
+    }
+    
+    // Process all collected pairs
+    if batch_pairs.is_empty() {
+        return Ok(());
+    }
+    
+    // Create batches for database operations
+    let mut entity_groups = Vec::new();
+    
+    // Process each potential match
+    for (entity1, entity2) in batch_pairs {
+        // Process potential match
+        if let Some((entity_id_1, entity_id_2, confidence)) = process_potential_match(
+            entity1,
+            entity2,
+            pool,
+            reinforcement_orchestrator,
+            pipeline_run_id,
+            feature_cache,
+            new_pairs,
+        ).await? {
+            // Add to results
+            new_pairs.push((entity_id_1, entity_id_2, confidence));
+        }
+    }
+    
+    // Batch insert entity groups if any
+    if !entity_groups.is_empty() {
+        batch_insert_entity_groups(pool, &entity_groups).await?;
+    }
+    
+    Ok(())
+}
+
+// NEW: Process a potential match between two entities - UPDATED to use async mutex for feature cache
+async fn process_potential_match(
+    entity1: &EntityUrlInfo,
+    entity2: &EntityUrlInfo,
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    new_pairs: &mut Vec<(EntityId, EntityId, f64)>,
+) -> Result<Option<(EntityId, EntityId, f64)>> {
+    // Skip if different domains (shouldn't happen with our grouping)
+    if entity1.normalized_data.domain != entity2.normalized_data.domain {
+        return Ok(None);
+    }
+    
+    // Calculate distance if both have location data
+    let distance = if entity1.has_location_data && entity2.has_location_data {
+        Some(calculate_distance(
+            entity1.latitude.unwrap(),
+            entity1.longitude.unwrap(),
+            entity2.latitude.unwrap(),
+            entity2.longitude.unwrap()
+        ))
+    } else {
+        None
+    };
+    
+    // Skip if distance exceeds threshold, unless they have matching path segments
+    if let Some(dist) = distance {
+        let should_skip_by_distance = dist > MAX_LOCATION_DISTANCE_METERS;
+        let matching_slugs = count_matching_slugs(
+            &entity1.normalized_data.path_slugs,
+            &entity2.normalized_data.path_slugs
+        );
+        
+        // Different locations but similar paths - might be related
+        if should_skip_by_distance && matching_slugs < 2 {
+            return Ok(None);
+        }
+        
+        // Different paths but close locations - also might be related
+        if matching_slugs == 0 && domain_requires_path_matching(&entity1.normalized_data.domain) && dist > 500.0 {
+            return Ok(None);
+        }
+    }
+    
+    // Count matching slugs
+    let matching_slugs = count_matching_slugs(
+        &entity1.normalized_data.path_slugs,
+        &entity2.normalized_data.path_slugs
+    );
+    
+    // For location-less entities with domain requiring path matching
+    if distance.is_none() 
+       && domain_requires_path_matching(&entity1.normalized_data.domain) 
+       && matching_slugs < 1 {
+        return Ok(None);
+    }
+    
+    // Calculate confidence
+    let (confidence_score, match_values) = calculate_url_match_confidence(
+        entity1,
+        entity2,
+        matching_slugs,
+        distance
+    );
+    
+    // Apply RL tuning if available, using feature cache
+    let final_confidence = if let Some(orchestrator) = reinforcement_orchestrator {
+        // Try to get features from cache first
+        let cache_key = if entity1.entity_id.0 < entity2.entity_id.0 {
+            (entity1.entity_id.0.clone(), entity2.entity_id.0.clone())
+        } else {
+            (entity2.entity_id.0.clone(), entity1.entity_id.0.clone())
+        };
+        
+        // UPDATED: Using tokio::sync::Mutex with .await
+        let features = {
+            let mut cache = feature_cache.lock().await;
+            if let Some(cached_features) = cache.get(&cache_key) {
+                cached_features.clone()
+            } else {
+                // Drop the lock before the async call to avoid holding the lock across .await
+                drop(cache);
+                
+                // Extract features
+                let extracted_features = match MatchingOrchestrator::extract_pair_context_features(
+                    pool, &entity1.entity_id, &entity2.entity_id
+                ).await {
+                    Ok(features) => features,
+                    Err(e) => {
+                        warn!("URL: Failed to extract features: {}", e);
+                        Vec::new()
+                    }
+                };
+                
+                // Re-acquire the lock and update the cache
+                if !extracted_features.is_empty() {
+                    let mut cache = feature_cache.lock().await;
+                    cache.put(cache_key, extracted_features.clone());
+                }
+                
+                extracted_features
+            }
+        };
+        
+        // Apply tuning if features were extracted
+        if !features.is_empty() {
+            let orchestrator_guard = orchestrator.lock().await;
+            match orchestrator_guard.get_tuned_confidence(
+                &MatchMethodType::Url,
+                confidence_score,
+                &features
+            ) {
+                Ok(tuned_score) => tuned_score,
+                Err(e) => {
+                    warn!("URL: Failed to get tuned confidence: {}", e);
+                    confidence_score
+                }
+            }
+        } else {
+            confidence_score
+        }
+    } else {
+        confidence_score
+    };
+    
+    // Create entity group
+    let entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
+    let match_values_json = serde_json::to_value(&match_values)
+        .context("Failed to serialize match values")?;
+    
+    // Ensure consistent order
+    let (e1, e2) = if entity1.entity_id.0 < entity2.entity_id.0 {
+        (&entity1.entity_id, &entity2.entity_id)
+    } else {
+        (&entity2.entity_id, &entity1.entity_id)
+    };
+    
+    // Execute INSERT directly instead of calling another function
+    // This reduces the number of database connections needed
+    let conn = pool.get().await
+        .context("Failed to get DB connection for entity group creation")?;
+    
+    let rows_affected = conn.execute(
+        INSERT_ENTITY_GROUP_SQL,
+        &[
+            &entity_group_id.0,
+            &e1.0,
+            &e2.0,
+            &MatchMethodType::Url.as_str(),
+            &match_values_json,
+            &final_confidence,
+            &confidence_score,
+        ]
+    ).await?;
+    
+    // Return the match if created
+    if rows_affected > 0 {
+        // Create suggestion for low confidence if needed
+        if final_confidence < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
+            let priority = if final_confidence < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+                2
+            } else {
+                1
+            };
+            
+            let details_json = serde_json::json!({
+                "method_type": MatchMethodType::Url.as_str(),
+                "entity_group_id": entity_group_id.0,
+                "rule_based_confidence": confidence_score,
+                "final_confidence": final_confidence,
+            });
+            
+            let suggestion = NewSuggestedAction {
+                pipeline_run_id: Some(pipeline_run_id.to_string()),
+                action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
+                entity_id: None,
+                group_id_1: Some(entity_group_id.0.clone()),
+                group_id_2: None,
+                cluster_id: None,
+                triggering_confidence: Some(final_confidence),
+                details: Some(details_json),
+                reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
+                reason_message: Some(format!(
+                    "URL match with low confidence: {:.4}", final_confidence
+                )),
+                priority,
+                status: SuggestionStatus::PendingReview.as_str().to_string(),
+                reviewer_id: None,
+                reviewed_at: None,
+                review_notes: None,
+            };
+            
+            // UPDATED: Using deref() to access the inner client
+            if let Err(e) = db::insert_suggestion(conn.deref(), &suggestion).await {
+                warn!("URL: Failed to insert suggestion: {}", e);
+            }
+        }
+        
+        // Log decision to orchestrator if available
+        if let (Some(orch_arc), Some(features)) = (
+            reinforcement_orchestrator,
+            MatchingOrchestrator::extract_pair_context_features(pool, e1, e2).await.ok()
+        ) {
+            let orchestrator_guard = orch_arc.lock().await;
+            if let Err(e) = orchestrator_guard.log_decision_snapshot(
+                pool,
+                &entity_group_id.0,
+                pipeline_run_id,
+                &features,
+                &MatchMethodType::Url,
+                confidence_score,
+                final_confidence,
+            ).await {
+                warn!("URL: Failed to log decision: {}", e);
+            }
+        }
+        
+        return Ok(Some((e1.clone(), e2.clone(), final_confidence)));
+    }
+    
+    Ok(None)
+}
+
+// NEW: Pre-check if two entities should be compared
+fn should_compare_entities(entity1: &EntityUrlInfo, entity2: &EntityUrlInfo, domain: &str) -> bool {
+    // Skip extraction if domains don't match (shouldn't happen with our grouping)
+    if entity1.normalized_data.domain != entity2.normalized_data.domain {
+        return false;
+    }
+    
+    // For location-aware domains, skip if too far apart
+    if entity1.has_location_data && entity2.has_location_data {
+        let distance = calculate_distance(
+            entity1.latitude.unwrap(),
+            entity1.longitude.unwrap(),
+            entity2.latitude.unwrap(),
+            entity2.longitude.unwrap()
+        );
+        
+        if distance > MAX_LOCATION_DISTANCE_METERS * 2.0 {
+            return false;
+        }
+    }
+    
+    // For path-matching required domains, skip if no common path elements
+    if domain_requires_path_matching(domain) {
+        let matching_slugs = count_matching_slugs(
+            &entity1.normalized_data.path_slugs,
+            &entity2.normalized_data.path_slugs
+        );
+        
+        if matching_slugs == 0 {
+            return false;
+        }
+    }
+    
+    true
+}
+
+struct QueryParam {
+    value: Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+}
+
+async fn batch_insert_entity_groups(
+    pool: &PgPool,
+    entity_groups: &[(EntityGroupId, EntityId, EntityId, MatchValues, f64, f64)]
+) -> Result<usize> {
+    if entity_groups.is_empty() {
+        return Ok(0);
+    }
+    
+    // Build query for batch insert
+    let mut query = String::from(
+        "INSERT INTO public.entity_group
+        (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, 
+        pre_rl_confidence_score) VALUES "
+    );
+    
+    // Create a vector of boxed values that own their data
+    let mut param_values: Vec<QueryParam> = Vec::new();
+    
+    // Store method type string once
+    let method_type_str = MatchMethodType::Url.as_str().to_string();
+    
+    for (i, (id, e1, e2, values, conf, pre_conf)) in entity_groups.iter().enumerate() {
+        if i > 0 {
+            query.push_str(", ");
+        }
+        
+        // Convert values to JSON
+        let match_values_json = serde_json::to_value(values)?;
+        
+        // Add parameters index placeholders to query
+        query.push_str(&format!("(${},${},${},${},${},${},${})",
+            i*7+1, i*7+2, i*7+3, i*7+4, i*7+5, i*7+6, i*7+7));
+        
+        // Add owned values to parameter vec (using to_owned() to create owned copies)
+        param_values.push(QueryParam { value: Box::new(id.0.clone()) });
+        param_values.push(QueryParam { value: Box::new(e1.0.clone()) });
+        param_values.push(QueryParam { value: Box::new(e2.0.clone()) });
+        param_values.push(QueryParam { value: Box::new(method_type_str.clone()) });
+        param_values.push(QueryParam { value: Box::new(match_values_json) });
+        param_values.push(QueryParam { value: Box::new(*conf) });
+        param_values.push(QueryParam { value: Box::new(*pre_conf) });
+    }
+    
+    // Add ON CONFLICT clause
+    query.push_str(" ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING");
+    
+    // Create a vector of references for the execute call
+let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = 
+    param_values.iter().map(|p| p.value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+    
+    // Execute the batch insert - UPDATED to use slice syntax
+    let conn = pool.get().await?;
+    let result = conn.execute(&query, &param_refs[..])
+    .await
+    .context("Failed to update domain status")?;
+
+    Ok(result as usize)
+}
+
+// NEW: Ensure domain status table exists
+async fn ensure_domain_status_table_exists(pool: &PgPool) -> Result<()> {
+    let conn = pool.get().await
+        .context("Failed to get DB connection for creating domain status table")?;
+    
+    conn.execute(CREATE_DOMAIN_STATUS_TABLE_SQL, &[])
+        .await
+        .context("Failed to create domain processing status table")?;
+    
+    Ok(())
+}
+
+// NEW: Insert domain status
+async fn insert_domain_status(
+    pool: &PgPool,
+    domain: &str,
+    pipeline_run_id: &str,
+    total_entities: usize,
+) -> Result<String> {
+    let conn = pool.get().await
+        .context("Failed to get DB connection for inserting domain status")?;
+    
+    let query = "
+        INSERT INTO clustering_metadata.domain_processing_status
+        (domain, pipeline_run_id, status, total_entities)
+        VALUES ($1, $2, 'pending', $3)
+        ON CONFLICT (domain, pipeline_run_id) DO UPDATE SET
+            status = 'pending',
+            total_entities = $3,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING id
+    ";
+    
+    let row = conn.query_one(query, &[&domain, &pipeline_run_id, &(total_entities as i32)])
+        .await
+        .context("Failed to insert domain status")?;
+    
+    let id: String = row.get(0);
+    
+    Ok(id)
+}
+
+// NEW: Update domain status
+async fn update_domain_status(
+    pool: &PgPool,
+    status_id: &str,
+    status: &str,
+    total_entities: Option<usize>,
+    processed_entity_pairs: Option<usize>,
+    error_message: Option<&str>,
+) -> Result<()> {
+    let conn = pool.get().await
+        .context("Failed to get DB connection for updating domain status")?;
+    
+    let mut query = "
+        UPDATE clustering_metadata.domain_processing_status
+        SET status = $1, updated_at = CURRENT_TIMESTAMP
+    ".to_string();
+    
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&status];
+    
+    let entities_int;
+    let pairs_int;
+    let now_timestamp;
+    let error_str;
+
+    if let Some(entities) = total_entities {
+        entities_int = entities as i32;  // Assign to pre-declared variable
+        query.push_str(", total_entities = $2");
+        params.push(&entities_int);
+    }
+
+    if let Some(pairs) = processed_entity_pairs {
+        pairs_int = pairs as i32;  // Assign to pre-declared variable
+        let idx = params.len() + 1;
+        query.push_str(&format!(", processed_entity_pairs = ${}", idx));
+        params.push(&pairs_int);
+    }
+
+    if let Some(error) = error_message {
+        error_str = error;  // Assign to pre-declared variable
+        let idx = params.len() + 1;
+        query.push_str(&format!(", error_message = ${}", idx));
+        params.push(&error_str);
+    }
+
+    if status == "completed" || status == "error" {
+        now_timestamp = chrono::Utc::now().naive_utc();  // Assign to pre-declared variable
+        let idx = params.len() + 1;
+        query.push_str(&format!(", completed_at = ${}", idx));
+        params.push(&now_timestamp);
+    }
+    
+    query.push_str(" WHERE id = $");
+    query.push_str(&(params.len() + 1).to_string());
+    
+    params.push(&status_id);
+    
+    conn.execute(&query, &params[..])  // UPDATED to use slice syntax
+        .await
+        .context("Failed to update domain status")?;
+    
+    Ok(())
+}
+
+// NEW: Fetch processed domains
+async fn fetch_processed_domains(pool: &PgPool, pipeline_run_id: &str) -> Result<HashSet<String>> {
+    let conn = pool.get().await
+        .context("Failed to get DB connection for fetching processed domains")?;
+    
+    let query = "
+        SELECT domain
+        FROM clustering_metadata.domain_processing_status
+        WHERE pipeline_run_id = $1
+        AND status = 'completed'
+    ";
+    
+    let rows = conn.query(query, &[&pipeline_run_id])
+        .await
+        .context("Failed to fetch processed domains")?;
+    
+    let mut domains = HashSet::with_capacity(rows.len());
+    
+    for row in rows {
+        let domain: String = row.get(0);
+        domains.insert(domain);
+    }
+    
+    Ok(domains)
+}
+
+// Existing function implementations (unchanged)
+
+/// Fetches entities with URLs and location data where available
+async fn fetch_entities_with_urls_and_locations(pool: &PgPool) -> Result<Vec<EntityUrlInfo>> {
+    let mut conn = pool.get().await
+        .context("Failed to get DB connection for fetching entities with URLs")?;
+    
+    let query = r#"
+    WITH EntityURLs AS (
+        -- URLs from organizations
+        SELECT 
+            e.id AS entity_id,
+            o.url AS url,
+            e.name AS entity_name
+        FROM 
+            public.entity e
+        JOIN 
+            public.organization o ON e.organization_id = o.id
+        WHERE 
+            o.url IS NOT NULL AND o.url != '' AND o.url !~ '^\s*$'
+        UNION ALL
+        -- URLs from services
+        SELECT 
+            e.id AS entity_id,
+            s.url AS url,
+            e.name AS entity_name
+        FROM 
+            public.entity e
+        JOIN 
+            public.entity_feature ef ON e.id = ef.entity_id
+        JOIN 
+            public.service s ON ef.table_id = s.id AND ef.table_name = 'service'
+        WHERE 
+            s.url IS NOT NULL AND s.url != '' AND s.url !~ '^\s*$'
+    ),
+    EntityLocations AS (
+        -- Get entity locations where available
+        SELECT 
+            e.id AS entity_id,
+            l.latitude,
+            l.longitude
+        FROM 
+            public.entity e
+        JOIN 
+            public.entity_feature ef ON e.id = ef.entity_id
+        JOIN 
+            public.location l ON ef.table_id = l.id AND ef.table_name = 'location'
+        WHERE 
+            l.latitude IS NOT NULL AND l.longitude IS NOT NULL
+        GROUP BY 
+            e.id, l.latitude, l.longitude
+    )
+    -- Join entities with their URLs and locations (if available)
+    SELECT 
+        u.entity_id,
+        u.url,
+        u.entity_name,
+        l.latitude,
+        l.longitude
+    FROM 
+        EntityURLs u
+    LEFT JOIN 
+        EntityLocations l ON u.entity_id = l.entity_id
+    "#;
+    
+    let rows = conn.query(query, &[]).await
+        .context("Failed to fetch entities with URLs and locations")?;
+    
+    let mut entities = Vec::with_capacity(rows.len());
+    
+    for row in rows {
+        let entity_id: String = row.get("entity_id");
+        let url: String = row.get("url");
+        let entity_name: Option<String> = row.get("entity_name");
+        let latitude: Option<f64> = row.try_get("latitude").ok();
+        let longitude: Option<f64> = row.try_get("longitude").ok();
+        
+        if let Some(normalized_data) = normalize_url_with_slugs(&url) {
+            entities.push(EntityUrlInfo {
+                entity_id: EntityId(entity_id),
+                original_url: url,
+                normalized_data,
+                entity_name,
+                has_location_data: latitude.is_some() && longitude.is_some(),
+                latitude,
+                longitude,
+            });
+        }
+    }
+    
+    // Filter out social media and ignored domains
+    entities.retain(|e| !is_ignored_domain(&e.normalized_data.domain));
+    
+    Ok(entities)
+}
+
+/// Fetch existing URL matched pairs
+async fn fetch_existing_pairs(pool: &PgPool) -> Result<HashSet<(EntityId, EntityId)>> {
+    let conn = pool.get().await
+        .context("Failed to get DB connection for fetching existing pairs")?;
+    
+    let query = "
+        SELECT entity_id_1, entity_id_2
+        FROM public.entity_group
+        WHERE method_type = $1";
+    
+    let rows = conn.query(query, &[&MatchMethodType::Url.as_str()]).await
+        .context("Failed to query existing URL-matched pairs")?;
+    
+    let mut existing_pairs = HashSet::with_capacity(rows.len());
+    
+    for row in rows {
+        let id1: String = row.get("entity_id_1");
+        let id2: String = row.get("entity_id_2");
+        
+        // Ensure consistent ordering
+        if id1 < id2 {
+            existing_pairs.insert((EntityId(id1), EntityId(id2)));
+        } else {
+            existing_pairs.insert((EntityId(id2), EntityId(id1)));
+        }
+    }
+    
+    Ok(existing_pairs)
+}
+
+/// Group entities by domain for batch processing
+fn group_entities_by_domain(entities: &[EntityUrlInfo]) -> HashMap<String, Vec<EntityUrlInfo>> {
+    let mut domain_map: HashMap<String, Vec<EntityUrlInfo>> = HashMap::new();
+    
+    for entity in entities {
+        domain_map.entry(entity.normalized_data.domain.clone())
+            .or_default()
+            .push(entity.clone());
+    }
+    
+    domain_map
+}
+
+/// Apply RL tuning to confidence score if available
+async fn apply_rl_tuning(
+    pool: &PgPool,
+    orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
+    entity_id_1: &EntityId,
+    entity_id_2: &EntityId,
+    base_confidence: f64,
+    pipeline_run_id: &str
+) -> Result<f64> {
+    if let Some(orch_arc) = orchestrator {
+        match MatchingOrchestrator::extract_pair_context_features(
+            pool, entity_id_1, entity_id_2
+        ).await {
+            Ok(features) => {
+                if !features.is_empty() {
+                    let orchestrator_guard = orch_arc.lock().await;
+                    match orchestrator_guard.get_tuned_confidence(
+                        &MatchMethodType::Url,
+                        base_confidence,
+                        &features
+                    ) {
+                        Ok(tuned_score) => return Ok(tuned_score),
+                        Err(e) => {
+                            warn!("URL: Failed to get tuned confidence: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("URL: Failed to extract features: {}", e);
+            }
+        }
+    }
+    
+    Ok(base_confidence)
+}
+
+/// Calculate the Haversine distance between two coordinates in meters
+fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS: f64 = 6371000.0; // Earth radius in meters
+    
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let delta_lat = (lat2 - lat1).to_radians();
+    let delta_lon = (lon2 - lon1).to_radians();
+    
+    let a = (delta_lat / 2.0).sin().powi(2) +
+            lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    
+    EARTH_RADIUS * c
+}
+
+/// Count matching path segments between two URLs
+fn count_matching_slugs(slugs1: &[String], slugs2: &[String]) -> usize {
+    let mut count = 0;
+    let min_len = slugs1.len().min(slugs2.len());
+    
+    for i in 0..min_len {
+        if slugs1[i] == slugs2[i] {
+            count += 1;
+        } else {
+            break; // Stop at first non-matching segment
+        }
+    }
+    
+    count
+}
+
+/// Calculate confidence score based on URL match quality
+fn calculate_url_match_confidence(
+    entity1: &EntityUrlInfo,
+    entity2: &EntityUrlInfo,
+    matching_slug_count: usize,
+    distance_meters: Option<f64>
+) -> (f64, MatchValues) {
+    let is_full_path_match = matching_slug_count == entity1.normalized_data.path_slugs.len() &&
+                             matching_slug_count == entity2.normalized_data.path_slugs.len() &&
+                             !entity1.normalized_data.path_slugs.is_empty();
+    
+    // Base confidence from path matching
+    let mut confidence_score = if is_full_path_match {
+        CONFIDENCE_DOMAIN_FULL_PATH_MATCH
+    } else {
+        match matching_slug_count {
+            0 => CONFIDENCE_DOMAIN_ONLY,
+            1 => CONFIDENCE_DOMAIN_PLUS_ONE_SLUG,
+            2 => CONFIDENCE_DOMAIN_PLUS_TWO_SLUGS,
+            _ => CONFIDENCE_DOMAIN_PLUS_THREE_OR_MORE_SLUGS,
+        }
+    };
+    
+    // Adjust confidence based on distance if available
+    if let Some(distance) = distance_meters {
+        // Closer locations = higher confidence
+        if distance < 100.0 && matching_slug_count > 0 {
+            confidence_score = (confidence_score + 0.05).min(0.95);
+        } else if distance > 5000.0 && matching_slug_count == 0 {
+            confidence_score = (confidence_score - 0.05).max(0.65);
+        }
+    }
+    
+    // Create match values
+    let match_values = MatchValues::Url(UrlMatchValue {
+        original_url1: entity1.original_url.clone(),
+        original_url2: entity2.original_url.clone(),
+        normalized_shared_domain: entity1.normalized_data.domain.clone(),
+        matching_slug_count,
+    });
+    
+    (confidence_score, match_values)
+}
+
+/// Normalize a URL, extract the domain and path slugs
+fn normalize_url_with_slugs(url_str: &str) -> Option<NormalizedUrlData> {
+    let trimmed_url = url_str.trim();
+    if trimmed_url.is_empty() || 
+       trimmed_url.starts_with("mailto:") || 
+       trimmed_url.starts_with("tel:") {
+        return None;
+    }
+    
+    // Add scheme if missing
+    let url_with_scheme = if !trimmed_url.contains("://") {
+        format!("https://{}", trimmed_url)
+    } else {
+        trimmed_url.to_string()
+    };
+    
+    match StdUrl::parse(&url_with_scheme) {
+        Ok(parsed_url) => {
+            // Extract domain
+            let domain_opt = parsed_url.host_str().and_then(|host| {
+                let host_lower = host.to_lowercase();
+                let domain = host_lower.trim_start_matches("www.").to_string();
+                if domain.is_empty() || !domain.contains('.') || is_ip_address(&domain) {
+                    None
+                } else {
+                    Some(domain)
+                }
+            });
+            
+            domain_opt.map(|domain| {
+                // Extract path segments
+                let path_slugs: Vec<String> = parsed_url
+                    .path_segments()
+                    .map_or_else(Vec::new, |segments| {
+                        segments
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    });
+                
+                // Determine domain type
+                let domain_type = categorize_domain(&domain);
+                
+                NormalizedUrlData {
+                    domain,
+                    path_slugs,
+                    original_url: url_str.to_string(),
+                    domain_type,
+                }
+            })
+        },
+        Err(_) => {
+            // Fallback for unparseable URLs
+            let domain_part = trimmed_url
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("");
+            
+            if domain_part.contains('.') && !is_ip_address(domain_part) {
+                let normalized_domain = domain_part
+                    .to_lowercase()
+                    .trim_start_matches("www.")
+                    .to_string();
+                
+                Some(NormalizedUrlData {
+                    domain: normalized_domain.clone(),
+                    path_slugs: Vec::new(),
+                    original_url: url_str.to_string(),
+                    domain_type: categorize_domain(&normalized_domain),
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Determine if a domain is on the ignore list
+fn is_ignored_domain(domain: &str) -> bool {
+    // List of social media and URL shortening domains to ignore
+    static IGNORED_DOMAINS: [&str; 10] = [
+        "facebook.com",
+        "twitter.com",
+        "instagram.com",
+        "linkedin.com",
+        "youtube.com",
+        "tiktok.com",
+        "bit.ly",
+        "t.co",
+        "goo.gl",
+        "tinyurl.com",
+    ];
+    
+    // Check for exact match or subdomain
+    IGNORED_DOMAINS.iter().any(|ignored| 
+        domain == *ignored || domain.ends_with(&format!(".{}", ignored))
+    )
+}
+
+/// Check if a domain is one that requires path matching
+fn domain_requires_path_matching(domain: &str) -> bool {
+    // Check if domain is in the high volume list
+    HIGH_VOLUME_DOMAINS.iter().any(|&high_vol| domain == high_vol)
+}
+
+/// Categorize domain by type for specialized handling
+fn categorize_domain(domain: &str) -> DomainType {
+    if domain.ends_with(".gov") {
+        DomainType::Government
+    } else if domain.ends_with(".edu") || domain.contains("school") || domain.contains("college") {
+        DomainType::Education
+    } else if domain.ends_with(".org") || domain.contains("health") || domain.contains("clinic") || domain.contains("hospital") {
+        DomainType::Healthcare
+    } else if domain.ends_with(".com") || domain.ends_with(".net") || domain.ends_with(".io") {
+        DomainType::Commercial
+    } else if domain.contains("facebook") || domain.contains("twitter") || domain.contains("social") {
+        DomainType::Social
+    } else {
+        DomainType::Other
+    }
+}
+
+/// Helper to check for IP addresses
+fn is_ip_address(domain: &str) -> bool {
+    // Simple IPv4 check
+    let parts: Vec<&str> = domain.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+        return true;
+    }
+    
+    // Simple IPv6 check
+    domain.contains(':') && domain.split(':').count() > 1
 }

@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
 
     // Run the URL matching component
     info!("Running URL matching...");
-    match matching::url::find_matches(&pool, Some(&reinforcement_orchestrator), &run_id).await {
+    match matching::url::find_matches(&pool, Some(reinforcement_orchestrator), &run_id).await {
         Ok(result) => {
             info!(
                 "URL matching completed successfully. Created {} new entity groups.",

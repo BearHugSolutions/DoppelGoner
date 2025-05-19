@@ -31,6 +31,8 @@ const INSERT_ENTITY_GROUP_SQL: &str = "
  pre_rl_confidence_score)
 VALUES ($1, $2, $3, $4, $5, $6, $7)";
 
+// src/matching/address.rs - Refactored find_matches function
+
 pub async fn find_matches(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
@@ -47,11 +49,13 @@ pub async fn find_matches(
     );
     let start_time = Instant::now();
 
+    // Get initial connection for data loading
     let mut conn = pool
         .get()
         .await
         .context("Address: Failed to get DB connection for initial reads")?;
 
+    // 1. Fetch existing pairs to avoid duplicates
     let existing_processed_pairs: HashSet<(EntityId, EntityId)> =
         fetch_existing_pairs(&*conn, MatchMethodType::Address).await?;
     info!(
@@ -59,7 +63,7 @@ pub async fn find_matches(
         existing_processed_pairs.len()
     );
 
-    // Fetch address data (same as before)
+    // 2. Fetch address data
     let address_query = "
         SELECT e.id AS entity_id, l.id as location_id,
                a.address_1, a.address_2, a.city, a.state_province, a.postal_code, a.country
@@ -75,10 +79,11 @@ pub async fn find_matches(
         .context("Address: Failed to query addresses")?;
     info!("Address: Found {} address records.", address_rows.len());
 
+    // 3. Process and normalize addresses
     let mut address_map: HashMap<String, HashMap<EntityId, String>> = HashMap::new();
     for row in &address_rows {
         let entity_id = EntityId(row.get("entity_id"));
-        let full_address = format_full_address(row)?; // Helper to construct full address string
+        let full_address = format_full_address(row)?; 
         let normalized_address = normalize_address(&full_address);
         if !normalized_address.is_empty() {
             address_map
@@ -91,246 +96,305 @@ pub async fn find_matches(
         "Address: Processed {} unique normalized addresses.",
         address_map.len()
     );
-    drop(conn); // Release connection before loop
+    
+    // Release initial connection before loop
+    drop(conn);
 
+    // 4. Stats tracking
     let mut new_pairs_created_count = 0;
     let mut entities_in_new_pairs: HashSet<EntityId> = HashSet::new();
     let mut confidence_scores_for_stats: Vec<f64> = Vec::new();
-    let mut individual_transaction_errors = 0; // To track errors if not using overarching transaction
+    let mut individual_operation_errors = 0;
 
-    for (normalized_shared_address, current_entity_map) in address_map {
-        if current_entity_map.len() < 2 {
-            continue;
-        }
-        let entities_sharing_address: Vec<_> = current_entity_map.iter().collect();
+// Add this at the beginning of the find_matches function, near other declarations:
+let mut processed_in_this_run: HashSet<(EntityId, EntityId)> = HashSet::new();
 
-        for i in 0..entities_sharing_address.len() {
-            for j in (i + 1)..entities_sharing_address.len() {
-                let (entity_id1_obj, original_address1) = entities_sharing_address[i];
-                let (entity_id2_obj, original_address2) = entities_sharing_address[j];
+// 5. Process potential matches
+for (normalized_shared_address, current_entity_map) in address_map {
+    if current_entity_map.len() < 2 {
+        continue;
+    }
+    
+    let entities_sharing_address: Vec<_> = current_entity_map.iter().collect();
 
-                let (e1_id, e1_orig_addr, e2_id, e2_orig_addr) =
-                    if entity_id1_obj.0 < entity_id2_obj.0 {
-                        (
-                            entity_id1_obj,
-                            original_address1,
-                            entity_id2_obj,
-                            original_address2,
-                        )
-                    } else {
-                        (
-                            entity_id2_obj,
-                            original_address2,
-                            entity_id1_obj,
-                            original_address1,
-                        )
-                    };
+    for i in 0..entities_sharing_address.len() {
+        for j in (i + 1)..entities_sharing_address.len() {
+            let (entity_id1_obj, original_address1) = entities_sharing_address[i];
+            let (entity_id2_obj, original_address2) = entities_sharing_address[j];
 
-                if existing_processed_pairs.contains(&(e1_id.clone(), e2_id.clone())) {
+            // Ensure consistent ordering of entity IDs
+            let (e1_id, e1_orig_addr, e2_id, e2_orig_addr) =
+                if entity_id1_obj.0 < entity_id2_obj.0 {
+                    (
+                        entity_id1_obj,
+                        original_address1,
+                        entity_id2_obj,
+                        original_address2,
+                    )
+                } else {
+                    (
+                        entity_id2_obj,
+                        original_address2,
+                        entity_id1_obj,
+                        original_address1,
+                    )
+                };
+
+            // Create a tuple for the pair to use in our checks
+            let entity_pair = (e1_id.clone(), e2_id.clone());
+
+            // Skip if pair already exists in DB OR has been processed in this run
+            if existing_processed_pairs.contains(&entity_pair) || 
+               processed_in_this_run.contains(&entity_pair) {
+                debug!("Address: Skipping already processed pair ({}, {})", e1_id.0, e2_id.0);
+                continue;
+            }
+
+            // Mark this pair as processed to avoid duplicate attempts in this run
+            processed_in_this_run.insert(entity_pair);
+
+            // 6. Calculate pre-RL confidence score
+            let mut pre_rl_confidence_score = 0.95; // Base for address match
+            let unit1 = extract_unit(e1_orig_addr);
+            let unit2 = extract_unit(e2_orig_addr);
+            if !unit1.is_empty() && !unit2.is_empty() && unit1 != unit2 {
+                pre_rl_confidence_score *= 0.85; // Penalty for different units
+            }
+
+            // 7. Extract features and get tuned confidence if applicable
+            let mut final_confidence_score = pre_rl_confidence_score;
+            let mut features_for_snapshot: Option<Vec<f64>> = None;
+
+            if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
+                match MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await {
+                    Ok(features_vec) => {
+                        if !features_vec.is_empty() {
+                            features_for_snapshot = Some(features_vec.clone());
+                            let orchestrator_guard = ro_arc.lock().await;
+                            match orchestrator_guard.get_tuned_confidence(
+                                &MatchMethodType::Address,
+                                pre_rl_confidence_score,
+                                &features_vec,
+                            ) {
+                                Ok(tuned_score) => final_confidence_score = tuned_score,
+                                Err(e) => warn!("Address: Failed to get tuned confidence for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
+                            }
+                        } else {
+                            warn!("Address: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", e1_id.0, e2_id.0);
+                        }
+                    }
+                    Err(e) => warn!("Address: Failed to extract features for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
+                }
+            }
+
+            // Remaining code stays the same...
+            // 8. Create the match values
+            let match_values = MatchValues::Address(AddressMatchValue {
+                original_address1: e1_orig_addr.clone(),
+                original_address2: e2_orig_addr.clone(),
+                normalized_shared_address: normalized_shared_address.clone(),
+                pairwise_match_score: Some(pre_rl_confidence_score as f32),
+            });
+
+            // 9. Get a connection for the combined operations
+            let conn_for_operations = match pool.get().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    individual_operation_errors += 1;
+                    warn!("Address: Failed to get DB connection for pair ({}, {}): {}", e1_id.0, e2_id.0, e);
                     continue;
                 }
+            };
 
-                let mut pre_rl_confidence_score = 0.95; // Base for address match
-                let unit1 = extract_unit(e1_orig_addr);
-                let unit2 = extract_unit(e2_orig_addr);
-                if !unit1.is_empty() && !unit2.is_empty() && unit1 != unit2 {
-                    pre_rl_confidence_score *= 0.85; // Penalty for different units
+            // 10. Process this pair within a single transaction
+            let process_result = process_pair(
+                conn_for_operations,
+                e1_id,
+                e2_id,
+                match_values,
+                pre_rl_confidence_score,
+                final_confidence_score,
+                features_for_snapshot,
+                reinforcement_orchestrator_option.as_ref(),
+                pipeline_run_id,
+            ).await;
+
+            match process_result {
+                Ok(()) => {
+                    new_pairs_created_count += 1;
+                    entities_in_new_pairs.insert(e1_id.clone());
+                    entities_in_new_pairs.insert(e2_id.clone());
+                    confidence_scores_for_stats.push(final_confidence_score);
                 }
-
-                let mut final_confidence_score = pre_rl_confidence_score;
-                let mut features_for_snapshot: Option<Vec<f64>> = None;
-
-                if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
-                    match MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await {
-                        Ok(features_vec) => {
-                            if !features_vec.is_empty() {
-                                features_for_snapshot = Some(features_vec.clone());
-                                let orchestrator_guard = ro_arc.lock().await;
-                                match orchestrator_guard.get_tuned_confidence(
-                                    &MatchMethodType::Address,
-                                    pre_rl_confidence_score,
-                                    &features_vec,
-                                ) {
-                                    Ok(tuned_score) => final_confidence_score = tuned_score,
-                                    Err(e) => warn!("Address: Failed to get tuned confidence for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
-                                }
-                            } else {
-                                warn!("Address: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", e1_id.0, e2_id.0);
-                            }
-                        }
-                        Err(e) => warn!("Address: Failed to extract features for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
-                    }
-                }
-
-                let match_values = MatchValues::Address(AddressMatchValue {
-                    original_address1: e1_orig_addr.clone(),
-                    original_address2: e2_orig_addr.clone(),
-                    normalized_shared_address: normalized_shared_address.clone(),
-                    pairwise_match_score: Some(pre_rl_confidence_score as f32), // Store the pre_rl heuristic score
-                });
-
-                // Insert into entity_group (no overarching transaction for all pairs)
-                let mut conn_for_insert = pool
-                    .get()
-                    .await
-                    .context("Address: Failed to get DB conn for insert")?;
-                let tx_for_insert = conn_for_insert
-                    .transaction()
-                    .await
-                    .context("Address: Failed to start insert tx")?;
-
-                let new_entity_group_id_val = EntityGroupId(Uuid::new_v4().to_string());
-                let match_values_json = serde_json::to_value(&match_values)?;
-
-                match tx_for_insert
-                    .execute(
-                        INSERT_ENTITY_GROUP_SQL,
-                        &[
-                            &new_entity_group_id_val.0,
-                            &e1_id.0,
-                            &e2_id.0,
-                            &MatchMethodType::Address.as_str(),
-                            &match_values_json,
-                            &final_confidence_score,
-                            &pre_rl_confidence_score,
-                        ],
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        tx_for_insert
-                            .commit()
-                            .await
-                            .context("Address: Failed to commit insert")?;
-                        new_pairs_created_count += 1;
-                        entities_in_new_pairs.insert(e1_id.clone());
-                        entities_in_new_pairs.insert(e2_id.clone());
-                        confidence_scores_for_stats.push(final_confidence_score);
-
-                        if let (Some(ro_arc), Some(ref features)) = (
-                            reinforcement_orchestrator_option.as_ref(),
-                            features_for_snapshot.as_ref(),
-                        ) {
-                            let orchestrator_guard = ro_arc.lock().await;
-                            if let Err(e) = orchestrator_guard
-                                .log_decision_snapshot(
-                                    pool,
-                                    &new_entity_group_id_val.0,
-                                    pipeline_run_id,
-                                    features,
-                                    &MatchMethodType::Address,
-                                    pre_rl_confidence_score,
-                                    final_confidence_score,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    "Address: Failed to log decision snapshot for {}: {}",
-                                    new_entity_group_id_val.0, e
-                                );
-                            }
-                        }
-                        if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-                            // ... (suggestion logging, similar to email.rs, using a new connection/transaction for safety)
-                            let mut temp_conn_sugg = pool
-                                .get()
-                                .await
-                                .context("Address: Failed to get temp conn for suggestion")?;
-                            let sugg_tx = temp_conn_sugg
-                                .transaction()
-                                .await
-                                .context("Address: Failed to start suggestion tx")?;
-                            let details_json = serde_json::json!({
-                                "method_type": MatchMethodType::Address.as_str(),
-                                "matched_value": &normalized_shared_address,
-                                "original_address1": e1_orig_addr,
-                                "original_address2": e2_orig_addr,
-                                "entity_group_id": &new_entity_group_id_val.0,
-                                "pre_rl_confidence": pre_rl_confidence_score,
-                            });
-                            let reason_message = format!(
-                                "Pair ({}, {}) matched by Address with low tuned confidence ({:.4}). Pre-RL: {:.2}.",
-                                e1_id.0, e2_id.0, final_confidence_score, pre_rl_confidence_score
-                            );
-                            let suggestion = NewSuggestedAction {
-                                pipeline_run_id: Some(pipeline_run_id.to_string()),
-                                action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
-                                entity_id: None,
-                                group_id_1: Some(new_entity_group_id_val.0.clone()),
-                                group_id_2: None,
-                                cluster_id: None,
-                                triggering_confidence: Some(final_confidence_score),
-                                details: Some(details_json),
-                                reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
-                                reason_message: Some(reason_message),
-                                priority: if final_confidence_score
-                                    < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD
-                                {
-                                    2
-                                } else {
-                                    1
-                                },
-                                status: SuggestionStatus::PendingReview.as_str().to_string(),
-                                reviewer_id: None,
-                                reviewed_at: None,
-                                review_notes: None,
-                            };
-                            if let Err(e) = db::insert_suggestion(&sugg_tx, &suggestion).await {
-                                warn!("Address: Failed to log suggestion: {}", e);
-                                let _ = sugg_tx.rollback().await;
-                            } else {
-                                sugg_tx
-                                    .commit()
-                                    .await
-                                    .context("Address: Failed to commit suggestion tx")?;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx_for_insert.rollback().await; // Attempt rollback
-                        individual_transaction_errors += 1;
-                        warn!(
-                            "Address: Failed to insert pair ({}, {}): {}",
-                            e1_id.0, e2_id.0, e
-                        );
-                    }
+                Err(e) => {
+                    individual_operation_errors += 1;
+                    warn!("Address: Failed to process pair ({}, {}): {}", e1_id.0, e2_id.0, e);
                 }
             }
         }
     }
-    if individual_transaction_errors > 0 {
+}
+
+    // 11. Report errors if any
+    if individual_operation_errors > 0 {
         warn!(
-            "Address: {} errors during individual pair transaction attempts.",
-            individual_transaction_errors
+            "Address: {} errors during individual pair operations.",
+            individual_operation_errors
         );
     }
 
+    // 12. Calculate stats
     let avg_confidence = if !confidence_scores_for_stats.is_empty() {
         confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
     } else {
         0.0
     };
+    
     let method_stats = MatchMethodStats {
         method_type: MatchMethodType::Address,
         groups_created: new_pairs_created_count,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 {
-            2.0
-        } else {
-            0.0
-        },
+        avg_group_size: if new_pairs_created_count > 0 { 2.0 } else { 0.0 },
     };
+    
     info!(
         "Address matching complete in {:.2?}: {} new pairs, {} unique entities.",
         start_time.elapsed(),
         method_stats.groups_created,
         method_stats.entities_matched
     );
+    
     Ok(AnyMatchResult::Address(AddressMatchResult {
         groups_created: method_stats.groups_created,
         stats: method_stats,
     }))
+}
+
+// Helper function to process a single entity pair within a transaction
+async fn process_pair(
+    mut conn: bb8::PooledConnection<'_, bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>,
+    e1_id: &EntityId,
+    e2_id: &EntityId,
+    match_values: MatchValues,
+    pre_rl_confidence_score: f64,
+    final_confidence_score: f64,
+    features_for_snapshot: Option<Vec<f64>>,
+    reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
+    pipeline_run_id: &str,
+) -> Result<()> {
+    // Start a transaction for all operations on this pair
+    let tx = conn.transaction().await.context("Address: Failed to start transaction")?;
+    
+    // Generate entity group ID and prepare values
+    let new_entity_group_id_val = EntityGroupId(Uuid::new_v4().to_string());
+    let match_values_json = serde_json::to_value(&match_values)?;
+
+    // 1. Insert the entity group
+    tx.execute(
+        INSERT_ENTITY_GROUP_SQL,
+        &[
+            &new_entity_group_id_val.0,
+            &e1_id.0,
+            &e2_id.0,
+            &MatchMethodType::Address.as_str(),
+            &match_values_json,
+            &final_confidence_score,
+            &pre_rl_confidence_score,
+        ],
+    )
+    .await
+    .context("Address: Failed to insert entity group")?;
+
+    // 2. If we have features and an orchestrator, log the decision in the same transaction
+    if let (Some(ro_arc), Some(features)) = (reinforcement_orchestrator_option, features_for_snapshot) {
+        let orchestrator_guard = ro_arc.lock().await;
+        
+        // Use direct SQL to log the decision (no need to verify the entity group exists)
+        const INSERT_DECISION_SQL: &str = "
+            INSERT INTO clustering_metadata.match_decision_details (
+                entity_group_id, pipeline_run_id, snapshotted_features,
+                method_type_at_decision, pre_rl_confidence_at_decision,
+                tuned_confidence_at_decision, confidence_tuner_version_at_decision
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id";
+            
+        let snapshot_features_json = serde_json::to_value(&features)
+            .unwrap_or(serde_json::Value::Null);
+            
+        let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
+        
+        tx.query_one(
+            INSERT_DECISION_SQL,
+            &[
+                &new_entity_group_id_val.0,
+                &pipeline_run_id,
+                &snapshot_features_json,
+                &MatchMethodType::Address.as_str(),
+                &pre_rl_confidence_score,
+                &final_confidence_score,
+                &(confidence_tuner_ver as i32),
+            ],
+        )
+        .await
+        .context("Address: Failed to log decision snapshot")?;
+    }
+
+    // 3. If confidence is low, create a suggestion for review
+    if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
+        match &match_values {
+            MatchValues::Address(addr_values) => {
+                let details_json = serde_json::json!({
+                    "method_type": MatchMethodType::Address.as_str(),
+                    "matched_value": &addr_values.normalized_shared_address,
+                    "original_address1": &addr_values.original_address1,
+                    "original_address2": &addr_values.original_address2,
+                    "entity_group_id": &new_entity_group_id_val.0,
+                    "pre_rl_confidence": pre_rl_confidence_score,
+                });
+                
+                let reason_message = format!(
+                    "Pair ({}, {}) matched by Address with low tuned confidence ({:.4}). Pre-RL: {:.2}.",
+                    e1_id.0, e2_id.0, final_confidence_score, pre_rl_confidence_score
+                );
+                
+                let suggestion = NewSuggestedAction {
+                    pipeline_run_id: Some(pipeline_run_id.to_string()),
+                    action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
+                    entity_id: None,
+                    group_id_1: Some(new_entity_group_id_val.0.clone()),
+                    group_id_2: None,
+                    cluster_id: None,
+                    triggering_confidence: Some(final_confidence_score),
+                    details: Some(details_json),
+                    reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
+                    reason_message: Some(reason_message),
+                    priority: if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+                        2
+                    } else {
+                        1
+                    },
+                    status: SuggestionStatus::PendingReview.as_str().to_string(),
+                    reviewer_id: None,
+                    reviewed_at: None,
+                    review_notes: None,
+                };
+                
+                db::insert_suggestion(&tx, &suggestion)
+                    .await
+                    .context("Address: Failed to insert suggestion")?;
+            },
+            _ => {
+                // This should never happen as we're using MatchValues::Address
+                warn!("Address: Unexpected match values type when creating suggestion");
+            }
+        }
+    }
+
+    // 4. Commit the transaction
+    tx.commit().await.context("Address: Failed to commit transaction")?;
+    
+    Ok(())
 }
 
 /// Normalize an address by:

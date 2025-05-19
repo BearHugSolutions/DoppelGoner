@@ -305,7 +305,7 @@ pub async fn get_confidence_for_entity_in_group(
 // --- New/Refactored DB Functions for V1 RL System ---
 
 /// Inserts a snapshot of the match decision details.
-// Modified insert_match_decision_detail function in db.rs
+// Modified insert_match_decision_detail function with retry logic
 pub async fn insert_match_decision_detail(
     pool: &PgPool,
     entity_group_id: &str,
@@ -316,6 +316,8 @@ pub async fn insert_match_decision_detail(
     tuned_confidence_at_decision: f64,
     confidence_tuner_version_at_decision: u32,
 ) -> Result<Uuid> {
+    use tokio::time::{sleep, Duration};
+
     let mut conn = pool
         .get()
         .await
@@ -327,73 +329,151 @@ pub async fn insert_match_decision_detail(
         .await
         .context("Failed to start transaction for match_decision_detail")?;
 
-    // Verify that the entity_group exists before attempting to insert
-    let entity_group_check = tx
-        .query_one(
-            "SELECT 1 FROM public.entity_group WHERE id = $1",
+    // Verify that the entity_group exists with retry logic
+    let mut retry_count = 0;
+let max_retries = 8; // Increased from 4 to 8 for more retries
+let mut entity_exists = false;
+let mut last_error = None;
+
+while retry_count <= max_retries {
+    match tx
+        .query(
+            "SELECT COUNT(*) FROM public.entity_group WHERE id = $1",
             &[&entity_group_id],
         )
-        .await;
-
-    match entity_group_check {
-        Ok(_) => {
-            // Entity group exists, proceed with insertion
-            const INSERT_SQL: &str = "
-                INSERT INTO clustering_metadata.match_decision_details (
-                    entity_group_id, pipeline_run_id, snapshotted_features,
-                    method_type_at_decision, pre_rl_confidence_at_decision,
-                    tuned_confidence_at_decision, confidence_tuner_version_at_decision
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id";
-
-            match tx
-                .query_one(
-                    INSERT_SQL,
-                    &[
-                        &entity_group_id,
-                        &pipeline_run_id,
-                        &snapshotted_features,
-                        &method_type_at_decision,
-                        &pre_rl_confidence_at_decision,
-                        &tuned_confidence_at_decision,
-                        &(confidence_tuner_version_at_decision as i32), // Cast u32 to i32 for DB
-                    ],
-                )
-                .await
-            {
-                Ok(row) => {
-                    // Commit the transaction
-                    tx.commit()
-                        .await
-                        .context("Failed to commit match_decision_detail transaction")?;
-
-                    // Get the ID as a string first
-                    let id_str: String = row.get(0);
-
-                    // Parse the string into a Uuid
-                    let id = Uuid::parse_str(&id_str)
-                        .context("Failed to parse returned ID string as UUID")?;
-
-                    Ok(id)
-                }
-                Err(e) => {
-                    // Rollback the transaction
-                    let _rollback_result = tx.rollback().await;
-                    Err(anyhow::anyhow!(
-                        "Failed to insert match_decision_detail for entity_group_id {}, method {}: {}", 
-                        entity_group_id, method_type_at_decision, e
-                    ))
-                }
+        .await
+    {
+        Ok(rows) => {
+            if rows.is_empty() {
+                let _ = tx.rollback().await;
+                return Err(anyhow::anyhow!(
+                    "Failed to verify entity_group_id {} exists: no rows returned from COUNT query", 
+                    entity_group_id
+                ));
             }
+
+            let count: i64 = rows[0].get(0);
+
+            if count == 0 {
+                // Entity group doesn't exist, retry after waiting
+                if retry_count < max_retries {
+                    let wait_time = Duration::from_millis(1000); // Increased from 500ms to 1000ms
+                    info!(
+                        "Entity group with id {} not found, waiting {}s before retry {}/{}...",
+                        entity_group_id,
+                        wait_time.as_secs(),
+                        retry_count + 1,
+                        max_retries
+                    );
+                    sleep(wait_time).await;
+                    retry_count += 1;
+                    continue;
+                } else {
+                    // Exhausted all retries
+                    let _ = tx.rollback().await;
+                    return Err(anyhow::anyhow!(
+                        "Entity group with id {} does not exist after {} retries", 
+                        entity_group_id,
+                        max_retries
+                    ));
+                }
+            } else if count > 1 {
+                // Multiple entity groups with the same ID - data integrity issue
+                warn!(
+                    "Data integrity issue: Found {} entity_groups with ID {}. Proceeding with insertion anyway.",
+                    count, entity_group_id
+                );
+            }
+
+            // If we reach here, entity exists or we're proceeding despite duplicates
+            entity_exists = true;
+            break;
         }
         Err(e) => {
-            // Entity group doesn't exist or couldn't be verified
-            let _rollback_result = tx.rollback().await;
-            Err(anyhow::anyhow!(
-                "Failed to verify entity_group_id {} exists before inserting match_decision_detail: {}", 
-                entity_group_id, e
-            ))
+            // Error during verification query
+            last_error = Some(e);
+            if retry_count < max_retries {
+                let wait_time = Duration::from_secs(2); // Increased from 1s to 2s
+                warn!(
+                    "Error checking entity group {}, waiting {}s before retry {}/{}...",
+                    entity_group_id,
+                    wait_time.as_secs(),
+                    retry_count + 1,
+                    max_retries
+                );
+                sleep(wait_time).await;
+                retry_count += 1;
+                continue;
+            } else {
+                // Exhausted all retries
+                let _ = tx.rollback().await;
+                return Err(anyhow::anyhow!(
+                    "Database error while verifying entity_group_id {} exists after {} retries: {}", 
+                    entity_group_id,
+                    max_retries,
+                    last_error.unwrap()
+                ));
+            }
         }
+    }
+}
+    // Entity group exists or we decided to proceed despite issues
+    if entity_exists {
+        const INSERT_SQL: &str = "
+            INSERT INTO clustering_metadata.match_decision_details (
+                entity_group_id, pipeline_run_id, snapshotted_features,
+                method_type_at_decision, pre_rl_confidence_at_decision,
+                tuned_confidence_at_decision, confidence_tuner_version_at_decision
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id";
+
+        match tx
+            .query_one(
+                INSERT_SQL,
+                &[
+                    &entity_group_id,
+                    &pipeline_run_id,
+                    &snapshotted_features,
+                    &method_type_at_decision,
+                    &pre_rl_confidence_at_decision,
+                    &tuned_confidence_at_decision,
+                    &(confidence_tuner_version_at_decision as i32), // Cast u32 to i32 for DB
+                ],
+            )
+            .await
+        {
+            Ok(row) => {
+                // Commit the transaction
+                tx.commit()
+                    .await
+                    .context("Failed to commit match_decision_detail transaction")?;
+
+                // Get the ID as a string first
+                let id_str: String = row.get(0);
+
+                // Parse the string into a Uuid
+                let id = Uuid::parse_str(&id_str)
+                    .context("Failed to parse returned ID string as UUID")?;
+
+                Ok(id)
+            }
+            Err(e) => {
+                // Rollback the transaction
+                let _rollback_result = tx.rollback().await;
+                Err(anyhow::anyhow!(
+                    "Failed to insert match_decision_detail for entity_group_id {}, method {}: {}", 
+                    entity_group_id, method_type_at_decision, e
+                ))
+            }
+        }
+    } else {
+        // This branch should never be reached due to the returns in the loop above
+        // But keeping it for logical completeness
+        let _ = tx.rollback().await;
+        Err(anyhow::anyhow!(
+            "Failed to verify entity_group_id {} exists after all retries", 
+            entity_group_id
+        ))
     }
 }
 

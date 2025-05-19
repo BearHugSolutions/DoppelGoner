@@ -376,7 +376,7 @@ async fn run_matching_pipeline(
         info!("Starting URL matching task...");
         let result = matching::url::find_matches(
             &pool_clone_url,
-            Some(&orchestrator_clone_url),
+            Some(orchestrator_clone_url),
             &run_id_clone_url,
         )
         .await

@@ -64,6 +64,9 @@ strsim = "0.10.0"
 # For regular expressions in name normalization
 regex = "1.7.0"
 
+lru = "0.9"  # For feature caching
+num_cpus = "1.15"  # For detecting available CPU cores
+
 # Define binary targets
 [[bin]]
 name = "dedupe"
