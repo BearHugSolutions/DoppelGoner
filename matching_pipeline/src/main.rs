@@ -308,16 +308,20 @@ async fn identify_entities(pool: &PgPool) -> Result<usize> {
     Ok(total_entities_count as usize)
 }
 
+// Modified section of src/main.rs to implement feature caching
+// Replace the run_matching_pipeline function with this version
+
+// src/main.rs - Updated run_matching_pipeline function with feature cache
+
 async fn run_matching_pipeline(
     pool: &PgPool,
     reinforcement_orchestrator: Arc<Mutex<reinforcement::MatchingOrchestrator>>,
     run_id: String,
 ) -> Result<(usize, Vec<MatchMethodStats>)> {
-    info!("Parallelizing matching strategies...");
+    info!("Initializing matching pipeline with feature caching...");
     let start_time_matching = Instant::now();
 
     // Parse the run_id into a UUID type
-    // This will fix the type mismatch between String and PostgreSQL UUID
     let run_id_uuid = match Uuid::parse_str(&run_id) {
         Ok(uuid) => uuid,
         Err(e) => {
@@ -325,19 +329,31 @@ async fn run_matching_pipeline(
         }
     };
 
+    // Create the shared feature cache
+    let feature_cache = reinforcement::create_shared_cache();
+    
+    // Set the feature cache on the orchestrator
+    {
+        let mut orchestrator = reinforcement_orchestrator.lock().await;
+        orchestrator.set_feature_cache(feature_cache.clone());
+        info!("Feature cache attached to RL orchestrator");
+    }
+
     // The vector of JoinHandles will hold tasks that resolve to Result<AnyMatchResult, anyhow::Error>
     let mut tasks: Vec<JoinHandle<Result<AnyMatchResult, anyhow::Error>>> = Vec::new();
 
     // --- Spawn Email Matching Task ---
     let pool_clone_email = pool.clone();
     let orchestrator_clone_email = reinforcement_orchestrator.clone();
-    let run_id_clone_email = run_id.clone(); // Keep using string for compatibility with existing API
+    let run_id_clone_email = run_id.clone(); 
+    let feature_cache_clone_email = feature_cache.clone();
     tasks.push(tokio::spawn(async move {
         info!("Starting email matching task...");
         let result = matching::email::find_matches(
             &pool_clone_email,
             Some(orchestrator_clone_email),
             &run_id_clone_email,
+            Some(feature_cache_clone_email), // Pass feature cache
         )
         .await
         .context("Email matching task failed");
@@ -352,12 +368,14 @@ async fn run_matching_pipeline(
     let pool_clone_phone = pool.clone();
     let orchestrator_clone_phone = reinforcement_orchestrator.clone();
     let run_id_clone_phone = run_id.clone();
+    let feature_cache_clone_phone = feature_cache.clone();
     tasks.push(tokio::spawn(async move {
         info!("Starting phone matching task...");
         let result = matching::phone::find_matches(
             &pool_clone_phone,
             Some(&orchestrator_clone_phone),
             &run_id_clone_phone,
+            Some(feature_cache_clone_phone), // Pass feature cache
         )
         .await
         .context("Phone matching task failed");
@@ -372,12 +390,14 @@ async fn run_matching_pipeline(
     let pool_clone_url = pool.clone();
     let orchestrator_clone_url = reinforcement_orchestrator.clone();
     let run_id_clone_url = run_id.clone();
+    let feature_cache_clone_url = feature_cache.clone();
     tasks.push(tokio::spawn(async move {
         info!("Starting URL matching task...");
         let result = matching::url::find_matches(
             &pool_clone_url,
             Some(orchestrator_clone_url),
             &run_id_clone_url,
+            Some(feature_cache_clone_url),
         )
         .await
         .context("URL matching task failed");
@@ -392,12 +412,14 @@ async fn run_matching_pipeline(
     let pool_clone_address = pool.clone();
     let orchestrator_clone_address = reinforcement_orchestrator.clone();
     let run_id_clone_address = run_id.clone();
+    let feature_cache_clone_address = feature_cache.clone();
     tasks.push(tokio::spawn(async move {
         info!("Starting address matching task...");
         let result = matching::address::find_matches(
             &pool_clone_address,
             Some(orchestrator_clone_address),
             &run_id_clone_address,
+            Some(feature_cache_clone_address), // Pass feature cache
         )
         .await
         .context("Address matching task failed");
@@ -412,12 +434,14 @@ async fn run_matching_pipeline(
     let pool_clone_name = pool.clone();
     let orchestrator_clone_name = reinforcement_orchestrator.clone();
     let run_id_clone_name = run_id.clone();
+    let feature_cache_clone_name = feature_cache.clone();
     tasks.push(tokio::spawn(async move {
         info!("Starting name matching task...");
         let result = matching::name::find_matches(
             &pool_clone_name,
             Some(orchestrator_clone_name),
             &run_id_clone_name,
+            Some(feature_cache_clone_name), // Pass feature cache
         )
         .await
         .context("Name matching task failed");
@@ -432,12 +456,14 @@ async fn run_matching_pipeline(
     let pool_clone_geo = pool.clone();
     let orchestrator_clone_geo = reinforcement_orchestrator.clone();
     let run_id_clone_geo = run_id.clone();
+    let feature_cache_clone_geo = feature_cache.clone();
     tasks.push(tokio::spawn(async move {
         info!("Starting geospatial matching task...");
         let result = matching::geospatial::find_matches(
             &pool_clone_geo,
             Some(orchestrator_clone_geo),
             &run_id_clone_geo,
+            Some(feature_cache_clone_geo), // Pass feature cache
         )
         .await
         .context("Geospatial matching task failed");
@@ -449,26 +475,19 @@ async fn run_matching_pipeline(
     }));
 
     // try_join_all awaits all JoinHandles.
-    // Each JoinHandle resolves to a Result<InnerTaskResult, JoinError>.
-    // Our InnerTaskResult is Result<AnyMatchResult, anyhow::Error>.
-    let join_handle_results: Result<
-        Vec<Result<AnyMatchResult, anyhow::Error>>,
-        tokio::task::JoinError,
-    > = try_join_all(tasks).await;
+    let join_handle_results = try_join_all(tasks).await;
 
     let mut total_groups = 0;
     let mut method_stats_vec = Vec::new();
     let mut completed_methods = 0;
     let total_matching_methods = 6;
 
-    // First, handle potential JoinError from try_join_all
+    // Handle results from all tasks
     match join_handle_results {
         Ok(individual_task_results) => {
-            // individual_task_results is Vec<Result<AnyMatchResult, anyhow::Error>>
             for (idx, task_result) in individual_task_results.into_iter().enumerate() {
                 match task_result {
                     Ok(any_match_result) => {
-                        // Task completed successfully and returned Ok(AnyMatchResult)
                         info!(
                             "Processing result for task index {}: method {:?}, groups created {}.",
                             idx,
@@ -476,19 +495,14 @@ async fn run_matching_pipeline(
                             any_match_result.groups_created()
                         );
                         total_groups += any_match_result.groups_created();
-                        method_stats_vec.push(any_match_result.stats().clone()); // Clone stats
+                        method_stats_vec.push(any_match_result.stats().clone());
                         completed_methods += 1;
                     }
                     Err(task_err) => {
-                        // Task completed but returned an Err from its own logic
                         warn!(
                             "Matching task at index {} failed internally: {:?}",
                             idx, task_err
                         );
-                        // Depending on requirements, you might want to collect all errors
-                        // or return the first one. try_join_all behavior makes this tricky
-                        // if you want to wait for all even if some fail internally.
-                        // For now, let's return the first internal task error.
                         return Err(
                             task_err.context(format!("Matching task at index {} failed", idx))
                         );
@@ -497,7 +511,6 @@ async fn run_matching_pipeline(
             }
         }
         Err(join_err) => {
-            // One of the tasks panicked or was cancelled
             warn!(
                 "A matching task failed to join (e.g., panicked): {:?}",
                 join_err
@@ -515,16 +528,44 @@ async fn run_matching_pipeline(
             "Expected {} completed matching methods, but only {} results processed successfully. Check logs for task errors.",
              total_matching_methods, completed_methods
          );
-        // This state could occur if try_join_all itself didn't error (no panics),
-        // but one or more of the inner Results was an Err, and we decided to continue
-        // rather than returning early. The current logic returns on the first Err.
+    }
+
+    // Report cache statistics
+    {
+        let mut cache = feature_cache.lock().await;
+        let (hits, misses, ind_hits, ind_misses) = cache.get_stats();
+        
+        let hit_rate = if hits + misses > 0 {
+            (hits as f64 / (hits + misses) as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        let individual_hit_rate = if ind_hits + ind_misses > 0 {
+            (ind_hits as f64 / (ind_hits + ind_misses) as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        info!(
+            "Feature cache statistics - Pair features: {} hits, {} misses, {:.2}% hit rate",
+            hits, misses, hit_rate
+        );
+        
+        info!(
+            "Feature cache statistics - Individual features: {} hits, {} misses, {:.2}% hit rate",
+            ind_hits, ind_misses, individual_hit_rate
+        );
+        
+        // Clear the cache to free memory
+        cache.clear();
     }
 
     info!(
         "All matching strategies processed in {:.2?}. Total groups from successful tasks: {}, Methods processed: {}/{}.",
         start_time_matching.elapsed(),
         total_groups,
-        completed_methods, // or method_stats_vec.len()
+        completed_methods,
         total_matching_methods
     );
 

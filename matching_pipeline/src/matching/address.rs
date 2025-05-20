@@ -1,4 +1,4 @@
-// src/matching/address.rs
+// src/matching/address.rs - Updated to use feature cache
 use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, info, warn};
@@ -20,7 +20,7 @@ use crate::models::{
     NewSuggestedAction,
     SuggestionStatus,
 };
-use crate::reinforcement::{self, MatchingOrchestrator};
+use crate::reinforcement::{self, MatchingOrchestrator, SharedFeatureCache};
 use crate::results::{AddressMatchResult, AnyMatchResult, MatchMethodStats}; // PairMlResult might not be needed if not used
 use serde_json;
 
@@ -37,6 +37,7 @@ pub async fn find_matches(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>, // Add feature_cache parameter
 ) -> Result<AnyMatchResult> {
     info!(
         "Starting V1 pairwise address matching (run ID: {}){}...",
@@ -166,7 +167,15 @@ for (normalized_shared_address, current_entity_map) in address_map {
             let mut features_for_snapshot: Option<Vec<f64>> = None;
 
             if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
-                match MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await {
+                // Use the feature cache if available
+                match if let Some(cache) = feature_cache.as_ref() {
+                    // Use the cache through the orchestrator
+                    let orchestrator_guard = ro_arc.lock().await;
+                    orchestrator_guard.get_pair_features(pool, e1_id, e2_id).await
+                } else {
+                    // Fall back to direct extraction if no cache
+                    MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await
+                } {
                     Ok(features_vec) => {
                         if !features_vec.is_empty() {
                             features_for_snapshot = Some(features_vec.clone());
@@ -217,6 +226,7 @@ for (normalized_shared_address, current_entity_map) in address_map {
                 features_for_snapshot,
                 reinforcement_orchestrator_option.as_ref(),
                 pipeline_run_id,
+                feature_cache.clone(), // Pass the feature cache
             ).await;
 
             match process_result {
@@ -282,6 +292,7 @@ async fn process_pair(
     features_for_snapshot: Option<Vec<f64>>,
     reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>, // Add feature_cache parameter
 ) -> Result<()> {
     // Start a transaction for all operations on this pair
     let tx = conn.transaction().await.context("Address: Failed to start transaction")?;

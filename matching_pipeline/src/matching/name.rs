@@ -12,7 +12,7 @@ use strsim::jaro_winkler;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::config;
+use crate::{config, reinforcement::SharedFeatureCache};
 use crate::db::PgPool;
 use crate::models::{
     ActionType, Entity, EntityGroupId, EntityId, MatchMethodType, MatchValues, NameMatchValue,
@@ -223,6 +223,7 @@ pub async fn find_matches(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>, // Added feature_cache parameter
 ) -> Result<AnyMatchResult> {
     info!(
         "Starting V1 high-performance name matching (run ID: {}){}...",
@@ -391,23 +392,62 @@ pub async fn find_matches(
             pre_rl_match_type: Some(pre_rl_match_type.clone()),
         });
         
+        // Extract features and apply RL tuning if available
+        let mut final_confidence = adjusted_pre_rl_score as f64;
+        let mut features_for_snapshot: Option<Vec<f64>> = None;
+        
+        if let Some(orchestrator) = reinforcement_orchestrator_option.as_ref() {
+            // Use the feature cache if available
+            match if let Some(cache) = feature_cache.as_ref() {
+                // Use the cache through the orchestrator
+                let orchestrator_guard = orchestrator.lock().await;
+                orchestrator_guard.get_pair_features(pool, e1_id, e2_id).await
+            } else {
+                // Fall back to direct extraction if no cache
+                MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await
+            } {
+                Ok(features) => {
+                    if !features.is_empty() {
+                        features_for_snapshot = Some(features.clone());
+                        let orchestrator_guard = orchestrator.lock().await;
+                        match orchestrator_guard.get_tuned_confidence(
+                            &MatchMethodType::Name,
+                            adjusted_pre_rl_score as f64,
+                            &features,
+                        ) {
+                            Ok(tuned_score) => final_confidence = tuned_score,
+                            Err(e) => {
+                                warn!("Name: Failed to get tuned confidence for pair ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e);
+                            }
+                        }
+                    } else {
+                        warn!("Name: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", e1_id.0, e2_id.0);
+                    }
+                },
+                Err(e) => {
+                    warn!("Name: Failed to extract features for pair ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e);
+                }
+            }
+        }
+        
         // Create entity group with unified approach
         match create_entity_group(
             pool,
             e1_id,
             e2_id,
             &match_values,
-            adjusted_pre_rl_score as f64, // Initial confidence
+            final_confidence,
             adjusted_pre_rl_score as f64, // Pre-RL score
             reinforcement_orchestrator_option.as_ref(),
             pipeline_run_id,
+            feature_cache.clone(), // Pass the feature cache
         ).await {
             Ok(created) => {
                 if created {
                     new_pairs_created_count += 1;
                     entities_in_new_pairs.insert(e1_id.clone());
                     entities_in_new_pairs.insert(e2_id.clone());
-                    confidence_scores_for_stats.push(adjusted_pre_rl_score as f64);
+                    confidence_scores_for_stats.push(final_confidence);
                     
                     if new_pairs_created_count % 100 == 0 {
                         info!(
@@ -474,6 +514,7 @@ async fn create_entity_group(
     pre_rl_confidence_score: f64,
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>, // Added feature_cache parameter
 ) -> Result<bool> {
     // Get a single connection for all operations
     let mut conn = pool.get().await
@@ -537,7 +578,15 @@ async fn create_entity_group(
     let mut features_for_snapshot: Option<Vec<f64>> = None;
     
     if let Some(ro_arc) = reinforcement_orchestrator {
-        match MatchingOrchestrator::extract_pair_context_features(pool, ordered_id_1, ordered_id_2).await {
+        // Use the feature cache if available
+        match if let Some(cache) = feature_cache.as_ref() {
+            // Use the cache through the orchestrator
+            let orchestrator_guard = ro_arc.lock().await;
+            orchestrator_guard.get_pair_features(pool, ordered_id_1, ordered_id_2).await
+        } else {
+            // Fall back to direct extraction if no cache
+            MatchingOrchestrator::extract_pair_context_features(pool, ordered_id_1, ordered_id_2).await
+        } {
             Ok(features_vec) => {
                 if !features_vec.is_empty() {
                     features_for_snapshot = Some(features_vec.clone());

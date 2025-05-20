@@ -81,18 +81,6 @@ name = "extract_context_features"
 path = "src/bin/extract_context_features.rs"
 
 [[bin]]
-name = "match_phone"
-path = "src/bin/match_phone.rs"
-
-[[bin]]
-name = "match_url"
-path = "src/bin/match_url.rs"
-
-[[bin]]
-name = "match_name"
-path = "src/bin/match_name.rs"
-
-[[bin]]
 name = "consolidate_clusters"
 path = "src/bin/consolidate_clusters.rs"
 

@@ -1,4 +1,4 @@
-// src/matching/email.rs
+// src/matching/email.rs - Updated for feature caching
 use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, info, warn};
@@ -20,7 +20,7 @@ use crate::models::{
     NewSuggestedAction,
     SuggestionStatus,
 };
-use crate::reinforcement::MatchingOrchestrator;
+use crate::reinforcement::{MatchingOrchestrator, SharedFeatureCache};
 use crate::results::{AnyMatchResult, EmailMatchResult, MatchMethodStats};
 use serde_json;
 
@@ -35,6 +35,7 @@ pub async fn find_matches(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>, // Add feature_cache parameter
 ) -> Result<AnyMatchResult> {
     info!(
         "Starting V1 pairwise email matching (run ID: {}){}...",
@@ -169,7 +170,15 @@ pub async fn find_matches(
 
                 // 7. Apply RL tuning if available
                 if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
-                    match MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await {
+                    // Use the feature cache if available
+                    match if let Some(cache) = feature_cache.as_ref() {
+                        // Use the cache through the orchestrator
+                        let orchestrator_guard = ro_arc.lock().await;
+                        orchestrator_guard.get_pair_features(pool, e1_id, e2_id).await
+                    } else {
+                        // Fall back to direct extraction if no cache
+                        MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await
+                    } {
                         Ok(features_vec) => {
                             if !features_vec.is_empty() {
                                 features_for_snapshot = Some(features_vec.clone());
@@ -208,6 +217,7 @@ pub async fn find_matches(
                     reinforcement_orchestrator_option.as_ref(),
                     pipeline_run_id,
                     &normalized_shared_email,
+                    feature_cache.clone(), // Pass the feature cache
                 ).await {
                     Ok(created) => {
                         if created {
@@ -273,6 +283,7 @@ async fn create_entity_group(
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
     normalized_shared_email: &str,
+    feature_cache: Option<SharedFeatureCache>, // Add feature_cache parameter
 ) -> Result<bool> {
     // Get a single connection for all operations
     let mut conn = pool.get().await
@@ -384,22 +395,18 @@ async fn create_entity_group(
                     }
                 }
                 
-                // Extract features and log decision in the same transaction
-                if let Some(ro_arc) = reinforcement_orchestrator {
-                    // Need to use a new connection for feature extraction as we can't use the transaction
-                    let features = match MatchingOrchestrator::extract_pair_context_features(
-                        pool, entity_id_1, entity_id_2
-                    ).await {
-                        Ok(f) => Some(f),
-                        Err(e) => {
-                            warn!("Email: Failed to extract features for logging: {}", e);
-                            None
-                        }
+                // Log decision to orchestrator if available
+                if let Some(orch_arc) = reinforcement_orchestrator {
+                    // Get features from cache if available or extract new ones
+                    let features = if let Some(cache) = feature_cache.as_ref() {
+                        let orchestrator_guard = orch_arc.lock().await;
+                        orchestrator_guard.get_pair_features(pool, entity_id_1, entity_id_2).await
+                    } else {
+                        MatchingOrchestrator::extract_pair_context_features(pool, entity_id_1, entity_id_2).await
                     };
                     
-                    if let Some(features_vec) = features {
-                        let orchestrator_guard = ro_arc.lock().await;
-                        
+                    if let Ok(features_vec) = features {
+                        let orchestrator_guard = orch_arc.lock().await;
                         let snapshot_features_json = serde_json::to_value(&features_vec)
                             .unwrap_or(serde_json::Value::Null);
                             
@@ -516,3 +523,6 @@ fn is_generic_organizational_email(email: &str) -> bool {
         .iter()
         .any(|prefix| email.starts_with(prefix))
 }
+
+// Add missing NaiveDateTime for compile
+use chrono::NaiveDateTime;

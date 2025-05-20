@@ -1,4 +1,4 @@
-// src/matching/geospatial.rs - Refactored for single-transaction pattern
+// src/matching/geospatial.rs - Updated to use feature cache
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use log::{debug, info, warn};
@@ -14,7 +14,7 @@ use crate::models::{
     ActionType, EntityGroupId, EntityId, GeospatialMatchValue, MatchMethodType, MatchValues,
     NewSuggestedAction, SuggestionStatus,
 };
-use crate::reinforcement::MatchingOrchestrator;
+use crate::reinforcement::{MatchingOrchestrator, SharedFeatureCache};
 use crate::results::{AnyMatchResult, GeospatialMatchResult, MatchMethodStats};
 use serde_json;
 
@@ -41,6 +41,7 @@ pub async fn find_matches(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>, // Add feature_cache parameter
 ) -> Result<AnyMatchResult> {
     info!(
         "Starting pairwise geospatial matching (run ID: {}){}...",
@@ -141,81 +142,44 @@ pub async fn find_matches(
             chunk_index + 1
         );
 
-        let mut chunk_feature_map = HashMap::new();
-
-        // 1. Extract features in smaller sub-batches to reduce memory pressure
-        if let Some(orch) = reinforcement_orchestrator_option.as_ref() {
-            info!(
-                "Geospatial: Extracting features for {} pairs in chunk {}...",
-                filtered_chunk.len(),
-                chunk_index + 1
-            );
-
-            for (sub_batch_index, sub_batch) in filtered_chunk
-                .chunks(MAX_FEATURE_EXTRACTIONS_PER_BATCH)
-                .enumerate()
-            {
-                let sub_batch_start = Instant::now();
-                info!(
-                    "Geospatial: Extracting features for sub-batch {}/{} ({} pairs)...",
-                    sub_batch_index + 1,
-                    (filtered_chunk.len() + MAX_FEATURE_EXTRACTIONS_PER_BATCH - 1)
-                        / MAX_FEATURE_EXTRACTIONS_PER_BATCH,
-                    sub_batch.len()
-                );
-
-                for (e1, e2, ..) in sub_batch {
-                    match MatchingOrchestrator::extract_pair_context_features(pool, e1, e2).await {
-                        Ok(features) => {
-                            chunk_feature_map.insert((e1.clone(), e2.clone()), features);
-                            feature_extraction_count += 1;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Geospatial: Failed to extract features for pair ({}, {}): {}",
-                                e1.0, e2.0, e
-                            );
-                            feature_extraction_failures += 1;
-                        }
-                    }
-                }
-
-                info!(
-                    "Geospatial: Completed feature extraction for sub-batch {}/{} in {:.2?}",
-                    sub_batch_index + 1,
-                    (filtered_chunk.len() + MAX_FEATURE_EXTRACTIONS_PER_BATCH - 1)
-                        / MAX_FEATURE_EXTRACTIONS_PER_BATCH,
-                    sub_batch_start.elapsed()
-                );
-            }
-        }
-
-        // 2. Process each pair individually using unified approach
+        // Process each pair individually
         for (e1_id, e2_id, lat1, lon1, lat2, lon2, distance_meters) in filtered_chunk {
             pairs_processed_count += 1;
 
             // Calculate pre-RL confidence score
             let pre_rl_confidence_score = 0.85; // Default confidence
             let mut final_confidence_score = pre_rl_confidence_score;
+            let mut features_for_snapshot: Option<Vec<f64>> = None;
 
             // Apply RL tuning if available
-            if let (Some(orch_arc), Some(extracted_features)) = (
-                reinforcement_orchestrator_option.as_ref(),
-                chunk_feature_map.get(&(e1_id.clone(), e2_id.clone())),
-            ) {
-                if !extracted_features.is_empty() {
-                    let orchestrator_guard = orch_arc.lock().await;
-                    match orchestrator_guard.get_tuned_confidence(
-                        &MatchMethodType::Geospatial,
-                        pre_rl_confidence_score,
-                        extracted_features,
-                    ) {
-                        Ok(tuned_score) => {
-                            final_confidence_score = tuned_score;
+            if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
+                // Use the feature cache if available
+                match if let Some(cache) = feature_cache.as_ref() {
+                    // Use the cache through the orchestrator
+                    let orchestrator_guard = ro_arc.lock().await;
+                    orchestrator_guard.get_pair_features(pool, &e1_id, &e2_id).await
+                } else {
+                    // Fall back to direct extraction if no cache
+                    MatchingOrchestrator::extract_pair_context_features(pool, &e1_id, &e2_id).await
+                } {
+                    Ok(features_vec) => {
+                        feature_extraction_count += 1;
+                        if !features_vec.is_empty() {
+                            features_for_snapshot = Some(features_vec.clone());
+                            let orchestrator_guard = ro_arc.lock().await;
+                            match orchestrator_guard.get_tuned_confidence(
+                                &MatchMethodType::Geospatial,
+                                pre_rl_confidence_score,
+                                &features_vec,
+                            ) {
+                                Ok(tuned_score) => final_confidence_score = tuned_score,
+                                Err(e) => warn!("Geospatial: Failed to get tuned confidence for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
+                            }
                         }
-                        Err(e) => {
-                            warn!("Geospatial: Failed to get tuned confidence for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e);
-                        }
+                    }
+                    Err(e) => {
+                        feature_extraction_failures += 1;
+                        warn!("Geospatial: Failed to extract features for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e);
                     }
                 }
             }
@@ -229,7 +193,7 @@ pub async fn find_matches(
                 distance: distance_meters,
             });
 
-            // Process entity group creation with unified pattern
+            // Process entity group creation
             match create_entity_group(
                 pool,
                 &e1_id,
@@ -240,7 +204,8 @@ pub async fn find_matches(
                 reinforcement_orchestrator_option.as_ref(),
                 pipeline_run_id,
                 distance_meters,
-                chunk_feature_map.get(&(e1_id.clone(), e2_id.clone())),
+                features_for_snapshot.as_ref(),
+                feature_cache.clone(), // Pass the feature cache
             ).await {
                 Ok(created) => {
                     if created {
@@ -263,9 +228,6 @@ pub async fn find_matches(
                 }
             }
         }
-
-        // Free memory after each chunk
-        chunk_feature_map.clear();
     }
 
     // Report statistics
@@ -328,6 +290,7 @@ async fn create_entity_group(
     pipeline_run_id: &str,
     distance_meters: f64,
     features: Option<&Vec<f64>>,
+    feature_cache: Option<SharedFeatureCache>, // Add feature_cache parameter
 ) -> Result<bool> {
     // Get a single connection for all operations
     let mut conn = pool.get().await
@@ -420,36 +383,58 @@ async fn create_entity_group(
             }
         }
         
-        // Log decision snapshot if orchestrator available
-        if let (Some(orch), Some(features_vec)) = (reinforcement_orchestrator, features) {
-            let orchestrator_guard = orch.lock().await;
-            let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
+        // Log decision snapshot if features are available
+        if let Some(orch) = reinforcement_orchestrator {
+            // Use features if already extracted, or get them from cache/extract them
+            let features_to_log = if let Some(f) = features {
+                Some(f.clone())
+            } else if let Some(cache) = feature_cache.as_ref() {
+                // Try to get features from cache
+                let orchestrator_guard = orch.lock().await;
+                match orchestrator_guard.get_pair_features(pool, entity_id_1, entity_id_2).await {
+                    Ok(f) => Some(f),
+                    Err(_) => None,
+                }
+            } else {
+                // Try direct extraction as last resort
+                match MatchingOrchestrator::extract_pair_context_features(
+                    pool, entity_id_1, entity_id_2
+                ).await {
+                    Ok(f) => Some(f),
+                    Err(_) => None,
+                }
+            };
             
-            let snapshot_features_json = serde_json::to_value(features_vec)
-                .unwrap_or(serde_json::Value::Null);
+            if let Some(features_vec) = features_to_log {
+                let orchestrator_guard = orch.lock().await;
+                let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
                 
-            // Insert decision directly with SQL to avoid verification
-            const INSERT_DECISION_SQL: &str = "
-                INSERT INTO clustering_metadata.match_decision_details (
-                    entity_group_id, pipeline_run_id, snapshotted_features,
-                    method_type_at_decision, pre_rl_confidence_at_decision,
-                    tuned_confidence_at_decision, confidence_tuner_version_at_decision
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id";
-                
-            if let Err(e) = tx.query_one(
-                INSERT_DECISION_SQL,
-                &[
-                    &new_entity_group_id.0,
-                    &pipeline_run_id,
-                    &snapshot_features_json,
-                    &MatchMethodType::Geospatial.as_str(),
-                    &pre_rl_confidence_score,
-                    &final_confidence_score,
-                    &(confidence_tuner_ver as i32),
-                ],
-            ).await {
-                warn!("Geospatial: Failed to log decision snapshot: {}", e);
+                let snapshot_features_json = serde_json::to_value(&features_vec)
+                    .unwrap_or(serde_json::Value::Null);
+                    
+                // Insert decision directly with SQL to avoid verification
+                const INSERT_DECISION_SQL: &str = "
+                    INSERT INTO clustering_metadata.match_decision_details (
+                        entity_group_id, pipeline_run_id, snapshotted_features,
+                        method_type_at_decision, pre_rl_confidence_at_decision,
+                        tuned_confidence_at_decision, confidence_tuner_version_at_decision
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING id";
+                    
+                if let Err(e) = tx.query_one(
+                    INSERT_DECISION_SQL,
+                    &[
+                        &new_entity_group_id.0,
+                        &pipeline_run_id,
+                        &snapshot_features_json,
+                        &MatchMethodType::Geospatial.as_str(),
+                        &pre_rl_confidence_score,
+                        &final_confidence_score,
+                        &(confidence_tuner_ver as i32),
+                    ],
+                ).await {
+                    warn!("Geospatial: Failed to log decision snapshot: {}", e);
+                }
             }
         }
         

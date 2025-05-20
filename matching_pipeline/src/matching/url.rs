@@ -1,4 +1,4 @@
-// src/matching/url.rs
+// src/matching/url.rs - Fully refactored for feature caching
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use futures::future::{self, try_join_all};
@@ -22,7 +22,7 @@ use crate::models::{
     ActionType, EntityGroupId, EntityId, MatchMethodType, MatchValues, NewSuggestedAction,
     SuggestionStatus, UrlMatchValue,
 };
-use crate::reinforcement::{self, MatchingOrchestrator};
+use crate::reinforcement::{self, MatchingOrchestrator, SharedFeatureCache};
 use crate::results::{AnyMatchResult, MatchMethodStats, UrlMatchResult};
 use serde_json;
 
@@ -136,7 +136,7 @@ struct DomainEntityMap<'a> {
     entity_urls: Vec<&'a EntityUrlInfo>,
 }
 
-// NEW: Structure for domain processing status
+// Structure for domain processing status
 #[derive(Debug, Clone)]
 struct DomainProcessingStatus {
     domain: String,
@@ -146,14 +146,14 @@ struct DomainProcessingStatus {
     last_processed_entity_id: Option<String>,
 }
 
-// NEW: Helper structure for spatial binning
+// Helper structure for spatial binning
 #[derive(Debug, Eq, PartialEq, Hash)]
 struct SpatialBin {
     x: i32,
     y: i32,
 }
 
-// NEW: Task item for domain worker queue
+// Task item for domain worker queue
 struct DomainTask {
     domain: String,
     entities: Vec<EntityUrlInfo>,
@@ -171,17 +171,18 @@ impl DomainTask {
     }
 }
 
-// Main entry point for URL matching (significantly refactored)
+// Main entry point for URL matching (updated to use feature cache)
 pub async fn find_matches(
     pool: &PgPool,
-    reinforcement_orchestrator: Option<Arc<Mutex<MatchingOrchestrator>>>,
+    reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>, // Added feature_cache parameter
 ) -> Result<AnyMatchResult> {
     let start_time = Instant::now();
     info!(
         "Starting optimized URL matching (run ID: {}){}...",
         pipeline_run_id,
-        if reinforcement_orchestrator.is_some() {
+        if reinforcement_orchestrator_option.is_some() {
             " with ML guidance"
         } else {
             ""
@@ -219,7 +220,7 @@ pub async fn find_matches(
         info!("URL: #{}: {} - {} entities", idx + 1, domain, count);
     }
 
-    // NEW: Create domain tasks and update status
+    // Create domain tasks and update status
     let domain_entities_map = group_entities_by_domain(&entities_with_urls);
     
     // Initialize task queues for different domain sizes
@@ -234,7 +235,7 @@ pub async fn find_matches(
     let entities_in_new_pairs = Arc::new(Mutex::new(HashSet::new()));
     let confidence_scores = Arc::new(Mutex::new(Vec::new()));
     
-    // NEW: Check for domains that have already been processed in this run
+    // Check for domains that have already been processed in this run
     let processed_domains = fetch_processed_domains(pool, pipeline_run_id).await?;
     info!("URL: Found {} domains already processed in this run", processed_domains.len());
     
@@ -300,40 +301,37 @@ pub async fn find_matches(
     // Track domain workers
     let mut domain_workers = Vec::new();
     
-    // Create a shared feature cache - UPDATED to use tokio::sync::Mutex
-    let feature_cache = Arc::new(Mutex::new(LruCache::new(NonZero::new(FEATURE_CACHE_SIZE).unwrap())));
-    
     // Process large domains
     {
         let large_queue = large_domain_queue.clone();
         let semaphore = large_domain_semaphore.clone();
         let pool_clone = pool.clone();
-        let rl_clone = reinforcement_orchestrator.clone();
+        let rl_clone = reinforcement_orchestrator_option.clone();
         let run_id = pipeline_run_id.to_string();
         let completed = completed_domains.clone();
         let pairs = new_pairs.clone();
         let entities = entities_in_new_pairs.clone();
         let scores = confidence_scores.clone();
         let existing = existing_processed_pairs.clone();
-        let cache = feature_cache.clone();
+        let feature_cache_clone = feature_cache.clone();
         
-let worker = tokio::spawn(async move {
-    process_domain_queue(
-        "large",
-        large_queue,
-        semaphore,
-        pool_clone,  // Pass owned PgPool (no &)
-        rl_clone,
-        run_id,      // Pass owned String (no &)
-        completed,
-        total_domains,
-        pairs,
-        entities,
-        scores,
-        existing,
-        cache,
-    ).await
-});
+        let worker = tokio::spawn(async move {
+            process_domain_queue(
+                "large",
+                large_queue,
+                semaphore,
+                pool_clone,
+                rl_clone,
+                run_id,
+                completed,
+                total_domains,
+                pairs,
+                entities,
+                scores,
+                existing,
+                feature_cache_clone,
+            ).await
+        });
         
         domain_workers.push(worker);
     }
@@ -343,32 +341,32 @@ let worker = tokio::spawn(async move {
         let medium_queue = medium_domain_queue.clone();
         let semaphore = medium_domain_semaphore.clone();
         let pool_clone = pool.clone();
-        let rl_clone = reinforcement_orchestrator.clone();
+        let rl_clone = reinforcement_orchestrator_option.clone();
         let run_id = pipeline_run_id.to_string();
         let completed = completed_domains.clone();
         let pairs = new_pairs.clone();
         let entities = entities_in_new_pairs.clone();
         let scores = confidence_scores.clone();
         let existing = existing_processed_pairs.clone();
-        let cache = feature_cache.clone();
+        let feature_cache_clone = feature_cache.clone();
         
-let worker = tokio::spawn(async move {
-    process_domain_queue(
-        "medium",
-        medium_queue,
-        semaphore,
-        pool_clone,  // Pass owned PgPool (no &)
-        rl_clone,
-        run_id,      // Pass owned String (no &)
-        completed,
-        total_domains,
-        pairs,
-        entities,
-        scores,
-        existing,
-        cache,
-    ).await
-});
+        let worker = tokio::spawn(async move {
+            process_domain_queue(
+                "medium",
+                medium_queue,
+                semaphore,
+                pool_clone,
+                rl_clone,
+                run_id,
+                completed,
+                total_domains,
+                pairs,
+                entities,
+                scores,
+                existing,
+                feature_cache_clone,
+            ).await
+        });
         
         domain_workers.push(worker);
     }
@@ -378,32 +376,32 @@ let worker = tokio::spawn(async move {
         let small_queue = small_domain_queue.clone();
         let semaphore = small_domain_semaphore.clone();
         let pool_clone = pool.clone();
-        let rl_clone = reinforcement_orchestrator.clone();
+        let rl_clone = reinforcement_orchestrator_option.clone();
         let run_id = pipeline_run_id.to_string();
         let completed = completed_domains.clone();
         let pairs = new_pairs.clone();
         let entities = entities_in_new_pairs.clone();
         let scores = confidence_scores.clone();
         let existing = existing_processed_pairs.clone();
-        let cache = feature_cache.clone();
+        let feature_cache_clone = feature_cache.clone();
         
-let worker = tokio::spawn(async move {
-    process_domain_queue(
-        "small",
-        small_queue,
-        semaphore,
-        pool_clone,  // Pass owned PgPool (no &)
-        rl_clone,
-        run_id,      // Pass owned String (no &)
-        completed,
-        total_domains,
-        pairs,
-        entities,
-        scores,
-        existing,
-        cache,
-    ).await
-});
+        let worker = tokio::spawn(async move {
+            process_domain_queue(
+                "small",
+                small_queue,
+                semaphore,
+                pool_clone,
+                rl_clone,
+                run_id,
+                completed,
+                total_domains,
+                pairs,
+                entities,
+                scores,
+                existing,
+                feature_cache_clone,
+            ).await
+        });
         
         domain_workers.push(worker);
     }
@@ -447,21 +445,21 @@ let worker = tokio::spawn(async move {
     }))
 }
 
-// NEW: Main worker function for processing domain queues - UPDATED signature for the feature cache
+// Main worker function for processing domain queues - Updated to use feature cache
 async fn process_domain_queue(
     category: &str,
     queue: Arc<Mutex<VecDeque<DomainTask>>>,
     semaphore: Arc<Semaphore>,
-    pool: PgPool,  // Changed from &PgPool to PgPool (owned)
+    pool: PgPool,
     reinforcement_orchestrator: Option<Arc<Mutex<MatchingOrchestrator>>>,
-    pipeline_run_id: String,  // Changed from &str to String (owned)
+    pipeline_run_id: String,
     completed_domains: Arc<AtomicUsize>,
     total_domains: usize,
     new_pairs: Arc<Mutex<Vec<(EntityId, EntityId)>>>,
     entities_in_new_pairs: Arc<Mutex<HashSet<EntityId>>>,
     confidence_scores: Arc<Mutex<Vec<f64>>>,
     existing_processed_pairs: HashSet<(EntityId, EntityId)>,
-    feature_cache: Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    feature_cache: Option<SharedFeatureCache>, // Added feature_cache parameter
 ) -> Result<()> {
     loop {
         // Get next task
@@ -499,7 +497,7 @@ async fn process_domain_queue(
             reinforcement_orchestrator.as_ref(),
             &pipeline_run_id,
             &existing_processed_pairs,
-            &feature_cache,
+            feature_cache.as_ref(), // Pass the feature cache
         ).await {
             Ok(pairs) => {
                 // Update local state with results
@@ -562,14 +560,14 @@ async fn process_domain_queue(
     Ok(())
 }
 
-// NEW: Process a single domain task with optimized algorithm - UPDATED signature for the feature cache
+// Process a single domain task with optimized algorithm - Updated to use feature cache
 async fn process_domain_task(
     task: &DomainTask,
     pool: &PgPool,
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
     existing_processed_pairs: &HashSet<(EntityId, EntityId)>,
-    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    feature_cache: Option<&SharedFeatureCache>, // Added feature_cache parameter
 ) -> Result<Vec<(EntityId, EntityId, f64)>> {
     let domain = task.domain.clone();
     let entities_owned = task.entities.clone();
@@ -615,7 +613,7 @@ async fn process_domain_task(
     Ok(new_pairs)
 }
 
-// NEW: Process a domain with spatial binning for large/location-sensitive domains - UPDATED signature for the feature cache
+// Process a domain with spatial binning for large/location-sensitive domains - Updated to use feature cache
 async fn process_domain_with_spatial_binning(
     domain: &str,
     entities: &[&EntityUrlInfo],
@@ -623,7 +621,7 @@ async fn process_domain_with_spatial_binning(
     pool: &PgPool,
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    feature_cache: Option<&SharedFeatureCache>, // Added feature_cache parameter
     new_pairs: &mut Vec<(EntityId, EntityId, f64)>,
 ) -> Result<()> {
     // Separate entities with and without location data
@@ -761,7 +759,7 @@ async fn process_domain_with_spatial_binning(
     Ok(())
 }
 
-// NEW: Process a domain in batches for regular domains - UPDATED signature for the feature cache
+// Process a domain in batches for regular domains - Updated to use feature cache
 async fn process_domain_in_batches(
     domain: &str,
     entities: &[&EntityUrlInfo],
@@ -770,7 +768,7 @@ async fn process_domain_in_batches(
     pool: &PgPool,
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    feature_cache: Option<&SharedFeatureCache>, // Added feature_cache parameter
     new_pairs: &mut Vec<(EntityId, EntityId, f64)>,
 ) -> Result<()> {
     // Process in batches
@@ -793,7 +791,7 @@ async fn process_domain_in_batches(
     Ok(())
 }
 
-// NEW: Process a batch of entities for potential matches - UPDATED signature for the feature cache
+// Process a batch of entities for potential matches - Updated to use feature cache
 async fn process_entity_batch(
     domain: &str,
     entities: &[&EntityUrlInfo],
@@ -801,7 +799,7 @@ async fn process_entity_batch(
     pool: &PgPool,
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    feature_cache: Option<&SharedFeatureCache>, // Added feature_cache parameter
     new_pairs: &mut Vec<(EntityId, EntityId, f64)>,
 ) -> Result<()> {
     // Collect all potential matches
@@ -863,14 +861,14 @@ async fn process_entity_batch(
     Ok(())
 }
 
-// NEW: Process a potential match between two entities - UPDATED to use async mutex for feature cache
+// Process a potential match between two entities - Updated to use feature cache
 async fn process_potential_match(
     entity1: &EntityUrlInfo,
     entity2: &EntityUrlInfo,
     pool: &PgPool,
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    feature_cache: &Arc<Mutex<LruCache<(String, String), Vec<f64>>>>,
+    feature_cache: Option<&SharedFeatureCache>, // Added feature_cache parameter
     new_pairs: &mut Vec<(EntityId, EntityId, f64)>,
 ) -> Result<Option<(EntityId, EntityId, f64)>> {
     // Skip if different domains (shouldn't happen with our grouping)
@@ -930,65 +928,49 @@ async fn process_potential_match(
         distance
     );
     
-    // Apply RL tuning if available, using feature cache
-    let final_confidence = if let Some(orchestrator) = reinforcement_orchestrator {
-        // Try to get features from cache first
-        let cache_key = if entity1.entity_id.0 < entity2.entity_id.0 {
-            (entity1.entity_id.0.clone(), entity2.entity_id.0.clone())
+    // Apply RL tuning if available, using cache if available
+    let mut final_confidence_score = confidence_score;
+    let mut features_for_snapshot: Option<Vec<f64>> = None;
+    
+    if let Some(orch_arc) = reinforcement_orchestrator {
+        // Use the feature cache if available
+        let features = match if let Some(cache) = feature_cache {
+            // Use the cache through the orchestrator
+            let orchestrator_guard = orch_arc.lock().await;
+            orchestrator_guard.get_pair_features(pool, &entity1.entity_id, &entity2.entity_id).await
         } else {
-            (entity2.entity_id.0.clone(), entity1.entity_id.0.clone())
-        };
-        
-        // UPDATED: Using tokio::sync::Mutex with .await
-        let features = {
-            let mut cache = feature_cache.lock().await;
-            if let Some(cached_features) = cache.get(&cache_key) {
-                cached_features.clone()
-            } else {
-                // Drop the lock before the async call to avoid holding the lock across .await
-                drop(cache);
-                
-                // Extract features
-                let extracted_features = match MatchingOrchestrator::extract_pair_context_features(
-                    pool, &entity1.entity_id, &entity2.entity_id
-                ).await {
-                    Ok(features) => features,
-                    Err(e) => {
-                        warn!("URL: Failed to extract features: {}", e);
-                        Vec::new()
-                    }
-                };
-                
-                // Re-acquire the lock and update the cache
-                if !extracted_features.is_empty() {
-                    let mut cache = feature_cache.lock().await;
-                    cache.put(cache_key, extracted_features.clone());
-                }
-                
-                extracted_features
+            // Fall back to direct extraction if no cache
+            MatchingOrchestrator::extract_pair_context_features(
+                pool, &entity1.entity_id, &entity2.entity_id
+            ).await
+        } {
+            Ok(f) => {
+                features_for_snapshot = Some(f.clone());
+                Some(f)
+            },
+            Err(e) => {
+                warn!("URL: Failed to extract features: {}", e);
+                None
             }
         };
         
         // Apply tuning if features were extracted
-        if !features.is_empty() {
-            let orchestrator_guard = orchestrator.lock().await;
-            match orchestrator_guard.get_tuned_confidence(
-                &MatchMethodType::Url,
-                confidence_score,
-                &features
-            ) {
-                Ok(tuned_score) => tuned_score,
-                Err(e) => {
-                    warn!("URL: Failed to get tuned confidence: {}", e);
-                    confidence_score
+        if let Some(extracted_features) = features {
+            if !extracted_features.is_empty() {
+                let orchestrator_guard = orch_arc.lock().await;
+                match orchestrator_guard.get_tuned_confidence(
+                    &MatchMethodType::Url,
+                    confidence_score,
+                    &extracted_features
+                ) {
+                    Ok(tuned_score) => final_confidence_score = tuned_score,
+                    Err(e) => {
+                        warn!("URL: Failed to get tuned confidence: {}", e);
+                    }
                 }
             }
-        } else {
-            confidence_score
         }
-    } else {
-        confidence_score
-    };
+    }
     
     // Create entity group
     let entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
@@ -1015,7 +997,7 @@ async fn process_potential_match(
             &e2.0,
             &MatchMethodType::Url.as_str(),
             &match_values_json,
-            &final_confidence,
+            &final_confidence_score,
             &confidence_score,
         ]
     ).await?;
@@ -1023,8 +1005,8 @@ async fn process_potential_match(
     // Return the match if created
     if rows_affected > 0 {
         // Create suggestion for low confidence if needed
-        if final_confidence < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-            let priority = if final_confidence < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+        if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
+            let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
                 2
             } else {
                 1
@@ -1034,7 +1016,7 @@ async fn process_potential_match(
                 "method_type": MatchMethodType::Url.as_str(),
                 "entity_group_id": entity_group_id.0,
                 "rule_based_confidence": confidence_score,
-                "final_confidence": final_confidence,
+                "final_confidence": final_confidence_score,
             });
             
             let suggestion = NewSuggestedAction {
@@ -1044,11 +1026,11 @@ async fn process_potential_match(
                 group_id_1: Some(entity_group_id.0.clone()),
                 group_id_2: None,
                 cluster_id: None,
-                triggering_confidence: Some(final_confidence),
+                triggering_confidence: Some(final_confidence_score),
                 details: Some(details_json),
                 reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
                 reason_message: Some(format!(
-                    "URL match with low confidence: {:.4}", final_confidence
+                    "URL match with low confidence: {:.4}", final_confidence_score
                 )),
                 priority,
                 status: SuggestionStatus::PendingReview.as_str().to_string(),
@@ -1057,7 +1039,7 @@ async fn process_potential_match(
                 review_notes: None,
             };
             
-            // UPDATED: Using deref() to access the inner client
+            // Using deref() to access the inner client
             if let Err(e) = db::insert_suggestion(conn.deref(), &suggestion).await {
                 warn!("URL: Failed to insert suggestion: {}", e);
             }
@@ -1065,8 +1047,8 @@ async fn process_potential_match(
         
         // Log decision to orchestrator if available
         if let (Some(orch_arc), Some(features)) = (
-            reinforcement_orchestrator,
-            MatchingOrchestrator::extract_pair_context_features(pool, e1, e2).await.ok()
+            reinforcement_orchestrator, 
+            features_for_snapshot
         ) {
             let orchestrator_guard = orch_arc.lock().await;
             if let Err(e) = orchestrator_guard.log_decision_snapshot(
@@ -1076,19 +1058,19 @@ async fn process_potential_match(
                 &features,
                 &MatchMethodType::Url,
                 confidence_score,
-                final_confidence,
+                final_confidence_score,
             ).await {
                 warn!("URL: Failed to log decision: {}", e);
             }
         }
         
-        return Ok(Some((e1.clone(), e2.clone(), final_confidence)));
+        return Ok(Some((e1.clone(), e2.clone(), final_confidence_score)));
     }
     
     Ok(None)
 }
 
-// NEW: Pre-check if two entities should be compared
+// Pre-check if two entities should be compared
 fn should_compare_entities(entity1: &EntityUrlInfo, entity2: &EntityUrlInfo, domain: &str) -> bool {
     // Skip extraction if domains don't match (shouldn't happen with our grouping)
     if entity1.normalized_data.domain != entity2.normalized_data.domain {
@@ -1175,19 +1157,19 @@ async fn batch_insert_entity_groups(
     query.push_str(" ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING");
     
     // Create a vector of references for the execute call
-let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = 
-    param_values.iter().map(|p| p.value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = 
+        param_values.iter().map(|p| p.value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
     
-    // Execute the batch insert - UPDATED to use slice syntax
+    // Execute the batch insert using slice syntax
     let conn = pool.get().await?;
     let result = conn.execute(&query, &param_refs[..])
-    .await
-    .context("Failed to update domain status")?;
+        .await
+        .context("Failed to update domain status")?;
 
     Ok(result as usize)
 }
 
-// NEW: Ensure domain status table exists
+// Ensure domain status table exists
 async fn ensure_domain_status_table_exists(pool: &PgPool) -> Result<()> {
     let conn = pool.get().await
         .context("Failed to get DB connection for creating domain status table")?;
@@ -1199,7 +1181,7 @@ async fn ensure_domain_status_table_exists(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-// NEW: Insert domain status
+// Insert domain status
 async fn insert_domain_status(
     pool: &PgPool,
     domain: &str,
@@ -1229,7 +1211,7 @@ async fn insert_domain_status(
     Ok(id)
 }
 
-// NEW: Update domain status
+// Update domain status
 async fn update_domain_status(
     pool: &PgPool,
     status_id: &str,
@@ -1285,14 +1267,14 @@ async fn update_domain_status(
     
     params.push(&status_id);
     
-    conn.execute(&query, &params[..])  // UPDATED to use slice syntax
+    conn.execute(&query, &params[..])  // Using slice syntax
         .await
         .context("Failed to update domain status")?;
     
     Ok(())
 }
 
-// NEW: Fetch processed domains
+// Fetch processed domains
 async fn fetch_processed_domains(pool: &PgPool, pipeline_run_id: &str) -> Result<HashSet<String>> {
     let conn = pool.get().await
         .context("Failed to get DB connection for fetching processed domains")?;
@@ -1318,9 +1300,7 @@ async fn fetch_processed_domains(pool: &PgPool, pipeline_run_id: &str) -> Result
     Ok(domains)
 }
 
-// Existing function implementations (unchanged)
-
-/// Fetches entities with URLs and location data where available
+// Fetches entities with URLs and location data where available
 async fn fetch_entities_with_urls_and_locations(pool: &PgPool) -> Result<Vec<EntityUrlInfo>> {
     let mut conn = pool.get().await
         .context("Failed to get DB connection for fetching entities with URLs")?;
@@ -1414,7 +1394,7 @@ async fn fetch_entities_with_urls_and_locations(pool: &PgPool) -> Result<Vec<Ent
     Ok(entities)
 }
 
-/// Fetch existing URL matched pairs
+// Fetch existing URL matched pairs
 async fn fetch_existing_pairs(pool: &PgPool) -> Result<HashSet<(EntityId, EntityId)>> {
     let conn = pool.get().await
         .context("Failed to get DB connection for fetching existing pairs")?;
@@ -1444,7 +1424,7 @@ async fn fetch_existing_pairs(pool: &PgPool) -> Result<HashSet<(EntityId, Entity
     Ok(existing_pairs)
 }
 
-/// Group entities by domain for batch processing
+// Group entities by domain for batch processing
 fn group_entities_by_domain(entities: &[EntityUrlInfo]) -> HashMap<String, Vec<EntityUrlInfo>> {
     let mut domain_map: HashMap<String, Vec<EntityUrlInfo>> = HashMap::new();
     
@@ -1457,44 +1437,7 @@ fn group_entities_by_domain(entities: &[EntityUrlInfo]) -> HashMap<String, Vec<E
     domain_map
 }
 
-/// Apply RL tuning to confidence score if available
-async fn apply_rl_tuning(
-    pool: &PgPool,
-    orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
-    entity_id_1: &EntityId,
-    entity_id_2: &EntityId,
-    base_confidence: f64,
-    pipeline_run_id: &str
-) -> Result<f64> {
-    if let Some(orch_arc) = orchestrator {
-        match MatchingOrchestrator::extract_pair_context_features(
-            pool, entity_id_1, entity_id_2
-        ).await {
-            Ok(features) => {
-                if !features.is_empty() {
-                    let orchestrator_guard = orch_arc.lock().await;
-                    match orchestrator_guard.get_tuned_confidence(
-                        &MatchMethodType::Url,
-                        base_confidence,
-                        &features
-                    ) {
-                        Ok(tuned_score) => return Ok(tuned_score),
-                        Err(e) => {
-                            warn!("URL: Failed to get tuned confidence: {}", e);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("URL: Failed to extract features: {}", e);
-            }
-        }
-    }
-    
-    Ok(base_confidence)
-}
-
-/// Calculate the Haversine distance between two coordinates in meters
+// Calculate the Haversine distance between two coordinates in meters
 fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const EARTH_RADIUS: f64 = 6371000.0; // Earth radius in meters
     
@@ -1510,7 +1453,7 @@ fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS * c
 }
 
-/// Count matching path segments between two URLs
+// Count matching path segments between two URLs
 fn count_matching_slugs(slugs1: &[String], slugs2: &[String]) -> usize {
     let mut count = 0;
     let min_len = slugs1.len().min(slugs2.len());
@@ -1526,7 +1469,7 @@ fn count_matching_slugs(slugs1: &[String], slugs2: &[String]) -> usize {
     count
 }
 
-/// Calculate confidence score based on URL match quality
+// Calculate confidence score based on URL match quality
 fn calculate_url_match_confidence(
     entity1: &EntityUrlInfo,
     entity2: &EntityUrlInfo,
@@ -1570,7 +1513,7 @@ fn calculate_url_match_confidence(
     (confidence_score, match_values)
 }
 
-/// Normalize a URL, extract the domain and path slugs
+// Normalize a URL, extract the domain and path slugs
 fn normalize_url_with_slugs(url_str: &str) -> Option<NormalizedUrlData> {
     let trimmed_url = url_str.trim();
     if trimmed_url.is_empty() || 
@@ -1653,7 +1596,7 @@ fn normalize_url_with_slugs(url_str: &str) -> Option<NormalizedUrlData> {
     }
 }
 
-/// Determine if a domain is on the ignore list
+// Determine if a domain is on the ignore list
 fn is_ignored_domain(domain: &str) -> bool {
     // List of social media and URL shortening domains to ignore
     static IGNORED_DOMAINS: [&str; 10] = [
@@ -1675,13 +1618,13 @@ fn is_ignored_domain(domain: &str) -> bool {
     )
 }
 
-/// Check if a domain is one that requires path matching
+// Check if a domain is one that requires path matching
 fn domain_requires_path_matching(domain: &str) -> bool {
     // Check if domain is in the high volume list
     HIGH_VOLUME_DOMAINS.iter().any(|&high_vol| domain == high_vol)
 }
 
-/// Categorize domain by type for specialized handling
+// Categorize domain by type for specialized handling
 fn categorize_domain(domain: &str) -> DomainType {
     if domain.ends_with(".gov") {
         DomainType::Government
@@ -1698,7 +1641,7 @@ fn categorize_domain(domain: &str) -> DomainType {
     }
 }
 
-/// Helper to check for IP addresses
+// Helper to check for IP addresses
 fn is_ip_address(domain: &str) -> bool {
     // Simple IPv4 check
     let parts: Vec<&str> = domain.split('.').collect();
