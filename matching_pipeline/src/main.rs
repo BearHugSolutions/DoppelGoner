@@ -29,13 +29,9 @@ use dedupe_lib::{
             orchestrator::MatchingOrchestrator,
         },
         service::{
-            service_feature_cache_service::{
+            service_feature_cache_prewarmer::{extract_and_store_all_service_features_and_prewarm_cache, prewarm_service_pair_features_cache}, service_feature_cache_service::{
                 create_shared_service_cache, SharedServiceFeatureCache,
-            },
-            service_feature_extraction::{
-                extract_and_store_all_service_context_features, get_stored_service_features,
-            },
-            service_orchestrator::{self, ServiceMatchingOrchestrator},
+            }, service_orchestrator::{self, ServiceMatchingOrchestrator}
         },
     },
     results::{
@@ -187,7 +183,7 @@ async fn run_pipeline(
                 e
             ),
         }
-        let max_pairs = 10000;
+        let max_pairs = 5000;
         match prewarm_pair_features_cache(pool, &entity_feature_cache, max_pairs).await {
             Ok(pairs_count) => info!(
                 "Successfully pre-warmed pair features cache for {} likely entity pairs.",
@@ -297,18 +293,34 @@ async fn run_pipeline(
         info!("Feature cache attached to service RL orchestrator");
     }
 
-    info!("Phase 5.5: Service Context Feature Extraction");
+    info!("Phase 5.5: Service Context Feature Extraction and Cache Pre-warming");
     let phase5_5_start = Instant::now();
+
+    // Extract and store individual service features
     let service_features_count =
-        extract_and_store_all_service_context_features(pool, &service_feature_cache).await?;
+        extract_and_store_all_service_features_and_prewarm_cache(pool, &service_feature_cache).await?;
+
+    // Pre-warm service pair features cache
+    let max_service_pairs = 5000;
+    match prewarm_service_pair_features_cache(pool, &service_feature_cache, max_service_pairs).await {
+        Ok(pairs_count) => info!(
+            "Successfully pre-warmed service pair features cache for {} likely service pairs.",
+            pairs_count
+        ),
+        Err(e) => warn!(
+            "Service pair features cache pre-warming failed: {}. Proceeding with on-demand feature extraction.",
+            e
+        ),
+    }
+
     let phase5_5_duration = phase5_5_start.elapsed();
     phase_times.insert(
-        "service_context_feature_extraction".to_string(),
+        "service_context_feature_extraction_and_prewarming".to_string(),
         phase5_5_duration,
     );
     stats.service_context_feature_extraction_time = phase5_5_duration.as_secs_f64();
     info!(
-        "Extracted and stored context features for {} services in {:.2?}. Phase 5.5 complete.",
+        "Extracted and pre-warmed context features for {} services in {:.2?}. Phase 5.5 complete.",
         service_features_count, phase5_5_duration
     );
 

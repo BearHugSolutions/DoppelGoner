@@ -53,7 +53,7 @@ impl ServiceFeatureCacheService {
     }
 
     /// Get the cache key for a service pair
-    fn get_pair_key(service1_id: &ServiceId, service2_id: &ServiceId) -> String {
+    pub fn get_pair_key(service1_id: &ServiceId, service2_id: &ServiceId) -> String {
         if service1_id.0 < service2_id.0 {
             format!("{}:{}", service1_id.0, service2_id.0)
         } else {

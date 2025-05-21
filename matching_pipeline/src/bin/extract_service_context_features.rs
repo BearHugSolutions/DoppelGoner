@@ -14,8 +14,7 @@ use tokio::sync::Semaphore;
 
 use dedupe_lib::{
     db, models::ServiceId,
-    reinforcement::service::service_feature_cache_service::create_shared_service_cache,
-    reinforcement::service::service_feature_extraction,
+    reinforcement::service::{service_feature_cache_prewarmer::extract_and_store_all_service_context_features, service_feature_cache_service::create_shared_service_cache, service_feature_extraction},
 };
 
 // Constants for parallel execution
@@ -218,7 +217,7 @@ async fn main() -> Result<()> {
 
     // Store the features in the shared cache as well
     info!("Populating shared feature cache with extracted features...");
-    match service_feature_extraction::extract_and_store_all_service_context_features(&pool, &feature_cache).await {
+    match extract_and_store_all_service_context_features(&pool, &feature_cache).await {
         Ok(features_count) => info!(
             "Successfully populated cache with features for {} services.",
             features_count
