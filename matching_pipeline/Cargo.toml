@@ -81,12 +81,8 @@ name = "extract_context_features"
 path = "src/bin/extract_context_features.rs"
 
 [[bin]]
-name = "consolidate_clusters"
-path = "src/bin/consolidate_clusters.rs"
-
-[[bin]]
-name = "match_services"
-path = "src/bin/match_services.rs"
+name = "extract_service_context_features"
+path = "src/bin/extract_service_context_features.rs"
 
 [lib]
 name = "dedupe_lib"

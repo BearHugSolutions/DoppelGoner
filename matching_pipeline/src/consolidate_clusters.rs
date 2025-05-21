@@ -26,7 +26,7 @@ use crate::models::{
     NewSuggestedAction,
     SuggestionStatus,
 };
-use crate::reinforcement::MatchingOrchestrator;
+use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
 
 #[derive(Debug)]
 struct NodeMapper {
@@ -576,10 +576,10 @@ async fn create_cluster_record(
     // It will default to NULL upon insertion here.
     // Explicitly listing columns for clarity and future-proofing.
     transaction.execute(
-        "INSERT INTO public.group_cluster (id, name, description, created_at, updated_at, entity_count, group_count, average_coherence_score)
+        "INSERT INTO public.entity_group_cluster (id, name, description, created_at, updated_at, entity_count, group_count, average_coherence_score)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)", // group_count here refers to number of pairs, average_coherence_score is NULL initially
         &[&cluster_id.0, &cluster_name, &description, &now, &now, &entity_count, &pair_count],
-    ).await.context("Failed to insert group_cluster")?;
+    ).await.context("Failed to insert entity_group_cluster")?;
     Ok(())
 }
 
@@ -644,7 +644,7 @@ async fn verify_clusters(
             // If no entities, we can't calculate a score, so update with NULL or skip.
             // Let's ensure it's NULL if we can't calculate.
             let update_null_score_query = "
-                UPDATE public.group_cluster
+                UPDATE public.entity_group_cluster
                 SET average_coherence_score = NULL
                 WHERE id = $1";
             if let Err(e) = transaction
@@ -674,7 +674,7 @@ async fn verify_clusters(
             );
             // If less than 2 entities, score is not meaningful. Update with NULL.
             let update_null_score_query = "
-                UPDATE public.group_cluster
+                UPDATE public.entity_group_cluster
                 SET average_coherence_score = NULL
                 WHERE id = $1";
             if let Err(e) = transaction
@@ -777,7 +777,7 @@ async fn verify_clusters(
         // Update the group_cluster table with the calculated average_coherence_score (or NULL)
         // Ensure this uses the `transaction` object.
         let update_score_query = "
-            UPDATE public.group_cluster
+            UPDATE public.entity_group_cluster
             SET average_coherence_score = $1
             WHERE id = $2";
         if let Err(e) = transaction

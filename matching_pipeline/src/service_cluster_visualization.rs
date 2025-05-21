@@ -1,4 +1,4 @@
-// src/cluster_visualization.rs
+// src/service_cluster_visualization.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, info, warn};
@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 // Local imports
 use crate::db::PgPool;
-use crate::models::{EntityId, GroupClusterId};
+use crate::models::{ServiceId, ServiceGroupClusterId};
 
-/// Simple struct to hold entity_group record details
-struct EntityGroupRecord {
+/// Simple struct to hold service_group record details
+struct ServiceGroupRecord {
     id: String,
     method_type: String,
     confidence_score: Option<f64>,
@@ -20,24 +20,24 @@ struct EntityGroupRecord {
     match_values: Option<serde_json::Value>,
 }
 
-/// Simple struct to hold group_cluster record details
-struct GroupClusterRecord {
+/// Simple struct to hold service_group_cluster record details
+struct ServiceGroupClusterRecord {
     id: String,
     name: Option<String>,
-    entity_count: Option<i32>,
+    service_count: Option<i32>,
     average_coherence_score: Option<f64>,
 }
 
-/// Ensures the tables needed for visualization edge weights exist
+/// Ensures the tables needed for service visualization edge weights exist
 pub async fn ensure_visualization_tables_exist(pool: &PgPool) -> Result<()> {
     let client = pool.get().await.context("Failed to get DB connection")?;
 
     // Create indices for performance
     let index_sqls = [
-        "CREATE INDEX IF NOT EXISTS idx_cluster_entity_edges_cluster_id 
-         ON clustering_metadata.cluster_entity_edges(cluster_id)",
-        "CREATE INDEX IF NOT EXISTS idx_cluster_entity_edges_entity_pairs 
-         ON clustering_metadata.cluster_entity_edges(entity_id_1, entity_id_2)",
+        "CREATE INDEX IF NOT EXISTS idx_service_edge_visualization_cluster_id 
+         ON public.service_edge_visualization(service_group_cluster_id)",
+        "CREATE INDEX IF NOT EXISTS idx_service_edge_visualization_service_pairs 
+         ON public.service_edge_visualization(service_id_1, service_id_2)",
     ];
 
     for sql in &index_sqls {
@@ -50,11 +50,11 @@ pub async fn ensure_visualization_tables_exist(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Main function to calculate edge weights between entities within each cluster
+/// Main function to calculate edge weights between services within each cluster
 /// These edge weights will be used for frontend visualization
 pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str) -> Result<usize> {
     info!(
-        "Starting entity edge weight calculation for cluster visualization (run ID: {})...",
+        "Starting service edge weight calculation for cluster visualization (run ID: {})...",
         pipeline_run_id
     );
     let start_time = Instant::now();
@@ -62,34 +62,34 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
     let mut conn = pool
         .get()
         .await
-        .context("Failed to get DB connection for calculate_visualization_edges")?;
+        .context("Failed to get DB connection for calculate_service_visualization_edges")?;
     let transaction = conn
         .transaction()
         .await
-        .context("Failed to start transaction for calculate_visualization_edges")?;
+        .context("Failed to start transaction for calculate_service_visualization_edges")?;
 
     // Clean up existing edges for this run
     transaction
         .execute(
-            "DELETE FROM public.entity_edge_visualization WHERE pipeline_run_id = $1",
+            "DELETE FROM public.service_edge_visualization WHERE pipeline_run_id = $1",
             &[&pipeline_run_id],
         )
         .await
-        .context("Failed to clean up existing edges")?;
+        .context("Failed to clean up existing service edges")?;
 
-    // Fetch all clusters
-    let clusters = fetch_clusters(&transaction).await?;
+    // Fetch all service clusters
+    let clusters = fetch_service_clusters(&transaction).await?;
     info!(
-        "Processing {} clusters for visualization edge calculation",
+        "Processing {} service clusters for visualization edge calculation",
         clusters.len()
     );
 
     let mut total_edges = 0;
 
     for cluster in &clusters {
-        let edges_count = process_cluster_for_visualization(
+        let edges_count = process_service_cluster_for_visualization(
             &transaction,
-            &GroupClusterId(cluster.id.clone()),
+            &ServiceGroupClusterId(cluster.id.clone()),
             pipeline_run_id,
         )
         .await?;
@@ -100,10 +100,10 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
     transaction
         .commit()
         .await
-        .context("Failed to commit cluster visualization edge transaction")?;
+        .context("Failed to commit service cluster visualization edge transaction")?;
 
     info!(
-        "Cluster visualization edge calculation finished in {:.2?}. {} edges created.",
+        "Service cluster visualization edge calculation finished in {:.2?}. {} edges created.",
         start_time.elapsed(),
         total_edges
     );
@@ -111,60 +111,60 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
     Ok(total_edges)
 }
 
-/// Process a single cluster to calculate visualization edges between its entities
-async fn process_cluster_for_visualization(
+/// Process a single service cluster to calculate visualization edges between its services
+async fn process_service_cluster_for_visualization(
     transaction: &Transaction<'_>,
-    cluster_id: &GroupClusterId,
+    cluster_id: &ServiceGroupClusterId,
     pipeline_run_id: &str,
 ) -> Result<usize> {
     debug!(
-        "Processing cluster {} for visualization edges",
+        "Processing service cluster {} for visualization edges",
         cluster_id.0
     );
 
-    // 1. Get all unique entities in this cluster
-    let entities = fetch_entities_in_cluster(transaction, cluster_id).await?;
-    if entities.len() < 2 {
+    // 1. Get all unique services in this cluster
+    let services = fetch_services_in_cluster(transaction, cluster_id).await?;
+    if services.len() < 2 {
         debug!(
-            "Cluster {} has fewer than 2 entities, skipping visualization edge calculation",
+            "Service cluster {} has fewer than 2 services, skipping visualization edge calculation",
             cluster_id.0
         );
         return Ok(0);
     }
 
     debug!(
-        "Found {} entities in cluster {}",
-        entities.len(),
+        "Found {} services in cluster {}",
+        services.len(),
         cluster_id.0
     );
 
     // 2. Get RL weight based on human feedback
-    let rl_weight = get_rl_weight_from_feedback(transaction).await?;
+    let rl_weight = get_service_rl_weight_from_feedback(transaction).await?;
     debug!(
-        "Using RL confidence weight of {:.2} based on human feedback",
+        "Using RL confidence weight of {:.2} based on human feedback for services",
         rl_weight
     );
 
-    // 3. For each entity pair, calculate edge weight
+    // 3. For each service pair, calculate edge weight
     let mut edges_created = 0;
-    for i in 0..entities.len() {
-        for j in (i + 1)..entities.len() {
-            let entity1_id = &entities[i];
-            let entity2_id = &entities[j];
+    for i in 0..services.len() {
+        for j in (i + 1)..services.len() {
+            let service1_id = &services[i];
+            let service2_id = &services[j];
 
-            // Ensure consistent ordering (entity_id_1 < entity_id_2)
-            let (source_id, target_id) = if entity1_id.0 < entity2_id.0 {
-                (entity1_id, entity2_id)
+            // Ensure consistent ordering (service_id_1 < service_id_2)
+            let (source_id, target_id) = if service1_id.0 < service2_id.0 {
+                (service1_id, service2_id)
             } else {
-                (entity2_id, entity1_id)
+                (service2_id, service1_id)
             };
 
-            // Find all matching methods between these entities
+            // Find all matching methods between these services
             let matching_methods =
-                fetch_entity_matching_methods(transaction, source_id, target_id).await?;
+                fetch_service_matching_methods(transaction, source_id, target_id).await?;
 
             if !matching_methods.is_empty() {
-                let edge_id = create_visualization_edge(
+                let edge_id = create_service_visualization_edge(
                     transaction,
                     cluster_id,
                     source_id,
@@ -183,27 +183,27 @@ async fn process_cluster_for_visualization(
     }
 
     debug!(
-        "Created {} visualization edges for cluster {}",
+        "Created {} visualization edges for service cluster {}",
         edges_created, cluster_id.0
     );
     Ok(edges_created)
 }
 
-/// Fetch all clusters from the database
-async fn fetch_clusters(transaction: &Transaction<'_>) -> Result<Vec<GroupClusterRecord>> {
-    let query = "SELECT id, name, entity_count, average_coherence_score FROM public.group_cluster";
+/// Fetch all service clusters from the database
+async fn fetch_service_clusters(transaction: &Transaction<'_>) -> Result<Vec<ServiceGroupClusterRecord>> {
+    let query = "SELECT id, name, service_count, average_coherence_score FROM public.service_group_cluster";
 
     let rows = transaction
         .query(query, &[])
         .await
-        .context("Failed to fetch clusters")?;
+        .context("Failed to fetch service clusters")?;
 
     let mut clusters = Vec::with_capacity(rows.len());
     for row in rows {
-        clusters.push(GroupClusterRecord {
+        clusters.push(ServiceGroupClusterRecord {
             id: row.get("id"),
             name: row.get("name"),
-            entity_count: row.get("entity_count"),
+            service_count: row.get("service_count"),
             average_coherence_score: row.get("average_coherence_score"),
         });
     }
@@ -211,55 +211,55 @@ async fn fetch_clusters(transaction: &Transaction<'_>) -> Result<Vec<GroupCluste
     Ok(clusters)
 }
 
-/// Fetch all unique entities that belong to a specific cluster
-async fn fetch_entities_in_cluster(
+/// Fetch all unique services that belong to a specific cluster
+async fn fetch_services_in_cluster(
     transaction: &Transaction<'_>,
-    cluster_id: &GroupClusterId,
-) -> Result<Vec<EntityId>> {
-    // Query to get all unique entities in a cluster from entity_group records
+    cluster_id: &ServiceGroupClusterId,
+) -> Result<Vec<ServiceId>> {
+    // Query to get all unique services in a cluster from service_group records
     let query = "
-        SELECT DISTINCT entity_id_1 as entity_id FROM public.entity_group 
+        SELECT DISTINCT service_id_1 as service_id FROM public.service_group 
         WHERE group_cluster_id = $1
         UNION
-        SELECT DISTINCT entity_id_2 as entity_id FROM public.entity_group 
+        SELECT DISTINCT service_id_2 as service_id FROM public.service_group 
         WHERE group_cluster_id = $1
     ";
 
     let rows = transaction
         .query(query, &[&cluster_id.0])
         .await
-        .context("Failed to fetch entities in cluster")?;
+        .context("Failed to fetch services in cluster")?;
 
-    let mut entities = Vec::with_capacity(rows.len());
+    let mut services = Vec::with_capacity(rows.len());
     for row in rows {
-        let entity_id: String = row.get("entity_id");
-        entities.push(EntityId(entity_id));
+        let service_id: String = row.get("service_id");
+        services.push(ServiceId(service_id));
     }
 
-    Ok(entities)
+    Ok(services)
 }
 
-/// Fetch all matching methods that connect two specific entities
-async fn fetch_entity_matching_methods(
+/// Fetch all matching methods that connect two specific services
+async fn fetch_service_matching_methods(
     transaction: &Transaction<'_>,
-    entity1_id: &EntityId,
-    entity2_id: &EntityId,
-) -> Result<Vec<EntityGroupRecord>> {
-    // We already ensure entity1_id < entity2_id before calling this
+    service1_id: &ServiceId,
+    service2_id: &ServiceId,
+) -> Result<Vec<ServiceGroupRecord>> {
+    // We already ensure service1_id < service2_id before calling this
     let query = "
         SELECT id, method_type, confidence_score, pre_rl_confidence_score, match_values
-        FROM public.entity_group
-        WHERE entity_id_1 = $1 AND entity_id_2 = $2
+        FROM public.service_group
+        WHERE service_id_1 = $1 AND service_id_2 = $2
     ";
 
     let rows = transaction
-        .query(query, &[&entity1_id.0, &entity2_id.0])
+        .query(query, &[&service1_id.0, &service2_id.0])
         .await
-        .context("Failed to fetch entity matching methods")?;
+        .context("Failed to fetch service matching methods")?;
 
     let mut methods = Vec::with_capacity(rows.len());
     for row in rows {
-        methods.push(EntityGroupRecord {
+        methods.push(ServiceGroupRecord {
             id: row.get("id"),
             method_type: row.get("method_type"),
             confidence_score: row.get("confidence_score"),
@@ -272,14 +272,14 @@ async fn fetch_entity_matching_methods(
 }
 
 /// Determine the proper weighting between RL and pre-RL confidence scores
-/// based on historical human feedback
-async fn get_rl_weight_from_feedback(transaction: &Transaction<'_>) -> Result<f64> {
+/// based on historical human feedback for services
+async fn get_service_rl_weight_from_feedback(transaction: &Transaction<'_>) -> Result<f64> {
     // Query human review feedback to see how often the RL model has been correct
     let query = "
         SELECT 
-            COUNT(CASE WHEN was_correct = true THEN 1 END) as correct_count,
-            COUNT(CASE WHEN was_correct = false THEN 1 END) as incorrect_count
-        FROM clustering_metadata.human_review_method_feedback
+            COUNT(CASE WHEN is_match_correct = true THEN 1 END) as correct_count,
+            COUNT(CASE WHEN is_match_correct = false THEN 1 END) as incorrect_count
+        FROM clustering_metadata.service_match_human_feedback
         WHERE reviewer_id != 'ml_system'
     ";
 
@@ -303,19 +303,19 @@ async fn get_rl_weight_from_feedback(transaction: &Transaction<'_>) -> Result<f6
         }
         _ => {
             // Table might not exist or query had an issue
-            debug!("Could not query human feedback, using default RL weight");
+            debug!("Could not query service human feedback, using default RL weight");
             Ok(0.6) // Balanced default
         }
     }
 }
 
-/// Calculate and store an edge between two entities for visualization
-async fn create_visualization_edge(
+/// Calculate and store an edge between two services for visualization
+async fn create_service_visualization_edge(
     transaction: &Transaction<'_>,
-    cluster_id: &GroupClusterId,
-    entity1_id: &EntityId,
-    entity2_id: &EntityId,
-    matching_methods: &[EntityGroupRecord],
+    cluster_id: &ServiceGroupClusterId,
+    service1_id: &ServiceId,
+    service2_id: &ServiceId,
+    matching_methods: &[ServiceGroupRecord],
     rl_weight: f64,
     pipeline_run_id: &str,
 ) -> Result<String> {
@@ -351,12 +351,10 @@ async fn create_visualization_edge(
     }
 
     // Calculate aggregate edge weight using probabilistic combination
-    // This ensures multiple weak methods don't produce a stronger edge than one strong method
     let edge_weight = if method_confidences.is_empty() {
         0.0
     } else {
         // 1 - product of (1 - confidence)
-        // Similar approach as used in consolidate_clusters.rs for edge weight calculation
         1.0 - method_confidences
             .iter()
             .fold(1.0, |acc, &conf| acc * (1.0 - conf.max(0.0).min(1.0)))
@@ -372,21 +370,21 @@ async fn create_visualization_edge(
 
     transaction
         .execute(
-            "INSERT INTO public.entity_edge_visualization
-         (id, cluster_id, entity_id_1, entity_id_2, edge_weight, details, pipeline_run_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO public.service_edge_visualization
+             (id, service_group_cluster_id, service_id_1, service_id_2, edge_weight, details, pipeline_run_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
             &[
                 &edge_id,
                 &cluster_id.0,
-                &entity1_id.0,
-                &entity2_id.0,
+                &service1_id.0,
+                &service2_id.0,
                 &edge_weight,
                 &details_json,
                 &pipeline_run_id,
             ],
         )
         .await
-        .context("Failed to insert visualization entity edge")?;
+        .context("Failed to insert visualization service edge")?;
 
     Ok(edge_id)
 }

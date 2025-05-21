@@ -10,6 +10,8 @@ pub mod reinforcement;
 pub mod results;
 pub mod service_matching;
 pub mod utils;
+pub mod service_consolidate_clusters;
+pub mod service_cluster_visualization;
 
 // Re-export common types for easier access
 pub use models::{
@@ -19,4 +21,3 @@ pub use models::{
 
 // Re-export important functionality
 pub use db::PgPool;
-pub use reinforcement::MatchingOrchestrator;

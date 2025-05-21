@@ -72,15 +72,20 @@ pub struct PipelineStats {
     pub total_groups: usize, // "groups" means pairwise links
     pub total_clusters: usize,
     pub total_service_matches: usize,
+    pub total_service_clusters: usize,
+    pub total_service_visualization_edges: usize,
     pub total_visualization_edges: usize, // New field for tracking visualization edges
 
     pub entity_processing_time: f64,
     pub context_feature_extraction_time: f64,
+    pub service_context_feature_extraction_time: f64,
     pub matching_time: f64,
     pub clustering_time: f64,
     pub visualization_edge_calculation_time: f64, // New timing field
     pub service_matching_time: f64,
     pub total_processing_time: f64,
+    pub service_clustering_time: f64,
+    pub service_visualization_edge_calculation_time: f64,
 
     pub method_stats: Vec<MatchMethodStats>,
     pub cluster_stats: Option<ClusterStats>,
@@ -127,8 +132,9 @@ impl AnyMatchResult {
 // `groups_created` will mean pairs created.
 #[derive(Debug, Clone)]
 pub struct ServiceMatchResult {
-    pub groups_created: usize, // Number of service_match pairs created
-    pub stats: MatchMethodStats,
+    pub groups_created: usize,
+    pub stats: MatchMethodStats, // Primary stats (typically first method or combined)
+    pub method_stats: Vec<MatchMethodStats>, // Stats for all methods used
 }
 #[derive(Debug, Clone)]
 pub struct EmailMatchResult {

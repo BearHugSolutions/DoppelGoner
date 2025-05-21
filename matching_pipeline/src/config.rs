@@ -15,3 +15,7 @@ pub const LEIDEN_RESOLUTION_PARAMETER: f64 = 1.0;
 
 // Minimum final confidence for a geospatial pair to be formed
 pub const MIN_GEO_PAIR_CONFIDENCE_THRESHOLD: f64 = 0.2; // Added constant
+
+pub const SERVICE_WEAK_LINK_THRESHOLD: f64 = 0.15; // Slightly higher than entity threshold
+pub const SERVICE_VERIFICATION_THRESHOLD: f64 = 0.65; // Slightly lower than entity threshold
+pub const SERVICE_LEIDEN_RESOLUTION_PARAMETER: f64 = 1.2; // Higher resolution for more granular clusters

@@ -22,7 +22,8 @@ use crate::models::{
     ActionType, EntityGroupId, EntityId, MatchMethodType, MatchValues, NewSuggestedAction,
     SuggestionStatus, UrlMatchValue,
 };
-use crate::reinforcement::{self, MatchingOrchestrator, SharedFeatureCache};
+use crate::reinforcement::entity::feature_cache_service::SharedFeatureCache;
+use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
 use crate::results::{AnyMatchResult, MatchMethodStats, UrlMatchResult};
 use serde_json;
 

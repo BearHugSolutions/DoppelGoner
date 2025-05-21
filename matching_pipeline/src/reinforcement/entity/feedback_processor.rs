@@ -1,4 +1,4 @@
-// src/reinforcement/feedback_processor.rs
+// src/reinforcement/entity/feedback_processor.rs
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use serde_json::Value as JsonValue; // For parsing JSONB features
@@ -6,8 +6,9 @@ use tokio_postgres::Client as PgClient; // Direct use of PgClient
 use uuid::Uuid;
 
 use crate::db::PgPool; // Assuming this is the main pool type
-use crate::reinforcement::confidence_tuner::ConfidenceTuner;
-use crate::reinforcement::types::HumanFeedbackDataForTuner; // New type for this process
+use crate::reinforcement::types::HumanFeedbackDataForTuner;
+
+use super::confidence_tuner::ConfidenceTuner; // New type for this process
 
 // This struct will represent a row fetched from `clustering_metadata.human_feedback`
 // It's an internal representation for this module.

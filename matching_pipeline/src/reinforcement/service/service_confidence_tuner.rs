@@ -1,14 +1,14 @@
-// src/reinforcement/confidence_tuner.rs
+// src/reinforcement/service_confidence_tuner.rs
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue}; // Renamed Value to JsonValue
+use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::db::PgPool; // Assuming this is the main pool type
-use crate::models::MatchMethodType; // Assuming this is the correct path
+use crate::db::PgPool;
+use crate::models::MatchMethodType;
 
 // Represents one "arm" in the multi-armed bandit for a specific method and confidence level.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -16,7 +16,6 @@ struct ConfidenceArm {
     target_confidence: f64, // The confidence level this arm represents/targets
     reward_sum: f64,
     trials: usize,
-    // Optional: could store context features that led to this arm being chosen if needed for more complex updates
 }
 
 impl ConfidenceArm {
@@ -35,7 +34,7 @@ impl ConfidenceArm {
 
     fn average_reward(&self) -> f64 {
         if self.trials == 0 {
-            0.0 // Avoid division by zero; could also be a small default positive value
+            0.0 // Avoid division by zero
         } else {
             self.reward_sum / self.trials as f64
         }
@@ -47,7 +46,6 @@ impl ConfidenceArm {
             return f64::INFINITY; // Prioritize unexplored arms
         }
         let exploitation_term = self.average_reward();
-        // Ensure total_parent_trials is at least 1 to avoid ln(0)
         let exploration_term =
             (2.0 * (total_parent_trials.max(1) as f64).ln() / self.trials as f64).sqrt();
         exploitation_term + exploration_term
@@ -55,30 +53,25 @@ impl ConfidenceArm {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ConfidenceTuner {
-    // Key: method_type (e.g., "email", "name")
+pub struct ServiceConfidenceTuner {
+    // Key: method_type (e.g., "service_name", "service_url")
     // Value: Vector of arms, each representing a discrete confidence output level for that method.
     method_arms: HashMap<String, Vec<ConfidenceArm>>,
     epsilon: f64, // Probability of choosing a random arm (exploration)
     pub version: u32,
-    // For V1, context_thresholds are removed as ContextModel is removed.
-    // The selection logic will directly use context_features if needed.
 }
 
-impl ConfidenceTuner {
+impl ServiceConfidenceTuner {
     pub fn new() -> Self {
         let mut method_arms = HashMap::new();
         let default_epsilon = 0.1; // 10% exploration rate
 
         // Define discrete confidence levels (arms) for each matching method.
-        // These are the potential confidence scores the tuner can output.
         let arm_levels: HashMap<&str, Vec<f64>> = [
-            ("email", vec![0.85, 0.90, 0.95, 0.98, 1.0]),
-            ("phone", vec![0.80, 0.85, 0.90, 0.95, 0.98]),
-            ("url", vec![0.80, 0.85, 0.90, 0.95]),
-            ("address", vec![0.75, 0.80, 0.85, 0.90, 0.95]),
-            ("name", vec![0.70, 0.75, 0.80, 0.85, 0.90, 0.92, 0.95]),
-            ("geospatial", vec![0.70, 0.75, 0.80, 0.85, 0.90]),
+            ("service_email", vec![0.85, 0.90, 0.95, 0.98, 1.0]),
+            ("service_url", vec![0.80, 0.85, 0.90, 0.95]),
+            ("service_name", vec![0.70, 0.75, 0.80, 0.85, 0.90, 0.92, 0.95]),
+            ("service_embedding", vec![0.80, 0.85, 0.90, 0.95]),
             // A default for any other methods that might be introduced
             ("default", vec![0.70, 0.80, 0.85, 0.90]),
         ]
@@ -99,13 +92,10 @@ impl ConfidenceTuner {
     }
 
     /// Selects a tuned confidence score for a given method and its context features.
-    /// For V1, this uses UCB1 based on the method type. Context features are passed
-    /// for future enhancements but not directly used in arm selection in this simplified V1.
-    /// The `pre_rl_confidence` is also logged but not directly used by this UCB selection.
     pub fn select_confidence(
         &self,
         method_name: &str,
-        _context_features: &[f64], // Available for future, more sophisticated arm selection
+        _context_features: &[f64], // Available for future use
         _pre_rl_confidence: f64,   // Available for logging and future use
     ) -> f64 {
         // Create a fallback vector that lives for the duration of this function
@@ -119,11 +109,11 @@ impl ConfidenceTuner {
                     method_name
                 );
                 self.method_arms.get("default").unwrap_or_else(|| {
-                // This should ideally not happen if "default" is always in method_arms
-                warn!("Critical: Default arms not found in ConfidenceTuner. Returning fixed default.");
-                // Reference the locally-created vector instead of creating a temporary one
-                &fallback_arms
-            })
+                    // This should ideally not happen if "default" is always in method_arms
+                    warn!("Critical: Default arms not found in ServiceConfidenceTuner. Returning fixed default.");
+                    // Reference the locally-created vector instead of creating a temporary one
+                    &fallback_arms
+                })
             }
         };
 
@@ -133,7 +123,7 @@ impl ConfidenceTuner {
             let random_arm_index = rng.gen_range(0..arms_for_method.len());
             let selected_confidence = arms_for_method[random_arm_index].target_confidence;
             debug!(
-                "ConfidenceTuner (v{}): EXPLORE for method '{}'. Selected arm with confidence {:.3}",
+                "ServiceConfidenceTuner (v{}): EXPLORE for method '{}'. Selected arm with confidence {:.3}",
                 self.version, method_name, selected_confidence
             );
             selected_confidence
@@ -159,7 +149,7 @@ impl ConfidenceTuner {
 
             let selected_confidence = best_arm.target_confidence;
             debug!(
-                "ConfidenceTuner (v{}): EXPLOIT for method '{}'. Selected arm with confidence {:.3} (UCB score calculation based on {} total trials for method)",
+                "ServiceConfidenceTuner (v{}): EXPLOIT for method '{}'. Selected arm with confidence {:.3} (UCB score calculation based on {} total trials for method)",
                 self.version, method_name, selected_confidence, total_trials_for_method
             );
             selected_confidence
@@ -167,8 +157,6 @@ impl ConfidenceTuner {
     }
 
     /// Updates the tuner based on feedback for a specific decision.
-    /// The `tuned_confidence_output` is the confidence score that was actually output by `select_confidence`
-    /// for this specific instance.
     pub fn update(
         &mut self,
         method_name: &str,
@@ -178,7 +166,7 @@ impl ConfidenceTuner {
         let arms_for_method = match self.method_arms.get_mut(method_name) {
             Some(arms) => arms,
             None => {
-                warn!("ConfidenceTuner (v{}): Method '{}' not found during update. Cannot update arms.", self.version, method_name);
+                warn!("ServiceConfidenceTuner (v{}): Method '{}' not found during update. Cannot update arms.", self.version, method_name);
                 // Optionally, create arms for this new method on the fly, or use "default"
                 // For now, we'll just return if the method is unknown to prevent altering "default" unintentionally.
                 return Ok(());
@@ -194,12 +182,12 @@ impl ConfidenceTuner {
         {
             arm_to_update.update(reward);
             debug!(
-                "ConfidenceTuner (v{}): Updated arm for method '{}' (target_confidence: {:.3}) with reward {:.1}. New avg reward: {:.3}, trials: {}",
+                "ServiceConfidenceTuner (v{}): Updated arm for method '{}' (target_confidence: {:.3}) with reward {:.1}. New avg reward: {:.3}, trials: {}",
                 self.version, method_name, arm_to_update.target_confidence, reward, arm_to_update.average_reward(), arm_to_update.trials
             );
         } else {
             warn!(
-                "ConfidenceTuner (v{}): Could not find matching arm for method '{}' with output confidence {:.3} during update. No arm updated.",
+                "ServiceConfidenceTuner (v{}): Could not find matching arm for method '{}' with output confidence {:.3} during update. No arm updated.",
                 self.version, method_name, tuned_confidence_output
             );
         }
@@ -222,17 +210,17 @@ impl ConfidenceTuner {
         let conn = pool
             .get()
             .await
-            .context("Failed to get DB connection for ConfidenceTuner save")?;
+            .context("Failed to get DB connection for ServiceConfidenceTuner save")?;
         self.version += 1; // Increment version on save
         let model_json =
-            serde_json::to_value(&*self).context("Failed to serialize ConfidenceTuner to JSON")?;
+            serde_json::to_value(&*self).context("Failed to serialize ServiceConfidenceTuner to JSON")?;
 
-        let id_prefix = "confidence_tuner";
+        let id_prefix = "service_confidence_tuner";
         // Try to find the latest existing ID for this model_type to maintain a consistent ID if possible
         let latest_model_row = conn.query_opt(
-            "SELECT id FROM clustering_metadata.ml_models WHERE model_type = $1 ORDER BY version DESC LIMIT 1",
+            "SELECT id FROM clustering_metadata.service_ml_models WHERE model_type = $1 ORDER BY version DESC LIMIT 1",
             &[&id_prefix]
-        ).await.context("Failed to query for latest ConfidenceTuner model ID")?;
+        ).await.context("Failed to query for latest ServiceConfidenceTuner model ID")?;
 
         let model_id = if let Some(row) = latest_model_row {
             row.get::<_, String>(0) // Use existing base ID
@@ -265,27 +253,27 @@ impl ConfidenceTuner {
         let metrics = json!(metrics_map);
 
         conn.execute(
-            "INSERT INTO clustering_metadata.ml_models
+            "INSERT INTO clustering_metadata.service_ml_models
              (id, model_type, parameters, metrics, version, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
              ON CONFLICT (id) DO UPDATE
              SET parameters = EXCLUDED.parameters, metrics = EXCLUDED.metrics, version = EXCLUDED.version, updated_at = CURRENT_TIMESTAMP",
             &[&model_id, &id_prefix, &parameters, &metrics, &(self.version as i32)],
-        ).await.context(format!("Failed to insert/update ConfidenceTuner metadata for ID {}", model_id))?;
+        ).await.context(format!("Failed to insert/update ServiceConfidenceTuner metadata for ID {}", model_id))?;
 
         // Store the full serialized model separately for easy loading
         let binary_model_id = format!("{}_binary", model_id);
         conn.execute(
-            "INSERT INTO clustering_metadata.ml_models
+            "INSERT INTO clustering_metadata.service_ml_models
              (id, model_type, parameters, version, created_at, updated_at)
              VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
              ON CONFLICT (id) DO UPDATE
              SET parameters = EXCLUDED.parameters, version = EXCLUDED.version, updated_at = CURRENT_TIMESTAMP",
             &[&binary_model_id, &format!("{}_binary", id_prefix), &model_json, &(self.version as i32)],
-        ).await.context(format!("Failed to insert/update ConfidenceTuner binary for ID {}", binary_model_id))?;
+        ).await.context(format!("Failed to insert/update ServiceConfidenceTuner binary for ID {}", binary_model_id))?;
 
         info!(
-            "Saved ConfidenceTuner (v{}) to database. Metadata ID: {}, Binary ID: {}",
+            "Saved ServiceConfidenceTuner (v{}) to database. Metadata ID: {}, Binary ID: {}",
             self.version, model_id, binary_model_id
         );
         Ok(model_id)
@@ -295,26 +283,26 @@ impl ConfidenceTuner {
         let conn = pool
             .get()
             .await
-            .context("Failed to get DB connection for ConfidenceTuner load")?;
-        let id_prefix = "confidence_tuner";
+            .context("Failed to get DB connection for ServiceConfidenceTuner load")?;
+        let id_prefix = "service_confidence_tuner";
         let binary_model_type = format!("{}_binary", id_prefix);
 
         let binary_row_opt = conn.query_opt(
-            "SELECT parameters FROM clustering_metadata.ml_models WHERE model_type = $1 ORDER BY version DESC LIMIT 1",
+            "SELECT parameters FROM clustering_metadata.service_ml_models WHERE model_type = $1 ORDER BY version DESC LIMIT 1",
             &[&binary_model_type]
-        ).await.context("Failed to query for latest ConfidenceTuner binary")?;
+        ).await.context("Failed to query for latest ServiceConfidenceTuner binary")?;
 
         if let Some(binary_row) = binary_row_opt {
             let model_json: JsonValue = binary_row.get(0);
-            let loaded_tuner: ConfidenceTuner = serde_json::from_value(model_json)
-                .context("Failed to deserialize ConfidenceTuner from DB JSON")?;
+            let loaded_tuner: ServiceConfidenceTuner = serde_json::from_value(model_json)
+                .context("Failed to deserialize ServiceConfidenceTuner from DB JSON")?;
             info!(
-                "Loaded ConfidenceTuner (v{}) from database.",
+                "Loaded ServiceConfidenceTuner (v{}) from database.",
                 loaded_tuner.version
             );
             Ok(loaded_tuner)
         } else {
-            info!("No existing ConfidenceTuner found in DB (type: {}). Creating new default instance.", binary_model_type);
+            info!("No existing ServiceConfidenceTuner found in DB (type: {}). Creating new default instance.", binary_model_type);
             Ok(Self::new())
         }
     }

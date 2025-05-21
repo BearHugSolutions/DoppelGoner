@@ -65,9 +65,16 @@ pub struct OrganizationId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EntityGroupId(pub String);
 
+/// Strongly typed identifier for ServiceGroup records
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ServiceGroupId(pub String);
+
 /// Strongly typed identifier for GroupCluster records
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupClusterId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ServiceGroupClusterId(pub String);
 
 /// Strongly typed identifier for Service records from HSDS
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -195,6 +202,11 @@ pub enum MatchMethodType {
 
     /// Custom matcher type (for extensibility)
     Custom(String),
+
+    ServiceNameSimilarity,
+    ServiceUrlMatch,
+    ServiceEmailMatch,
+    ServiceEmbeddingSimilarity,
 }
 
 impl MatchMethodType {
@@ -208,6 +220,10 @@ impl MatchMethodType {
             Self::Geospatial => "geospatial",
             Self::Name => "name",
             Self::Custom(s) => s.as_str(),
+            Self::ServiceNameSimilarity => "service_name",
+            Self::ServiceUrlMatch => "service_url",
+            Self::ServiceEmailMatch => "service_email",
+            Self::ServiceEmbeddingSimilarity => "service_embedding",
         }
     }
 
@@ -220,6 +236,10 @@ impl MatchMethodType {
             "address" => Self::Address,
             "geospatial" => Self::Geospatial,
             "name" => Self::Name,
+            "service_name" => Self::ServiceNameSimilarity,
+            "service_url" => Self::ServiceUrlMatch,
+            "service_email" => Self::ServiceEmailMatch,
+            "service_embedding" => Self::ServiceEmbeddingSimilarity,
             _ => Self::Custom(s.to_string()),
         }
     }
@@ -368,6 +388,34 @@ pub enum MatchValues {
     /// If it's a single generic value, it would be Generic(String).
     /// The plan was less specific here, so retaining Vec for flexibility.
     Generic(Vec<String>),
+
+    ServiceName(ServiceNameMatchValue),
+    ServiceUrl(ServiceUrlMatchValue),
+    ServiceEmail(EmailMatchValue), // Reuse EmailMatchValue
+    ServiceEmbedding(ServiceEmbeddingMatchValue),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceNameMatchValue {
+    pub original_name1: String,
+    pub original_name2: String,
+    pub normalized_name1: String,
+    pub normalized_name2: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceUrlMatchValue {
+    pub original_url1: String,
+    pub original_url2: String,
+    pub normalized_shared_domain: String,
+    pub matching_slug_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceEmbeddingMatchValue {
+    pub name1: String,
+    pub name2: String,
+    pub embedding_similarity: f64,
 }
 
 /// Represents matched URL values for a pair of entities.
@@ -634,4 +682,13 @@ pub struct ContributingSharedEntityDetail {
     pub conf_entity_in_target_group: f64, // Confidence of this entity being in the target pair
     #[serde(rename = "W_z")]
     pub w_z: f64, // Weight contribution of this shared entity to the edge
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContributingSharedServiceDetail {
+    pub service_id: String,
+    pub conf_service_in_source_group: f64,
+    pub conf_service_in_target_group: f64,
+    #[serde(rename = "W_z")]
+    pub w_z: f64,
 }

@@ -14,7 +14,8 @@ use crate::models::{
     ActionType, EntityGroupId, EntityId, GeospatialMatchValue, MatchMethodType, MatchValues,
     NewSuggestedAction, SuggestionStatus,
 };
-use crate::reinforcement::{MatchingOrchestrator, SharedFeatureCache};
+use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
+use crate::reinforcement::entity::feature_cache_service::SharedFeatureCache;
 use crate::results::{AnyMatchResult, GeospatialMatchResult, MatchMethodStats};
 use serde_json;
 

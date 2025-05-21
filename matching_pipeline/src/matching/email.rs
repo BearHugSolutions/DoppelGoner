@@ -20,7 +20,8 @@ use crate::models::{
     NewSuggestedAction,
     SuggestionStatus,
 };
-use crate::reinforcement::{MatchingOrchestrator, SharedFeatureCache};
+use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
+use crate::reinforcement::entity::feature_cache_service::SharedFeatureCache;
 use crate::results::{AnyMatchResult, EmailMatchResult, MatchMethodStats};
 use serde_json;
 

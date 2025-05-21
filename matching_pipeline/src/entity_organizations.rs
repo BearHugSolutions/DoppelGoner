@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::db::PgPool;
 use crate::models::{Entity, EntityFeature, EntityId, OrganizationId};
-use crate::reinforcement::get_stored_entity_features;
+use crate::reinforcement::entity::feature_extraction::get_stored_entity_features;
 
 /// Extracts entities from the organization table
 /// Creates an entity record for each organization with its metadata
@@ -811,13 +811,13 @@ pub async fn extract_and_store_all_entity_context_features(pool: &PgPool) -> Res
     let desired_concurrency = 30;
 
     // Atomic counters for tracking progress in a thread-safe manner
-    let Succeeded_count = Arc::new(AtomicUsize::new(0));
+    let succeeded_count = Arc::new(AtomicUsize::new(0));
     let processed_for_log_count = Arc::new(AtomicUsize::new(0));
 
     stream::iter(entity_ids)
         .map(|entity_id| {
             let pool_clone = pool.clone(); // Clone the pool for each spawned task
-            let Succeeded_clone = Arc::clone(&Succeeded_count);
+            let succeeded_clone = Arc::clone(&succeeded_count);
             let processed_log_clone = Arc::clone(&processed_for_log_count);
             // Shadow total_entities_to_process to avoid capturing the outer variable directly in the 'static future
             let total_entities = total_entities_to_process;
@@ -830,7 +830,7 @@ pub async fn extract_and_store_all_entity_context_features(pool: &PgPool) -> Res
                         match get_stored_entity_features(&*conn_guard, &entity_id).await {
                             Ok(_features) => {
                                 // If features are successfully retrieved or generated.
-                                Succeeded_clone.fetch_add(1, Ordering::Relaxed);
+                                succeeded_clone.fetch_add(1, Ordering::Relaxed);
                                 debug!("Features ensured for entity {}", entity_id.0);
                             }
                             Err(e) => {
@@ -860,12 +860,12 @@ pub async fn extract_and_store_all_entity_context_features(pool: &PgPool) -> Res
         })
         .await;
 
-    let final_Succeeded_count = Succeeded_count.load(Ordering::Relaxed);
+    let final_succeeded_count = succeeded_count.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed();
     info!(
         "Parallel context feature extraction and storage complete in {:.2?}. Ensured features for {} out of {} entities.",
-        elapsed, final_Succeeded_count, total_entities_to_process
+        elapsed, final_succeeded_count, total_entities_to_process
     );
 
-    Ok(final_Succeeded_count)
+    Ok(final_succeeded_count)
 }

@@ -12,13 +12,11 @@ use strsim::jaro_winkler;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{config, reinforcement::SharedFeatureCache};
-use crate::db::PgPool;
+use crate::{config, db::PgPool, reinforcement::entity::{feature_cache_service::SharedFeatureCache, orchestrator::MatchingOrchestrator}};
 use crate::models::{
     ActionType, Entity, EntityGroupId, EntityId, MatchMethodType, MatchValues, NameMatchValue,
     NewSuggestedAction, OrganizationId, SuggestionStatus,
 };
-use crate::reinforcement::MatchingOrchestrator;
 use crate::results::{AnyMatchResult, MatchMethodStats, NameMatchResult};
 use crate::utils::cosine_similarity_candle;
 use serde_json;

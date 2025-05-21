@@ -1,14 +1,14 @@
-// src/reinforcement/orchestrator.rs - Updated to use feature cache
+// src/reinforcement/entity/orchestrator.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, info, warn};
 use uuid::Uuid;
 
 use super::confidence_tuner::ConfidenceTuner;
-use super::SharedFeatureCache;
+use super::feature_cache_service::SharedFeatureCache;
 use crate::db::{insert_match_decision_detail, PgPool};
 use crate::models::{EntityId, MatchMethodType};
-use crate::reinforcement::feedback_processor;
+use crate::reinforcement::entity::feedback_processor;
 
 pub struct MatchingOrchestrator {
     pub confidence_tuner: ConfidenceTuner,

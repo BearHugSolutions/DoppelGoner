@@ -20,7 +20,8 @@ use crate::models::{
     NewSuggestedAction,
     SuggestionStatus,
 };
-use crate::reinforcement::{self, MatchingOrchestrator, SharedFeatureCache};
+use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
+use crate::reinforcement::entity::feature_cache_service::SharedFeatureCache;
 use crate::results::{AddressMatchResult, AnyMatchResult, MatchMethodStats}; // PairMlResult might not be needed if not used
 use serde_json;
 

@@ -14,7 +14,8 @@ use crate::models::{
     ActionType, EntityGroupId, EntityId, MatchMethodType, MatchValues, NewSuggestedAction,
     PhoneMatchValue, SuggestionStatus,
 };
-use crate::reinforcement::{MatchingOrchestrator, SharedFeatureCache};
+use crate::reinforcement::entity::feature_cache_service::SharedFeatureCache;
+use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
 use crate::results::{AnyMatchResult, MatchMethodStats, PhoneMatchResult};
 use serde_json;
 

@@ -1,4 +1,4 @@
-// src/reinforcement/feature_extraction.rs
+// src/reinforcement/entity/feature_extraction.rs
 use anyhow::{Context, Result};
 use futures::future;
 use log::{debug, error, info, warn, Level as LogLevel};
@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use candle_core::{Device, Error as CandleError};
 
-use super::types::FeatureMetadata;
 use crate::db::PgPool; // Assuming this is the main pool type from crate::db
 use crate::models::EntityId;
+use crate::reinforcement::types::FeatureMetadata;
 use crate::utils::cosine_similarity_candle; // Assuming this utility is in crate::utils
 
 // Helper to get a Candle device (same as before)
