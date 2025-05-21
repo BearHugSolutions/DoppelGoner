@@ -387,9 +387,8 @@ async fn get_high_degree_pairs(
 ) -> Result<Vec<(EntityId, EntityId, f64)>> {
     let conn = pool.get().await.context("Failed to get DB connection")?;
 
-    let rows = conn
-        .query(
-            "WITH entity_degree AS (
+    let rows = conn.query(
+        "WITH entity_degree AS (
           SELECT entity_id, COUNT(*) AS match_count
           FROM (
             SELECT entity_id_1 AS entity_id FROM public.entity_group
@@ -404,12 +403,12 @@ async fn get_high_degree_pairs(
           SELECT DISTINCT
             LEAST(ed1.entity_id, ed2.entity_id) AS entity_id_1,
             GREATEST(ed1.entity_id, ed2.entity_id) AS entity_id_2,
-            (ed1.match_count + ed2.match_count) / 100.0 AS popularity_score
+            (ed1.match_count + ed2.match_count) / 100.0::double precision AS popularity_score
           FROM entity_degree ed1
           CROSS JOIN entity_degree ed2
           WHERE ed1.entity_id < ed2.entity_id
         )
-        SELECT cp.entity_id_1, cp.entity_id_2, LEAST(cp.popularity_score, 1.0) AS score
+        SELECT cp.entity_id_1, cp.entity_id_2, LEAST(cp.popularity_score, 1.0)::double precision AS score
         FROM candidate_pairs cp
         LEFT JOIN public.entity_group eg ON 
           (cp.entity_id_1 = eg.entity_id_1 AND cp.entity_id_2 = eg.entity_id_2) OR
@@ -417,10 +416,8 @@ async fn get_high_degree_pairs(
         WHERE eg.id IS NULL
         ORDER BY score DESC
         LIMIT $1",
-            &[&(limit as i64)],
-        )
-        .await
-        .context("Failed to query high degree pairs")?;
+        &[&(limit as i64)],
+    ).await.context("Failed to query high degree pairs")?;
 
     let pairs = rows
         .into_iter()
