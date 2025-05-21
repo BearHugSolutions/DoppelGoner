@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::future::try_join_all;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::{
     any::Any,
     collections::HashMap,
@@ -29,9 +29,14 @@ use dedupe_lib::{
             orchestrator::MatchingOrchestrator,
         },
         service::{
-            service_feature_cache_prewarmer::{extract_and_store_all_service_features_and_prewarm_cache, prewarm_service_pair_features_cache}, service_feature_cache_service::{
+            service_feature_cache_prewarmer::{
+                extract_and_store_all_service_features_and_prewarm_cache,
+                prewarm_service_pair_features_cache,
+            },
+            service_feature_cache_service::{
                 create_shared_service_cache, SharedServiceFeatureCache,
-            }, service_orchestrator::{self, ServiceMatchingOrchestrator}
+            },
+            service_orchestrator::{self, ServiceMatchingOrchestrator},
         },
     },
     results::{
@@ -298,7 +303,8 @@ async fn run_pipeline(
 
     // Extract and store individual service features
     let service_features_count =
-        extract_and_store_all_service_features_and_prewarm_cache(pool, &service_feature_cache).await?;
+        extract_and_store_all_service_features_and_prewarm_cache(pool, &service_feature_cache)
+            .await?;
 
     // Pre-warm service pair features cache
     let max_service_pairs = 5000;
@@ -785,131 +791,259 @@ async fn run_service_matching_pipeline(
     service_orchestrator: Arc<Mutex<ServiceMatchingOrchestrator>>,
     feature_cache: SharedServiceFeatureCache,
 ) -> Result<results::ServiceMatchResult> {
-    info!("Starting service matching pipeline with parallel execution...");
+    info!("Starting cluster-scoped service matching pipeline...");
     let start_time = Instant::now();
 
-    // The vector of JoinHandles will hold tasks that resolve to Result<ServiceMatchResult, anyhow::Error>
-    let mut tasks: Vec<JoinHandle<Result<ServiceMatchResult, anyhow::Error>>> = Vec::new();
-
-    // --- Spawn Name Matching Task ---
-    let pool_clone_name = pool.clone();
-    let orchestrator_clone_name = service_orchestrator.clone();
-    let run_id_clone_name = pipeline_run_id.to_string();
-    let feature_cache_clone_name = feature_cache.clone();
-    tasks.push(tokio::spawn(async move {
-        info!("Starting service name matching task...");
-        let result = service_matching::name::find_matches(
-            &pool_clone_name,
-            Some(orchestrator_clone_name),
-            &run_id_clone_name,
-            Some(feature_cache_clone_name),
-        )
+    // 1. Get all cluster IDs
+    let conn = pool
+        .get()
         .await
-        .context("Service name matching task failed");
-        info!(
-            "Service name matching task finished: {:?}",
-            result.as_ref().map(|r| r.groups_created)
-        );
-        result
-    }));
-
-    // --- Spawn URL Matching Task ---
-    let pool_clone_url = pool.clone();
-    let orchestrator_clone_url = service_orchestrator.clone();
-    let run_id_clone_url = pipeline_run_id.to_string();
-    let feature_cache_clone_url = feature_cache.clone();
-    tasks.push(tokio::spawn(async move {
-        info!("Starting service URL matching task...");
-        let result = service_matching::url::find_matches(
-            &pool_clone_url,
-            Some(orchestrator_clone_url),
-            &run_id_clone_url,
-            Some(feature_cache_clone_url),
-        )
+        .context("Failed to get DB connection for clusters")?;
+    let cluster_rows = conn
+        .query(
+            "SELECT id FROM public.group_cluster WHERE id IS NOT NULL",
+            &[],
+        ) // Ensure id is not null
         .await
-        .context("Service URL matching task failed");
-        info!(
-            "Service URL matching task finished: {:?}",
-            result.as_ref().map(|r| r.groups_created)
-        );
-        result
-    }));
+        .context("Failed to query group_cluster IDs")?;
 
-    // --- Spawn Email Matching Task ---
-    let pool_clone_email = pool.clone();
-    let orchestrator_clone_email = service_orchestrator.clone();
-    let run_id_clone_email = pipeline_run_id.to_string();
-    let feature_cache_clone_email = feature_cache.clone();
-    tasks.push(tokio::spawn(async move {
-        info!("Starting service email matching task...");
-        let result = service_matching::email::find_matches(
-            &pool_clone_email,
-            Some(orchestrator_clone_email),
-            &run_id_clone_email,
-            Some(feature_cache_clone_email),
-        )
-        .await
-        .context("Service email matching task failed");
-        info!(
-            "Service email matching task finished: {:?}",
-            result.as_ref().map(|r| r.groups_created)
-        );
-        result
-    }));
+    let cluster_ids: Vec<String> = cluster_rows.into_iter().map(|row| row.get("id")).collect();
 
-    // --- Spawn Embedding Matching Task ---
-    let pool_clone_embedding = pool.clone();
-    let orchestrator_clone_embedding = service_orchestrator.clone();
-    let run_id_clone_embedding = pipeline_run_id.to_string();
-    let feature_cache_clone_embedding = feature_cache.clone();
-    tasks.push(tokio::spawn(async move {
-        info!("Starting service embedding matching task...");
-        let result = service_matching::embedding::find_matches(
-            &pool_clone_embedding,
-            Some(orchestrator_clone_embedding),
-            &run_id_clone_embedding,
-            Some(feature_cache_clone_embedding),
-        )
-        .await
-        .context("Service embedding matching task failed");
-        info!(
-            "Service embedding matching task finished: {:?}",
-            result.as_ref().map(|r| r.groups_created)
-        );
-        result
-    }));
+    if cluster_ids.is_empty() {
+        info!("No entity clusters found. Service matching will be skipped.");
+        return Ok(results::ServiceMatchResult {
+            groups_created: 0,
+            stats: results::MatchMethodStats {
+                method_type: MatchMethodType::Custom("service_combined_skipped".to_string()),
+                groups_created: 0,
+                entities_matched: 0,
+                avg_confidence: 0.0,
+                avg_group_size: 0.0,
+            },
+            method_stats: vec![],
+        });
+    }
+    info!(
+        "Found {} entity clusters for cluster-scoped service matching. Processing each...",
+        cluster_ids.len()
+    );
 
-    // try_join_all awaits all JoinHandles.
-    let join_handle_results = try_join_all(tasks).await;
+    let mut all_tasks: Vec<JoinHandle<Result<ServiceMatchResult, anyhow::Error>>> = Vec::new();
 
-    let mut total_groups_created = 0;
-    let mut method_stats: Vec<results::MatchMethodStats> = Vec::new();
-    let mut completed_methods = 0;
-    let total_matching_methods = 4; // name, url, email, embedding
+    for cluster_id_str in cluster_ids {
+        // 2. For each cluster_id, get its services' relevant details
+        let service_detail_rows = conn
+            .query(
+                "WITH cluster_entities AS (
+                SELECT entity_id_1 AS entity_id FROM public.entity_group WHERE group_cluster_id = $1
+                UNION
+                SELECT entity_id_2 AS entity_id FROM public.entity_group WHERE group_cluster_id = $1
+            )
+            SELECT
+                s.id,
+                s.name,
+                s.url,
+                s.email,
+                s.embedding_v2
+            FROM public.service s
+            JOIN public.entity_feature ef ON s.id = ef.table_id AND ef.table_name = 'service'
+            WHERE ef.entity_id IN (SELECT entity_id FROM cluster_entities)
+              AND s.status = 'active'
+            GROUP BY s.id, s.name, s.url, s.email, s.embedding_v2",
+                &[&cluster_id_str],
+            )
+            .await
+            .context(format!(
+                "Failed to query services for cluster {}",
+                cluster_id_str
+            ))?;
 
-    // Handle results from all tasks
-    match join_handle_results {
-        Ok(individual_task_results) => {
-            for (idx, task_result) in individual_task_results.into_iter().enumerate() {
-                match task_result {
-                    Ok(match_result) => {
-                        info!(
-                            "Processing result for service matching task index {}: method {:?}, groups created {}.",
-                            idx,
-                            match_result.stats.method_type,
-                            match_result.groups_created
-                        );
-                        total_groups_created += match_result.groups_created;
-                        method_stats.extend(match_result.method_stats);
-                        completed_methods += 1;
+        if service_detail_rows.is_empty() {
+            debug!(
+                "No active services found for cluster_id: {}. Skipping.",
+                cluster_id_str
+            );
+            continue;
+        }
+
+        // Prepare data for each matching method (as in your previous correct version)
+        let mut services_for_name_matcher: Vec<(ServiceId, String)> = Vec::new();
+        let mut services_for_url_matcher: Vec<(ServiceId, String)> = Vec::new();
+        let mut services_for_email_matcher: Vec<(ServiceId, String)> = Vec::new();
+        let mut services_for_embedding_matcher: Vec<(ServiceId, String, Option<Vec<f32>>)> =
+            Vec::new();
+
+        for row in &service_detail_rows {
+            let service_id_val: String = row.get("id");
+            let service_id = ServiceId(service_id_val);
+            let name_val: Option<String> = row.get("name");
+            let url_val: Option<String> = row.get("url");
+            let email_val: Option<String> = row.get("email");
+            let embedding_pg_opt: Option<pgvector::Vector> = row.get("embedding_v2");
+
+            if let Some(name) = name_val.clone() {
+                if !name.is_empty() {
+                    services_for_name_matcher.push((service_id.clone(), name.clone())); // Also clone name here
+                    if let Some(embedding_pg) = embedding_pg_opt.clone() {
+                        services_for_embedding_matcher.push((
+                            service_id.clone(),
+                            name,
+                            Some(embedding_pg.to_vec()),
+                        ));
+                    } else {
+                        services_for_embedding_matcher.push((service_id.clone(), name, None));
                     }
-                    Err(task_err) => {
-                        warn!(
-                            "Service matching task at index {} failed internally: {:?}",
-                            idx, task_err
-                        );
-                        return Err(task_err
-                            .context(format!("Service matching task at index {} failed", idx)));
+                }
+            }
+            if let Some(url) = url_val {
+                if !url.is_empty() {
+                    services_for_url_matcher.push((service_id.clone(), url));
+                }
+            }
+            if let Some(email) = email_val {
+                if !email.is_empty() {
+                    services_for_email_matcher.push((service_id.clone(), email));
+                }
+            }
+        }
+
+        // --- Spawn Name Matching Task ---
+        if !services_for_name_matcher.is_empty() {
+            // These task-specific clones ensure each task owns its required data.
+            let task_pool: PgPool = pool.clone();
+            let task_orchestrator: Arc<Mutex<ServiceMatchingOrchestrator>> =
+                service_orchestrator.clone();
+            let task_run_id: String = pipeline_run_id.to_string(); // Owned String
+            let task_feature_cache: SharedServiceFeatureCache = feature_cache.clone();
+            let task_cluster_id: String = cluster_id_str.clone(); // Owned String
+                                                                  // services_for_name_matcher is already an owned Vec, will be moved into the closure.
+
+            all_tasks.push(tokio::spawn(async move {
+                // async move takes ownership of the task_* variables
+                service_matching::name::find_matches_in_cluster(
+                    &task_pool,                // Pass reference to owned pool
+                    Some(task_orchestrator),   // Arc is cloned and moved
+                    &task_run_id,              // Pass reference to owned String
+                    Some(task_feature_cache),  // Arc is cloned and moved
+                    services_for_name_matcher, // Vec is moved
+                    task_cluster_id,           // String is moved
+                )
+                .await // Ensure the future returned by find_matches_in_cluster is awaited
+            }));
+        }
+
+        // --- Spawn URL Matching Task ---
+        if !services_for_url_matcher.is_empty() {
+            let task_pool = pool.clone();
+            let task_orchestrator = service_orchestrator.clone();
+            let task_run_id = pipeline_run_id.to_string();
+            let task_feature_cache = feature_cache.clone();
+            let task_cluster_id = cluster_id_str.clone();
+
+            all_tasks.push(tokio::spawn(async move {
+                service_matching::url::find_matches_in_cluster(
+                    &task_pool,
+                    Some(task_orchestrator),
+                    &task_run_id,
+                    Some(task_feature_cache),
+                    services_for_url_matcher,
+                    task_cluster_id,
+                )
+                .await
+            }));
+        }
+
+        // --- Spawn Email Matching Task ---
+        if !services_for_email_matcher.is_empty() {
+            let task_pool = pool.clone();
+            let task_orchestrator = service_orchestrator.clone();
+            let task_run_id = pipeline_run_id.to_string();
+            let task_feature_cache = feature_cache.clone();
+            let task_cluster_id = cluster_id_str.clone();
+
+            all_tasks.push(tokio::spawn(async move {
+                service_matching::email::find_matches_in_cluster(
+                    &task_pool,
+                    Some(task_orchestrator),
+                    &task_run_id,
+                    Some(task_feature_cache),
+                    services_for_email_matcher,
+                    task_cluster_id,
+                )
+                .await
+            }));
+        }
+
+        // --- Spawn Embedding Matching Task ---
+        if !services_for_embedding_matcher.is_empty() {
+            let task_pool = pool.clone();
+            let task_orchestrator = service_orchestrator.clone();
+            let task_run_id = pipeline_run_id.to_string();
+            let task_feature_cache = feature_cache.clone();
+            let task_cluster_id = cluster_id_str.clone();
+
+            all_tasks.push(tokio::spawn(async move {
+                service_matching::embedding::find_matches_in_cluster(
+                    &task_pool,
+                    Some(task_orchestrator),
+                    &task_run_id,
+                    Some(task_feature_cache),
+                    services_for_embedding_matcher,
+                    task_cluster_id,
+                )
+                .await
+            }));
+        }
+    }
+    // Aggregate results from all tasks (all methods, all clusters)
+    let mut total_groups_created_all_methods = 0;
+    let mut aggregated_method_stats: HashMap<String, MatchMethodStats> = HashMap::new();
+
+    let task_results = futures::future::try_join_all(all_tasks).await;
+
+    match task_results {
+        Ok(individual_task_results) => {
+            for task_result in individual_task_results {
+                match task_result {
+                    Ok(service_match_result_for_method_in_cluster) => {
+                        total_groups_created_all_methods +=
+                            service_match_result_for_method_in_cluster.groups_created;
+                        // Each ServiceMatchResult from find_matches_in_cluster should ideally contain one method_stat
+                        for stat in service_match_result_for_method_in_cluster.method_stats {
+                            let method_key = stat.method_type.as_str().to_string();
+                            let entry =
+                                aggregated_method_stats
+                                    .entry(method_key)
+                                    .or_insert_with(|| MatchMethodStats {
+                                        method_type: stat.method_type.clone(),
+                                        groups_created: 0,
+                                        entities_matched: 0, // entities_matched needs careful aggregation or redefinition for service matching
+                                        avg_confidence: 0.0,
+                                        avg_group_size: 2.0,
+                                    });
+                            // Weighted average for confidence
+                            let total_confidence_points =
+                                entry.avg_confidence * entry.groups_created as f64;
+                            let current_confidence_points =
+                                stat.avg_confidence * stat.groups_created as f64;
+                            entry.groups_created += stat.groups_created;
+                            // entities_matched: sum of unique services involved in new groups by this method.
+                            // This is harder to aggregate correctly without more info from find_matches_in_cluster.
+                            // For now, summing stat.entities_matched might overestimate if same service matched by same method in different contexts.
+                            // Let's assume entities_matched from find_matches_in_cluster refers to distinct services processed by that method in that cluster call.
+                            entry.entities_matched += stat.entities_matched;
+                            if entry.groups_created > 0 {
+                                entry.avg_confidence = (total_confidence_points
+                                    + current_confidence_points)
+                                    / entry.groups_created as f64;
+                            } else {
+                                entry.avg_confidence = 0.0;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("A service matching task failed: {:?}", e);
+                        // Optionally continue or return error
                     }
                 }
             }
@@ -924,95 +1058,85 @@ async fn run_service_matching_pipeline(
         }
     }
 
-    if completed_methods != total_matching_methods {
-        warn!(
-            "Expected {} completed service matching methods, but only {} results processed successfully. Check logs for task errors.",
-             total_matching_methods, completed_methods
-         );
-    }
-
     // Process any new feedback to update the service confidence tuner
     info!("Processing human feedback for service confidence tuner");
     let mut orchestrator = service_orchestrator.lock().await;
-    let _ = orchestrator.process_feedback_and_update_tuner(pool).await;
+    let _ = orchestrator.process_feedback_and_update_tuner(pool).await; //
 
     // Save the updated service confidence tuner
-    let _ = orchestrator.save_models(pool).await;
+    let _ = orchestrator.save_models(pool).await; //
 
-    // Report cache statistics
     if let Some((hits, misses, ind_hits, ind_misses)) = orchestrator.get_feature_cache_stats().await
     {
+        //
+        // ... (logging for cache stats as before) ...
         let hit_rate = if hits + misses > 0 {
             (hits as f64 / (hits + misses) as f64) * 100.0
         } else {
             0.0
-        };
-
+        }; //
         let individual_hit_rate = if ind_hits + ind_misses > 0 {
             (ind_hits as f64 / (ind_hits + ind_misses) as f64) * 100.0
         } else {
             0.0
-        };
-
+        }; //
         info!(
             "Feature cache statistics - Pair features: {} hits, {} misses, {:.2}% hit rate",
             hits, misses, hit_rate
-        );
-
+        ); //
         info!(
             "Feature cache statistics - Individual features: {} hits, {} misses, {:.2}% hit rate",
             ind_hits, ind_misses, individual_hit_rate
-        );
+        ); //
     }
 
-    // Elapsed time
-    let elapsed = start_time.elapsed();
+    let final_method_stats: Vec<MatchMethodStats> =
+        aggregated_method_stats.values().cloned().collect();
 
-    info!(
-        "Service matching complete in {:.2?}. Created {} service groups total.",
-        elapsed, total_groups_created
-    );
-
-    // Create combined stats for the overall result
-    let combined_stats = if !method_stats.is_empty() {
-        // Calculate average confidence across all methods
-        let avg_confidence = method_stats
+    let combined_stats = if !final_method_stats.is_empty() {
+        //
+        let total_avg_confidence_points: f64 = final_method_stats
             .iter()
-            .filter(|s| s.groups_created > 0)
             .map(|s| s.avg_confidence * s.groups_created as f64)
-            .sum::<f64>()
-            / method_stats
-                .iter()
-                .filter(|s| s.groups_created > 0)
-                .map(|s| s.groups_created as f64)
-                .sum::<f64>()
-                .max(1.0); // Avoid division by zero
+            .sum(); //
+        let total_groups_for_avg: usize = final_method_stats.iter().map(|s| s.groups_created).sum(); //
+        let avg_confidence = if total_groups_for_avg > 0 {
+            total_avg_confidence_points / total_groups_for_avg as f64
+        } else {
+            0.0
+        }; //
 
         results::MatchMethodStats {
-            method_type: models::MatchMethodType::Custom("service_combined".to_string()),
-            groups_created: total_groups_created,
-            entities_matched: method_stats
+            //
+            method_type: MatchMethodType::Custom("service_combined_all_clusters".to_string()), //
+            groups_created: total_groups_created_all_methods,                                  //
+            entities_matched: final_method_stats
                 .iter()
                 .map(|s| s.entities_matched)
-                .sum::<usize>(),
-            avg_confidence,
-            avg_group_size: 2.0,
+                .sum::<usize>(), // Sum of unique entities involved, per method type
+            avg_confidence,                                                                    //
+            avg_group_size: 2.0,                                                               //
         }
     } else {
-        // Default stats if no methods completed successfully
         results::MatchMethodStats {
-            method_type: models::MatchMethodType::Custom("service_combined".to_string()),
-            groups_created: 0,
-            entities_matched: 0,
-            avg_confidence: 0.0,
-            avg_group_size: 2.0,
+            //
+            method_type: MatchMethodType::Custom("service_combined_no_matches".to_string()), //
+            groups_created: 0,                                                               //
+            entities_matched: 0,                                                             //
+            avg_confidence: 0.0,                                                             //
+            avg_group_size: 2.0,                                                             //
         }
     };
 
-    // Return combined results
-    Ok(ServiceMatchResult {
-        groups_created: total_groups_created,
-        stats: combined_stats,
-        method_stats,
+    info!(
+        "Cluster-scoped service matching complete in {:.2?}. Created {} service groups total across all clusters.",
+        start_time.elapsed(), total_groups_created_all_methods
+    );
+
+    Ok(results::ServiceMatchResult {
+        //
+        groups_created: total_groups_created_all_methods, //
+        stats: combined_stats,                            //
+        method_stats: final_method_stats,                 //
     })
 }

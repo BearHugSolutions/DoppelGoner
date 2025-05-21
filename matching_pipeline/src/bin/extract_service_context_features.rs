@@ -13,8 +13,12 @@ use std::{
 use tokio::sync::Semaphore;
 
 use dedupe_lib::{
-    db, models::ServiceId,
-    reinforcement::service::{service_feature_cache_prewarmer::extract_and_store_all_service_context_features, service_feature_cache_service::create_shared_service_cache, service_feature_extraction},
+    db,
+    models::ServiceId,
+    reinforcement::service::{
+        service_feature_cache_prewarmer::extract_and_store_all_service_context_features,
+        service_feature_cache_service::create_shared_service_cache, service_feature_extraction,
+    },
 };
 
 // Constants for parallel execution

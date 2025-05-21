@@ -8,99 +8,101 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::PgPool;
-use crate::models::{EmailMatchValue, MatchMethodType, MatchValues, ServiceId};
-use crate::reinforcement::service::service_feature_cache_service::SharedServiceFeatureCache;
-use crate::reinforcement::service::service_orchestrator::ServiceMatchingOrchestrator;
-use crate::results::{MatchMethodStats, ServiceMatchResult};
+use crate::models::{EmailMatchValue, MatchMethodType, MatchValues, ServiceId}; //
+use crate::reinforcement::service::service_feature_cache_service::SharedServiceFeatureCache; //
+use crate::reinforcement::service::service_orchestrator::ServiceMatchingOrchestrator; //
+use crate::results::{MatchMethodStats, ServiceMatchResult}; //
+use crate::service_matching::name::insert_service_group; // Assuming it's made pub(crate) in name.rs
 
-pub async fn find_matches(
+pub async fn find_matches_in_cluster(
     pool: &PgPool,
     service_orchestrator: Option<Arc<Mutex<ServiceMatchingOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedServiceFeatureCache>,
-) -> Result<crate::results::ServiceMatchResult> {
-    info!("Starting service email matching...");
+    services_in_cluster: Vec<(ServiceId, String)>, // Input: Vec of (ServiceId, email_address)
+    cluster_id: String,                            // For logging context
+) -> Result<ServiceMatchResult> {
+    info!(
+        "Starting service email matching for cluster_id: {} with {} services...",
+        cluster_id,
+        services_in_cluster.len()
+    );
+
+    if services_in_cluster.is_empty() {
+        debug!(
+            "No services provided for email matching in cluster_id: {}.",
+            cluster_id
+        );
+        return Ok(create_empty_result_for_cluster(
+            MatchMethodType::ServiceEmailMatch,
+        ));
+    }
 
     let mut groups_created = 0;
-    let mut total_services = 0;
-    let mut avg_confidence = 0.0;
+    let mut confidence_sum = 0.0;
+    let mut distinct_services_processed_count = 0;
 
-    // Fetch services with non-empty emails
-    let conn = pool
-        .get()
-        .await
-        .context("Failed to get database connection")?;
-    let rows = conn
-        .query(
-            "SELECT id, email FROM public.service 
-         WHERE email IS NOT NULL AND email <> '' AND status = 'active'
-         ORDER BY id",
-            &[],
-        )
-        .await
-        .context("Failed to query services with emails")?;
+    let mut email_map: HashMap<String, Vec<(ServiceId, String)>> = HashMap::new(); //
 
-    let services_count = rows.len();
-    if services_count == 0 {
-        info!("No services with emails found for matching");
-        return Ok(create_empty_result());
-    }
-    info!("Found {} services with emails to process", services_count);
-
-    // Build a map of normalized emails to services
-    let mut email_map: HashMap<String, Vec<(ServiceId, String)>> = HashMap::new();
-
-    for row in rows {
-        let service_id: String = row.get("id");
-        let email: String = row.get("email");
-
-        let normalized_email = normalize_email(&email);
+    for (service_id, email) in services_in_cluster {
+        let normalized_email = normalize_email(&email); //
         if !normalized_email.is_empty() {
             email_map
                 .entry(normalized_email.clone())
                 .or_default()
-                .push((ServiceId(service_id), email));
-            total_services += 1;
+                .push((service_id, email)); //
+                                            // This counts each service entry passed to the function.
+                                            // If a service could have multiple emails and be passed multiple times, this might overcount.
+                                            // Assuming services_in_cluster has unique (ServiceId, email) or just unique ServiceId with its primary email.
+                                            // For now, let's count unique service IDs that go into the map.
         }
     }
-    info!(
-        "Built email map with {} unique normalized emails",
-        email_map.len()
-    );
+    distinct_services_processed_count = email_map
+        .values()
+        .flat_map(|v| v.iter().map(|(id, _)| id))
+        .collect::<HashSet<_>>()
+        .len();
 
-    // Process potential matches
-    let mut confidence_sum = 0.0;
-    for (normalized_email, services) in email_map {
-        if services.len() < 2 {
-            continue; // No potential matches with this email
+    info!(
+        "Built email map with {} unique normalized emails for cluster_id: {}",
+        email_map.len(),
+        cluster_id
+    ); //
+
+    for (normalized_email, services_with_same_email) in email_map {
+        //
+        if services_with_same_email.len() < 2 {
+            //
+            continue;
         }
 
-        // For each pair of services with the same normalized email
-        for i in 0..services.len() {
-            for j in (i + 1)..services.len() {
-                let (service1_id, original_email1) = &services[i];
-                let (service2_id, original_email2) = &services[j];
+        for i in 0..services_with_same_email.len() {
+            //
+            for j in (i + 1)..services_with_same_email.len() {
+                //
+                let (service1_id, original_email1) = &services_with_same_email[i]; //
+                let (service2_id, original_email2) = &services_with_same_email[j]; //
 
-                // Skip self-matches
                 if service1_id.0 == service2_id.0 {
+                    //
                     continue;
                 }
 
-                // Email matches are high confidence by default
-                let pre_rl_confidence = 0.95;
+                let pre_rl_confidence = 0.95; //
 
-                // Get feature context and apply RL if orchestrator is provided
                 let tuned_confidence = if let Some(orchestrator_arc) = &service_orchestrator {
-                    let orchestrator = orchestrator_arc.lock().await;
+                    //
+                    let orchestrator = orchestrator_arc.lock().await; //
 
-                    // Extract context features
                     let features = if let Some(cache) = &feature_cache {
-                        let mut cache_guard = cache.lock().await;
+                        //
+                        let mut cache_guard = cache.lock().await; //
                         cache_guard
-                            .get_pair_features(pool, service1_id, service2_id)
+                            .get_pair_features(pool, service1_id, service2_id) //
                             .await?
                     } else {
                         ServiceMatchingOrchestrator::extract_pair_context_features(
+                            //
                             pool,
                             service1_id,
                             service2_id,
@@ -108,19 +110,19 @@ pub async fn find_matches(
                         .await?
                     };
 
-                    // Get tuned confidence
                     let tuned = orchestrator.get_tuned_confidence(
+                        //
                         &MatchMethodType::ServiceEmailMatch,
                         pre_rl_confidence,
                         &features,
                     )?;
 
-                    // Log decision
-                    let service_group_id = Uuid::new_v4().to_string();
+                    let service_group_id_for_log = Uuid::new_v4().to_string(); //
                     let _ = orchestrator
                         .log_decision_snapshot(
+                            //
                             pool,
-                            &service_group_id,
+                            &service_group_id_for_log, // This ID is for logging, actual group ID generated by insert_service_group
                             pipeline_run_id,
                             &features,
                             &MatchMethodType::ServiceEmailMatch,
@@ -128,23 +130,24 @@ pub async fn find_matches(
                             tuned,
                         )
                         .await;
-
                     tuned
                 } else {
-                    pre_rl_confidence // Use raw confidence if no orchestrator
+                    pre_rl_confidence //
                 };
 
-                // Create a service group if confidence is sufficient
                 if tuned_confidence >= 0.85 {
+                    //
                     let match_values = EmailMatchValue {
-                        original_email1: original_email1.clone(),
-                        original_email2: original_email2.clone(),
-                        normalized_shared_email: normalized_email.clone(),
+                        //
+                        original_email1: original_email1.clone(), //
+                        original_email2: original_email2.clone(), //
+                        normalized_shared_email: normalized_email.clone(), //
                     };
 
-                    // Insert the service_group
-                    let service_group_id = Uuid::new_v4().to_string();
-                    let result = crate::service_matching::name::insert_service_group(
+                    let service_group_id = Uuid::new_v4().to_string(); //
+                                                                       // Use the shared insert_service_group function
+                    let result = insert_service_group(
+                        //
                         pool,
                         &service_group_id,
                         service1_id,
@@ -152,16 +155,22 @@ pub async fn find_matches(
                         tuned_confidence,
                         pre_rl_confidence,
                         MatchMethodType::ServiceEmailMatch,
-                        MatchValues::ServiceEmail(match_values),
+                        MatchValues::ServiceEmail(match_values), //
                     )
                     .await;
 
                     if result.is_ok() {
-                        groups_created += 1;
-                        confidence_sum += tuned_confidence;
-                        debug!(
-                            "Created service group for matched emails. ID: {}, s1: {}, s2: {}, confidence: {:.3}",
-                            service_group_id, service1_id.0, service2_id.0, tuned_confidence
+                        groups_created += 1; //
+                        confidence_sum += tuned_confidence; //
+                        debug!( //
+                            "Cluster_id: {}. Created service group for matched emails. ID: {}, s1: {}, s2: {}, confidence: {:.3}",
+                           cluster_id, service_group_id, service1_id.0, service2_id.0, tuned_confidence
+                        );
+                    } else {
+                        warn!(
+                            "Failed to insert service group for email match in cluster {}: {:?}",
+                            cluster_id,
+                            result.err()
                         );
                     }
                 }
@@ -169,79 +178,68 @@ pub async fn find_matches(
         }
     }
 
-    // Calculate average confidence
-    if groups_created > 0 {
-        avg_confidence = confidence_sum / groups_created as f64;
-    }
+    let avg_confidence = if groups_created > 0 {
+        confidence_sum / groups_created as f64
+    } else {
+        0.0
+    }; //
 
-    info!(
-        "Service email matching complete. Created {} groups with avg confidence: {:.3}",
-        groups_created, avg_confidence
+    info!( //
+        "Service email matching for cluster_id: {} complete. Created {} groups with avg confidence: {:.3}",
+        cluster_id, groups_created, avg_confidence
     );
 
     let method_stats = MatchMethodStats {
-        method_type: MatchMethodType::ServiceEmailMatch,
-        groups_created,
-        entities_matched: total_services,
-        avg_confidence,
-        avg_group_size: 2.0,
+        //
+        method_type: MatchMethodType::ServiceEmailMatch, //
+        groups_created,                                  //
+        entities_matched: distinct_services_processed_count, // Use the count of distinct services processed in this cluster by this method
+        avg_confidence,                                      //
+        avg_group_size: 2.0,                                 //
     };
 
-    // Create result struct
     Ok(ServiceMatchResult {
-        groups_created,
-        stats: MatchMethodStats {
-            method_type: MatchMethodType::ServiceEmailMatch,
-            groups_created,
-            entities_matched: total_services,
-            avg_confidence,
-            avg_group_size: 2.0,
-        },
-        method_stats: vec![method_stats],
+        //
+        groups_created,                   //
+        stats: method_stats.clone(), // This .stats field in ServiceMatchResult from a specific method is a bit redundant if method_stats vec is primary.
+        method_stats: vec![method_stats], //
     })
 }
 
-// Normalize email addresses for comparison
+// normalize_email function remains the same
 fn normalize_email(email: &str) -> String {
-    let email = email.trim().to_lowercase();
-
-    // Handle common email formats and strip local part "plus addressing"
-    if let Some(at_pos) = email.find('@') {
-        let (local_part, domain) = email.split_at(at_pos);
-
-        // Remove plus addressing if present
-        let normalized_local_part = if let Some(plus_pos) = local_part.find('+') {
-            local_part[0..plus_pos].to_string()
-        } else {
-            local_part.to_string()
-        };
-
-        // Remove dots from Gmail addresses (they're ignored by Gmail)
-        let normalized_local_part = if domain.contains("gmail.com") {
-            normalized_local_part.replace('.', "")
-        } else {
-            normalized_local_part
-        };
-
-        normalized_local_part + domain
+    let email_trimmed = email.trim().to_lowercase(); //
+    if let Some(at_pos) = email_trimmed.find('@') {
+        //
+        let (local_part, domain_part) = email_trimmed.split_at(at_pos); //
+        let mut normalized_local = local_part.to_string();
+        if let Some(plus_pos) = normalized_local.find('+') {
+            //
+            normalized_local.truncate(plus_pos); //
+        }
+        if domain_part.contains("gmail.com") || domain_part.contains("googlemail.com") {
+            //
+            normalized_local = normalized_local.replace('.', ""); //
+        }
+        normalized_local + domain_part //
     } else {
-        email // Not a valid email, return as is
+        email_trimmed //
     }
 }
 
-// Create empty result when no matches are found
-fn create_empty_result() -> crate::results::ServiceMatchResult {
-    let empty_stats = crate::results::MatchMethodStats {
-        method_type: MatchMethodType::ServiceEmailMatch,
-        groups_created: 0,
-        entities_matched: 0,
-        avg_confidence: 0.0,
-        avg_group_size: 0.0,
+fn create_empty_result_for_cluster(method_type: MatchMethodType) -> ServiceMatchResult {
+    let empty_stats = MatchMethodStats {
+        //
+        method_type,         //
+        groups_created: 0,   //
+        entities_matched: 0, //
+        avg_confidence: 0.0, //
+        avg_group_size: 0.0, //
     };
-
-    crate::results::ServiceMatchResult {
-        groups_created: 0,
-        stats: empty_stats.clone(),
-        method_stats: vec![empty_stats],
+    ServiceMatchResult {
+        //
+        groups_created: 0,               //
+        stats: empty_stats.clone(),      //
+        method_stats: vec![empty_stats], //
     }
 }

@@ -16,7 +16,9 @@ use crate::models::ServiceId;
 use crate::reinforcement::service::service_feature_cache_service::{
     ServiceFeatureCacheService, SharedServiceFeatureCache,
 };
-use crate::reinforcement::service::service_feature_extraction::{self, get_stored_service_features};
+use crate::reinforcement::service::service_feature_extraction::{
+    self, get_stored_service_features,
+};
 
 // Maximum batch size to process at once
 const MAX_BATCH_SIZE: usize = 50;
@@ -120,7 +122,6 @@ pub async fn extract_and_store_all_service_context_features(
     Ok(processed_count)
 }
 
-
 pub async fn extract_and_store_all_service_features_and_prewarm_cache(
     pool: &PgPool,
     feature_cache: &SharedServiceFeatureCache, // The service-specific shared cache
@@ -192,7 +193,10 @@ pub async fn extract_and_store_all_service_features_and_prewarm_cache(
                 }
                 Ok(Err(e)) => {
                     // Error from within the task's logic
-                    warn!("A task in service feature pre-warming batch failed: {:?}", e);
+                    warn!(
+                        "A task in service feature pre-warming batch failed: {:?}",
+                        e
+                    );
                 }
                 Err(e) => {
                     // JoinError, task panicked
@@ -357,7 +361,7 @@ async fn get_taxonomy_similar_pairs(
             let service_id_1: String = row.get(0);
             let service_id_2: String = row.get(1);
             let similarity: Option<f64> = row.try_get(2).ok();
-            
+
             similarity.map(|sim| (ServiceId(service_id_1), ServiceId(service_id_2), sim))
         })
         .collect();
@@ -582,7 +586,8 @@ pub async fn prewarm_service_pair_features_cache(
     }
 
     // Limit to max_pairs if needed
-    let mut deduplicated_pairs: Vec<(ServiceId, ServiceId)> = pairs_to_process.into_iter().collect();
+    let mut deduplicated_pairs: Vec<(ServiceId, ServiceId)> =
+        pairs_to_process.into_iter().collect();
     if deduplicated_pairs.len() > max_pairs {
         // Shuffle and take max_pairs
         let mut rng = rand::thread_rng();
