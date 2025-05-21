@@ -37,7 +37,7 @@ impl MatchingOrchestrator {
             feature_cache: None,
         })
     }
-    
+
     /// Set the feature cache to be used by this orchestrator
     pub fn set_feature_cache(&mut self, cache: SharedFeatureCache) {
         info!("Setting feature cache for MatchingOrchestrator");
@@ -55,7 +55,7 @@ impl MatchingOrchestrator {
             "Orchestrator: Extracting context features for pair ({}, {})",
             entity1_id.0, entity2_id.0
         );
-        
+
         // This static method cannot use the instance's cache
         // Callers should use get_pair_features instead when possible
         super::feature_extraction::extract_context_for_pair(pool, entity1_id, entity2_id)
@@ -65,7 +65,7 @@ impl MatchingOrchestrator {
                 entity1_id.0, entity2_id.0
             ))
     }
-    
+
     /// Gets features for an entity pair, using cache if available
     pub async fn get_pair_features(
         &self,
@@ -76,7 +76,9 @@ impl MatchingOrchestrator {
         if let Some(cache) = &self.feature_cache {
             // Use cache if available
             let mut cache_guard = cache.lock().await;
-            cache_guard.get_pair_features(pool, entity1_id, entity2_id).await
+            cache_guard
+                .get_pair_features(pool, entity1_id, entity2_id)
+                .await
         } else {
             // Fall back to direct extraction
             Self::extract_pair_context_features(pool, entity1_id, entity2_id).await
@@ -193,7 +195,7 @@ impl MatchingOrchestrator {
     pub fn get_confidence_tuner_stats(&self) -> String {
         self.confidence_tuner.get_stats_display()
     }
-    
+
     /// Get statistics from the feature cache if available
     pub async fn get_feature_cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
         if let Some(cache) = &self.feature_cache {

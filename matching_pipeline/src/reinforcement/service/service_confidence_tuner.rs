@@ -70,7 +70,10 @@ impl ServiceConfidenceTuner {
         let arm_levels: HashMap<&str, Vec<f64>> = [
             ("service_email", vec![0.85, 0.90, 0.95, 0.98, 1.0]),
             ("service_url", vec![0.80, 0.85, 0.90, 0.95]),
-            ("service_name", vec![0.70, 0.75, 0.80, 0.85, 0.90, 0.92, 0.95]),
+            (
+                "service_name",
+                vec![0.70, 0.75, 0.80, 0.85, 0.90, 0.92, 0.95],
+            ),
             ("service_embedding", vec![0.80, 0.85, 0.90, 0.95]),
             // A default for any other methods that might be introduced
             ("default", vec![0.70, 0.80, 0.85, 0.90]),
@@ -212,8 +215,8 @@ impl ServiceConfidenceTuner {
             .await
             .context("Failed to get DB connection for ServiceConfidenceTuner save")?;
         self.version += 1; // Increment version on save
-        let model_json =
-            serde_json::to_value(&*self).context("Failed to serialize ServiceConfidenceTuner to JSON")?;
+        let model_json = serde_json::to_value(&*self)
+            .context("Failed to serialize ServiceConfidenceTuner to JSON")?;
 
         let id_prefix = "service_confidence_tuner";
         // Try to find the latest existing ID for this model_type to maintain a consistent ID if possible

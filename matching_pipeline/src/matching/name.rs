@@ -12,13 +12,19 @@ use strsim::jaro_winkler;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{config, db::PgPool, reinforcement::entity::{feature_cache_service::SharedFeatureCache, orchestrator::MatchingOrchestrator}};
 use crate::models::{
     ActionType, Entity, EntityGroupId, EntityId, MatchMethodType, MatchValues, NameMatchValue,
     NewSuggestedAction, OrganizationId, SuggestionStatus,
 };
 use crate::results::{AnyMatchResult, MatchMethodStats, NameMatchResult};
 use crate::utils::cosine_similarity_candle;
+use crate::{
+    config,
+    db::PgPool,
+    reinforcement::entity::{
+        feature_cache_service::SharedFeatureCache, orchestrator::MatchingOrchestrator,
+    },
+};
 use serde_json;
 
 // Updated configuration for stricter name matching
@@ -263,15 +269,17 @@ pub async fn find_matches(
     }
 
     // 2. Fetch existing pairs to avoid duplicates
-    let existing_processed_pairs_set = fetch_existing_pairs(&*initial_conn, MatchMethodType::Name).await?;
+    let existing_processed_pairs_set =
+        fetch_existing_pairs(&*initial_conn, MatchMethodType::Name).await?;
     info!(
         "Name: Found {} existing name-matched pairs to skip.",
         existing_processed_pairs_set.len()
     );
 
     // 3. Get organization embeddings for semantic comparison
-    let org_embeddings_map = get_organization_embeddings(&*initial_conn, &all_entities_with_names_vec).await?;
-    
+    let org_embeddings_map =
+        get_organization_embeddings(&*initial_conn, &all_entities_with_names_vec).await?;
+
     // Release initial connection
     drop(initial_conn);
 
@@ -294,7 +302,7 @@ pub async fn find_matches(
 
     // 6. Process candidate pairs using a connection pool with limited concurrency
     let semaphore = Arc::new(tokio::sync::Semaphore::new(15)); // Limit concurrent DB operations
-    
+
     let candidate_pairs_len = candidate_pairs.len();
     for (i, j) in candidate_pairs {
         // Extract entity data
@@ -302,76 +310,106 @@ pub async fn find_matches(
         let entity2_data = &entity_data[j];
         let e1_id = &entity1_data.entity.id;
         let e2_id = &entity2_data.entity.id;
-        
-        // Skip if already processed
-        if existing_processed_pairs_set.contains(&(e1_id.clone(), e2_id.clone())) {
-            trace!("Name: Pair ({}, {}) already processed. Skipping.", e1_id.0, e2_id.0);
+
+        // Normalize the order of e1_id and e2_id for the check
+        let (id_to_check_1, id_to_check_2) = if e1_id.0 < e2_id.0 {
+            (e1_id.clone(), e2_id.clone())
+        } else {
+            (e2_id.clone(), e1_id.clone())
+        };
+
+        // Skip if already processed (using the normalized pair)
+        if existing_processed_pairs_set.contains(&(id_to_check_1, id_to_check_2)) {
+            //
+            trace!(
+                "Name: Pair ({}, {}) already processed. Skipping.",
+                e1_id.0,
+                e2_id.0
+            ); //
             continue;
         }
-        
+
         // Skip pairs with empty names
-        let original_name1 = entity1_data.entity.name.as_ref().cloned().unwrap_or_default();
-        let original_name2 = entity2_data.entity.name.as_ref().cloned().unwrap_or_default();
+        let original_name1 = entity1_data
+            .entity
+            .name
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+        let original_name2 = entity2_data
+            .entity
+            .name
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
         let normalized_name1 = entity1_data.normalized_name.clone();
         let normalized_name2 = entity2_data.normalized_name.clone();
-        
+
         if normalized_name1.is_empty() || normalized_name2.is_empty() {
             continue;
         }
-        
+
         // Skip pairs with incompatible entity types
         if let (Some(t1), Some(t2)) = (entity1_data.entity_type, entity2_data.entity_type) {
-            if t1 != t2 && INCOMPATIBLE_ORG_TYPES.iter().any(|(it1, it2)|
-                (t1 == *it1 && t2 == *it2) || (t1 == *it2 && t2 == *it1)) {
+            if t1 != t2
+                && INCOMPATIBLE_ORG_TYPES
+                    .iter()
+                    .any(|(it1, it2)| (t1 == *it1 && t2 == *it2) || (t1 == *it2 && t2 == *it1))
+            {
                 continue;
             }
         }
-        
+
         // Calculate fuzzy score using Jaro-Winkler similarity
         let fuzzy_score = jaro_winkler(&normalized_name1, &normalized_name2) as f32;
         if fuzzy_score < (MIN_FUZZY_SIMILARITY_THRESHOLD * 0.9) {
             continue;
         }
-        
+
         // Calculate semantic score using embeddings
-        let embedding1_opt = org_embeddings_map.get(e1_id).and_then(|opt_emb| opt_emb.as_ref());
-        let embedding2_opt = org_embeddings_map.get(e2_id).and_then(|opt_emb| opt_emb.as_ref());
+        let embedding1_opt = org_embeddings_map
+            .get(e1_id)
+            .and_then(|opt_emb| opt_emb.as_ref());
+        let embedding2_opt = org_embeddings_map
+            .get(e2_id)
+            .and_then(|opt_emb| opt_emb.as_ref());
         let semantic_score = match (embedding1_opt, embedding2_opt) {
-            (Some(emb1), Some(emb2)) => {
-                match cosine_similarity_candle(emb1, emb2) {
-                    Ok(sim) => sim as f32,
-                    Err(e) => {
-                        warn!("Name: Cosine similarity calculation failed for pair ({}, {}): {}. Defaulting to 0.0.", e1_id.0, e2_id.0, e);
-                        0.0
-                    }
+            (Some(emb1), Some(emb2)) => match cosine_similarity_candle(emb1, emb2) {
+                Ok(sim) => sim as f32,
+                Err(e) => {
+                    warn!("Name: Cosine similarity calculation failed for pair ({}, {}): {}. Defaulting to 0.0.", e1_id.0, e2_id.0, e);
+                    0.0
                 }
             },
             _ => 0.0,
         };
-        
+
         // Calculate combined score and determine match type
         let (pre_rl_score, pre_rl_match_type) =
             if semantic_score >= MIN_SEMANTIC_SIMILARITY_THRESHOLD {
-                ((fuzzy_score * FUZZY_WEIGHT) + (semantic_score * SEMANTIC_WEIGHT), "combined".to_string())
+                (
+                    (fuzzy_score * FUZZY_WEIGHT) + (semantic_score * SEMANTIC_WEIGHT),
+                    "combined".to_string(),
+                )
             } else if fuzzy_score >= MIN_FUZZY_SIMILARITY_THRESHOLD {
                 (fuzzy_score, "fuzzy".to_string())
             } else {
                 continue;
             };
-        
+
         // Apply domain rules
         let adjusted_pre_rl_score = apply_domain_rules(
-            &normalized_name1, 
-            &normalized_name2, 
-            pre_rl_score, 
-            entity1_data.entity_type, 
-            entity2_data.entity_type
+            &normalized_name1,
+            &normalized_name2,
+            pre_rl_score,
+            entity1_data.entity_type,
+            entity2_data.entity_type,
         );
-        
+
         if adjusted_pre_rl_score < COMBINED_SIMILARITY_THRESHOLD {
             continue;
         }
-        
+
         // Acquire a permit to limit concurrent DB operations
         let permit = match semaphore.acquire().await {
             Ok(permit) => permit,
@@ -380,7 +418,7 @@ pub async fn find_matches(
                 continue;
             }
         };
-        
+
         // Create match values
         let match_values = MatchValues::Name(NameMatchValue {
             original_name1: original_name1.clone(),
@@ -389,17 +427,19 @@ pub async fn find_matches(
             normalized_name2: normalized_name2.clone(),
             pre_rl_match_type: Some(pre_rl_match_type.clone()),
         });
-        
+
         // Extract features and apply RL tuning if available
         let mut final_confidence = adjusted_pre_rl_score as f64;
         let mut features_for_snapshot: Option<Vec<f64>> = None;
-        
+
         if let Some(orchestrator) = reinforcement_orchestrator_option.as_ref() {
             // Use the feature cache if available
             match if let Some(cache) = feature_cache.as_ref() {
                 // Use the cache through the orchestrator
                 let orchestrator_guard = orchestrator.lock().await;
-                orchestrator_guard.get_pair_features(pool, e1_id, e2_id).await
+                orchestrator_guard
+                    .get_pair_features(pool, e1_id, e2_id)
+                    .await
             } else {
                 // Fall back to direct extraction if no cache
                 MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await
@@ -421,13 +461,13 @@ pub async fn find_matches(
                     } else {
                         warn!("Name: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", e1_id.0, e2_id.0);
                     }
-                },
+                }
                 Err(e) => {
                     warn!("Name: Failed to extract features for pair ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e);
                 }
             }
         }
-        
+
         // Create entity group with unified approach
         match create_entity_group(
             pool,
@@ -439,29 +479,34 @@ pub async fn find_matches(
             reinforcement_orchestrator_option.as_ref(),
             pipeline_run_id,
             feature_cache.clone(), // Pass the feature cache
-        ).await {
+        )
+        .await
+        {
             Ok(created) => {
                 if created {
                     new_pairs_created_count += 1;
                     entities_in_new_pairs.insert(e1_id.clone());
                     entities_in_new_pairs.insert(e2_id.clone());
                     confidence_scores_for_stats.push(final_confidence);
-                    
+
                     if new_pairs_created_count % 100 == 0 {
                         info!(
-                            "Name: Created {} pairs so far ({:.2}% complete)", 
+                            "Name: Created {} pairs so far ({:.2}% complete)",
                             new_pairs_created_count,
                             (new_pairs_created_count as f32 / candidate_pairs_len as f32) * 100.0
                         );
                     }
                 }
-            },
+            }
             Err(e) => {
                 individual_operation_errors += 1;
-                warn!("Name: Failed to process pair ({}, {}): {}", e1_id.0, e2_id.0, e);
+                warn!(
+                    "Name: Failed to process pair ({}, {}): {}",
+                    e1_id.0, e2_id.0, e
+                );
             }
         }
-        
+
         // Release the permit
         drop(permit);
     }
@@ -486,7 +531,11 @@ pub async fn find_matches(
         groups_created: new_pairs_created_count,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 { 2.0 } else { 0.0 },
+        avg_group_size: if new_pairs_created_count > 0 {
+            2.0
+        } else {
+            0.0
+        },
     };
 
     info!(
@@ -515,20 +564,24 @@ async fn create_entity_group(
     feature_cache: Option<SharedFeatureCache>, // Added feature_cache parameter
 ) -> Result<bool> {
     // Get a single connection for all operations
-    let mut conn = pool.get().await
+    let mut conn = pool
+        .get()
+        .await
         .context("Name: Failed to get DB connection for entity group creation")?;
-    
+
     // Start a transaction that will include all operations
-    let tx = conn.transaction().await
+    let tx = conn
+        .transaction()
+        .await
         .context("Name: Failed to start transaction for entity group creation")?;
-    
+
     // Generate entity group ID
     let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
-    
+
     // Ensure entity_id_1 < entity_id_2 to satisfy the check_entity_order constraint
     let (ordered_id_1, ordered_id_2);
     let ordered_match_values;
-    
+
     if entity_id_1.0 <= entity_id_2.0 {
         ordered_id_1 = entity_id_1;
         ordered_id_2 = entity_id_2;
@@ -537,7 +590,7 @@ async fn create_entity_group(
         // Need to swap the entity IDs to satisfy the constraint
         ordered_id_1 = entity_id_2;
         ordered_id_2 = entity_id_1;
-        
+
         // Create new match values with swapped fields for NameMatchValue
         if let MatchValues::Name(name_match) = match_values {
             ordered_match_values = MatchValues::Name(NameMatchValue {
@@ -552,38 +605,48 @@ async fn create_entity_group(
             ordered_match_values = match_values.clone();
         }
     }
-    
+
     // Serialize match values
     let match_values_json = serde_json::to_value(&ordered_match_values)
         .context("Name: Failed to serialize match values")?;
-    
+
     let empty_string = "".to_string();
     // Extract name-specific data (using ordered match values)
-    let (original_name1, original_name2, normalized_name1, normalized_name2, pre_rl_match_type) = match &ordered_match_values {
-        MatchValues::Name(n) => (
-            &n.original_name1, 
-            &n.original_name2, 
-            &n.normalized_name1, 
-            &n.normalized_name2, 
-            n.pre_rl_match_type.as_ref().unwrap_or(&empty_string)
-        ),
-        _ => (&String::new(), &String::new(), &String::new(), &String::new(), &String::new()),
-    };
-    
+    let (original_name1, original_name2, normalized_name1, normalized_name2, pre_rl_match_type) =
+        match &ordered_match_values {
+            MatchValues::Name(n) => (
+                &n.original_name1,
+                &n.original_name2,
+                &n.normalized_name1,
+                &n.normalized_name2,
+                n.pre_rl_match_type.as_ref().unwrap_or(&empty_string),
+            ),
+            _ => (
+                &String::new(),
+                &String::new(),
+                &String::new(),
+                &String::new(),
+                &String::new(),
+            ),
+        };
+
     // Try to get tuned confidence score (RL-based) before inserting
     // IMPORTANT: Use ordered_id_1 and ordered_id_2 here to maintain consistency
     let mut tuned_confidence = final_confidence_score;
     let mut features_for_snapshot: Option<Vec<f64>> = None;
-    
+
     if let Some(ro_arc) = reinforcement_orchestrator {
         // Use the feature cache if available
         match if let Some(cache) = feature_cache.as_ref() {
             // Use the cache through the orchestrator
             let orchestrator_guard = ro_arc.lock().await;
-            orchestrator_guard.get_pair_features(pool, ordered_id_1, ordered_id_2).await
+            orchestrator_guard
+                .get_pair_features(pool, ordered_id_1, ordered_id_2)
+                .await
         } else {
             // Fall back to direct extraction if no cache
-            MatchingOrchestrator::extract_pair_context_features(pool, ordered_id_1, ordered_id_2).await
+            MatchingOrchestrator::extract_pair_context_features(pool, ordered_id_1, ordered_id_2)
+                .await
         } {
             Ok(features_vec) => {
                 if !features_vec.is_empty() {
@@ -599,26 +662,30 @@ async fn create_entity_group(
                                        ordered_id_1.0, ordered_id_2.0, e),
                     }
                 }
-            },
-            Err(e) => warn!("Name: Failed to extract features for ({}, {}): {}. Using pre-RL score.", 
-                           ordered_id_1.0, ordered_id_2.0, e),
+            }
+            Err(e) => warn!(
+                "Name: Failed to extract features for ({}, {}): {}. Using pre-RL score.",
+                ordered_id_1.0, ordered_id_2.0, e
+            ),
         }
     }
-    
+
     // Insert entity group using ordered IDs
-    let rows_affected = tx.execute(
-        INSERT_ENTITY_GROUP_SQL,
-        &[
-            &new_entity_group_id.0,
-            &ordered_id_1.0,  // Using the ordered entity ID
-            &ordered_id_2.0,  // Using the ordered entity ID
-            &MatchMethodType::Name.as_str(),
-            &match_values_json,
-            &tuned_confidence, // Now using tuned value
-            &pre_rl_confidence_score,
-        ],
-    ).await?;
-    
+    let rows_affected = tx
+        .execute(
+            INSERT_ENTITY_GROUP_SQL,
+            &[
+                &new_entity_group_id.0,
+                &ordered_id_1.0, // Using the ordered entity ID
+                &ordered_id_2.0, // Using the ordered entity ID
+                &MatchMethodType::Name.as_str(),
+                &match_values_json,
+                &tuned_confidence, // Now using tuned value
+                &pre_rl_confidence_score,
+            ],
+        )
+        .await?;
+
     if rows_affected > 0 {
         // Create suggestion for low confidence matches if needed
         if tuned_confidence < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
@@ -627,7 +694,7 @@ async fn create_entity_group(
             } else {
                 1
             };
-            
+
             let details_json = serde_json::json!({
                 "method_type": MatchMethodType::Name.as_str(),
                 "original_name1": original_name1,
@@ -638,12 +705,12 @@ async fn create_entity_group(
                 "pre_rl_match_type": pre_rl_match_type,
                 "entity_group_id": &new_entity_group_id.0,
             });
-            
+
             let reason_message = format!(
                 "Pair ({}, {}) matched by Name with low tuned confidence ({:.4}). Pre-RL: {:.2} ({}).",
                 ordered_id_1.0, ordered_id_2.0, tuned_confidence, pre_rl_confidence_score, pre_rl_match_type
             );
-            
+
             // Insert suggestion directly in this transaction
             const INSERT_SUGGESTION_SQL: &str = "
                 INSERT INTO clustering_metadata.suggested_actions (
@@ -652,39 +719,44 @@ async fn create_entity_group(
                     reviewer_id, reviewed_at, review_notes
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 RETURNING id";
-                
-            if let Err(e) = tx.query_one(
-                INSERT_SUGGESTION_SQL,
-                &[
-                    &Some(pipeline_run_id.to_string()),
-                    &ActionType::ReviewEntityInGroup.as_str(),
-                    &None::<String>,
-                    &Some(new_entity_group_id.0.clone()),
-                    &None::<String>,
-                    &None::<String>,
-                    &Some(tuned_confidence),
-                    &Some(details_json),
-                    &Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
-                    &Some(reason_message),
-                    &(priority as i32),
-                    &SuggestionStatus::PendingReview.as_str(),
-                    &None::<String>,
-                    &None::<NaiveDateTime>,
-                    &None::<String>,
-                ],
-            ).await {
+
+            if let Err(e) = tx
+                .query_one(
+                    INSERT_SUGGESTION_SQL,
+                    &[
+                        &Some(pipeline_run_id.to_string()),
+                        &ActionType::ReviewEntityInGroup.as_str(),
+                        &None::<String>,
+                        &Some(new_entity_group_id.0.clone()),
+                        &None::<String>,
+                        &None::<String>,
+                        &Some(tuned_confidence),
+                        &Some(details_json),
+                        &Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
+                        &Some(reason_message),
+                        &(priority as i32),
+                        &SuggestionStatus::PendingReview.as_str(),
+                        &None::<String>,
+                        &None::<NaiveDateTime>,
+                        &None::<String>,
+                    ],
+                )
+                .await
+            {
                 warn!("Name: Failed to create suggestion: {}", e);
             }
         }
-        
+
         // Log decision snapshot if features were extracted
-        if let (Some(ro_arc), Some(features_vec)) = (reinforcement_orchestrator, features_for_snapshot.as_ref()) {
+        if let (Some(ro_arc), Some(features_vec)) =
+            (reinforcement_orchestrator, features_for_snapshot.as_ref())
+        {
             let orchestrator_guard = ro_arc.lock().await;
             let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
-            
-            let snapshot_features_json = serde_json::to_value(features_vec)
-                .unwrap_or(serde_json::Value::Null);
-                
+
+            let snapshot_features_json =
+                serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
+
             // Insert decision directly with SQL to avoid verification
             const INSERT_DECISION_SQL: &str = "
                 INSERT INTO clustering_metadata.match_decision_details (
@@ -693,23 +765,26 @@ async fn create_entity_group(
                     tuned_confidence_at_decision, confidence_tuner_version_at_decision
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id";
-                
-            if let Err(e) = tx.query_one(
-                INSERT_DECISION_SQL,
-                &[
-                    &new_entity_group_id.0,
-                    &pipeline_run_id,
-                    &snapshot_features_json,
-                    &MatchMethodType::Name.as_str(),
-                    &pre_rl_confidence_score,
-                    &tuned_confidence,
-                    &(confidence_tuner_ver as i32),
-                ],
-            ).await {
+
+            if let Err(e) = tx
+                .query_one(
+                    INSERT_DECISION_SQL,
+                    &[
+                        &new_entity_group_id.0,
+                        &pipeline_run_id,
+                        &snapshot_features_json,
+                        &MatchMethodType::Name.as_str(),
+                        &pre_rl_confidence_score,
+                        &tuned_confidence,
+                        &(confidence_tuner_ver as i32),
+                    ],
+                )
+                .await
+            {
                 warn!("Name: Failed to log decision snapshot: {}", e);
             }
         }
-        
+
         // Commit the transaction with all operations
         tx.commit().await?;
         Ok(true)

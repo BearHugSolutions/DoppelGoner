@@ -2,15 +2,15 @@
 
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
-use uuid::Uuid;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use super::service_confidence_tuner::ServiceConfidenceTuner;
 use super::service_feature_cache_service::SharedServiceFeatureCache;
 use super::service_feature_extraction;
 use crate::db::PgPool;
-use crate::models::{ServiceId, MatchMethodType};
+use crate::models::{MatchMethodType, ServiceId};
 use crate::reinforcement::service::service_feedback_processor::process_service_feedback_for_tuner;
 use crate::EntityId;
 
@@ -31,7 +31,10 @@ impl ServiceMatchingOrchestrator {
                 tuner
             }
             Err(e) => {
-                warn!("Could not load service confidence tuner: {}. Creating new one.", e);
+                warn!(
+                    "Could not load service confidence tuner: {}. Creating new one.",
+                    e
+                );
                 ServiceConfidenceTuner::new()
             }
         };
@@ -41,7 +44,7 @@ impl ServiceMatchingOrchestrator {
             feature_cache: None,
         })
     }
-    
+
     /// Set the feature cache to be used by this orchestrator
     pub fn set_feature_cache(&mut self, cache: SharedServiceFeatureCache) {
         info!("Setting feature cache for ServiceMatchingOrchestrator");
@@ -58,7 +61,7 @@ impl ServiceMatchingOrchestrator {
             "ServiceOrchestrator: Extracting context features for pair ({}, {})",
             service1_id.0, service2_id.0
         );
-        
+
         service_feature_extraction::extract_context_for_service_pair(pool, service1_id, service2_id)
             .await
             .context(format!(
@@ -66,7 +69,7 @@ impl ServiceMatchingOrchestrator {
                 service1_id.0, service2_id.0
             ))
     }
-    
+
     /// Gets features for a service pair, using cache if available
     pub async fn get_pair_features(
         &self,
@@ -76,7 +79,9 @@ impl ServiceMatchingOrchestrator {
     ) -> Result<Vec<f64>> {
         if let Some(cache) = &self.feature_cache {
             let mut cache_guard = cache.lock().await;
-            cache_guard.get_pair_features(pool, &service1_id, &service2_id).await
+            cache_guard
+                .get_pair_features(pool, &service1_id, &service2_id)
+                .await
         } else {
             // Fall back to direct extraction
             Self::extract_pair_context_features(pool, service1_id, service2_id).await
@@ -102,7 +107,10 @@ impl ServiceMatchingOrchestrator {
             MatchMethodType::ServiceEmailMatch => "service_email",
             MatchMethodType::ServiceEmbeddingSimilarity => "service_embedding",
             _ => {
-                warn!("Using default service method type for unknown method: {}", method_type.as_str());
+                warn!(
+                    "Using default service method type for unknown method: {}",
+                    method_type.as_str()
+                );
                 "default"
             }
         };
@@ -197,7 +205,10 @@ impl ServiceMatchingOrchestrator {
     // Utility to get tuner stats - useful for reporting
     pub fn get_confidence_tuner_stats(&self) -> String {
         let stats = self.confidence_tuner.get_stats();
-        let mut output = format!("Service Confidence Tuner (v{}) Statistics:\n", self.confidence_tuner.version);
+        let mut output = format!(
+            "Service Confidence Tuner (v{}) Statistics:\n",
+            self.confidence_tuner.version
+        );
         for (method, values) in stats {
             output.push_str(&format!("\nMethod: {}\n", method));
             output.push_str("  Target Confidence | Avg Reward | Trials\n");
@@ -211,7 +222,7 @@ impl ServiceMatchingOrchestrator {
         }
         output
     }
-    
+
     /// Get statistics from the feature cache if available
     pub async fn get_feature_cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
         if let Some(cache) = &self.feature_cache {

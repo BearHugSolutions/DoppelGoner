@@ -17,16 +17,16 @@ const DEFAULT_CACHE_SIZE: usize = 20000;
 /// A service for caching entity pair features to avoid redundant extraction
 pub struct FeatureCacheService {
     // Cache for individual entity features (entity_id -> Vec<f64>)
-    individual_cache: LruCache<String, Vec<f64>>,
-    
+    pub individual_cache: LruCache<String, Vec<f64>>,
+
     // Cache for pair features (concat of sorted entity_ids -> Vec<f64>)
-    pair_cache: LruCache<String, Vec<f64>>,
-    
+    pub pair_cache: LruCache<String, Vec<f64>>,
+
     // Stats
-    hits: usize,
-    misses: usize,
-    individual_hits: usize,
-    individual_misses: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub individual_hits: usize,
+    pub individual_misses: usize,
 }
 
 impl FeatureCacheService {
@@ -36,9 +36,12 @@ impl FeatureCacheService {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(DEFAULT_CACHE_SIZE);
-            
-        info!("Initializing FeatureCacheService with cache size: {}", cache_size);
-        
+
+        info!(
+            "Initializing FeatureCacheService with cache size: {}",
+            cache_size
+        );
+
         Self {
             individual_cache: LruCache::new(NonZero::new(cache_size).unwrap()),
             pair_cache: LruCache::new(NonZero::new(cache_size).unwrap()),
@@ -48,16 +51,16 @@ impl FeatureCacheService {
             individual_misses: 0,
         }
     }
-    
+
     /// Get the cache key for an entity pair
-    fn get_pair_key(entity1_id: &EntityId, entity2_id: &EntityId) -> String {
+    pub fn get_pair_key(entity1_id: &EntityId, entity2_id: &EntityId) -> String {
         if entity1_id.0 < entity2_id.0 {
             format!("{}:{}", entity1_id.0, entity2_id.0)
         } else {
             format!("{}:{}", entity2_id.0, entity1_id.0)
         }
     }
-    
+
     /// Get features for an entity pair, using cache if available
     pub async fn get_pair_features(
         &mut self,
@@ -66,7 +69,7 @@ impl FeatureCacheService {
         entity2_id: &EntityId,
     ) -> Result<Vec<f64>> {
         let key = Self::get_pair_key(entity1_id, entity2_id);
-        
+
         // Check if features are already in cache
         if let Some(features) = self.pair_cache.get(&key) {
             self.hits += 1;
@@ -80,7 +83,7 @@ impl FeatureCacheService {
             }
             return Ok(features.clone());
         }
-        
+
         // Features not in cache, need to extract
         self.misses += 1;
         let features = feature_extraction::extract_context_for_pair(pool, entity1_id, entity2_id)
@@ -89,18 +92,18 @@ impl FeatureCacheService {
                 "Failed to extract features for pair ({}, {})",
                 entity1_id.0, entity2_id.0
             ))?;
-            
+
         // Cache the features
         self.pair_cache.put(key, features.clone());
-        
+
         Ok(features)
     }
-    
+
     /// Get features for an individual entity, using cache if available
     pub async fn get_individual_features(
-        &mut self, 
+        &mut self,
         conn: &tokio_postgres::Client,
-        entity_id: &EntityId
+        entity_id: &EntityId,
     ) -> Result<Vec<f64>> {
         // Check if features are already in cache
         if let Some(features) = self.individual_cache.get(&entity_id.0) {
@@ -115,7 +118,7 @@ impl FeatureCacheService {
             }
             return Ok(features.clone());
         }
-        
+
         // Features not in cache, need to extract
         self.individual_misses += 1;
         let features = feature_extraction::get_stored_entity_features(conn, entity_id)
@@ -124,18 +127,24 @@ impl FeatureCacheService {
                 "Failed to extract individual features for entity {}",
                 entity_id.0
             ))?;
-            
+
         // Cache the features
-        self.individual_cache.put(entity_id.0.clone(), features.clone());
-        
+        self.individual_cache
+            .put(entity_id.0.clone(), features.clone());
+
         Ok(features)
     }
-    
+
     /// Get cache statistics
     pub fn get_stats(&self) -> (usize, usize, usize, usize) {
-        (self.hits, self.misses, self.individual_hits, self.individual_misses)
+        (
+            self.hits,
+            self.misses,
+            self.individual_hits,
+            self.individual_misses,
+        )
     }
-    
+
     /// Clear the cache
     pub fn clear(&mut self) {
         self.pair_cache.clear();

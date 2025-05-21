@@ -19,11 +19,11 @@ use crate::db::{self, PgPool};
 use crate::models::{
     ActionType,
     ContributingSharedServiceDetail, // New struct (will need to be added to models.rs)
-    ServiceId,
-    ServiceGroupId,
-    ServiceGroupClusterId,
     NewClusterFormationEdge,
     NewSuggestedAction,
+    ServiceGroupClusterId,
+    ServiceGroupId,
+    ServiceId,
     SuggestionStatus,
 };
 use crate::reinforcement::service::service_orchestrator::ServiceMatchingOrchestrator;
@@ -375,7 +375,9 @@ pub async fn process_clusters(
                 .rollback()
                 .await
                 .map_err(|rb_err| warn!("Rollback failed: {}", rb_err));
-            return Err(anyhow::Error::from(e).context("Leiden community detection failed for services"));
+            return Err(
+                anyhow::Error::from(e).context("Leiden community detection failed for services")
+            );
         }
     };
     info!(

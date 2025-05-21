@@ -126,7 +126,8 @@ pub fn get_service_feature_metadata() -> Vec<FeatureMetadata> {
         },
         FeatureMetadata {
             name: "s_organization_embedding_present".to_string(),
-            description: "Boolean indicating if the service's organization has an embedding.".to_string(),
+            description: "Boolean indicating if the service's organization has an embedding."
+                .to_string(),
             min_value: 0.0,
             max_value: 1.0,
         },
@@ -157,7 +158,8 @@ pub fn get_service_feature_metadata() -> Vec<FeatureMetadata> {
         },
         FeatureMetadata {
             name: "pair_s_same_organization".to_string(),
-            description: "Boolean indicating if services belong to the same organization.".to_string(),
+            description: "Boolean indicating if services belong to the same organization."
+                .to_string(),
             min_value: 0.0,
             max_value: 1.0,
         },
@@ -198,7 +200,7 @@ pub async fn get_stored_service_features(
 ) -> Result<Vec<f64>> {
     let service_context = format!("Service {}", service_id.0);
     debug!("{} Checking for stored features...", service_context);
-    
+
     let rows = conn
         .query(
             "SELECT feature_name, feature_value
@@ -222,7 +224,7 @@ pub async fn get_stored_service_features(
             service_context,
             rows.len()
         );
-        
+
         let mut feature_map = HashMap::new();
         for row in rows {
             let name: String = row.get(0);
@@ -232,7 +234,7 @@ pub async fn get_stored_service_features(
 
         let mut features_vec: Vec<f64> = Vec::with_capacity(INDIVIDUAL_FEATURE_COUNT);
         let mut all_present = true;
-        
+
         for i in 0..INDIVIDUAL_FEATURE_COUNT {
             if let Some(value) = feature_map.get(&metadata[i].name) {
                 features_vec.push(*value);
@@ -264,7 +266,7 @@ pub async fn get_stored_service_features(
             service_context
         );
     }
-    
+
     // If not all features were present or rows were empty, extract and store them.
     extract_and_store_service_features(conn, service_id, &metadata).await
 }
@@ -282,7 +284,7 @@ pub async fn extract_and_store_service_features(
         "{} Extracting service features (consolidated query)...",
         service_context
     );
-    
+
     let basic_features_tasks_completed = Arc::new(AtomicUsize::new(0));
     let total_basic_feature_tasks = 1;
 
@@ -330,24 +332,26 @@ pub async fn extract_and_store_service_features(
         service_status: row.try_get("service_status").ok(),
         service_embedding_v2_present: row.try_get("service_embedding_v2_present").unwrap_or(false),
         organization_name: row.try_get("organization_name").ok(),
-        organization_embedding_present: row.try_get("organization_embedding_present").unwrap_or(false),
+        organization_embedding_present: row
+            .try_get("organization_embedding_present")
+            .unwrap_or(false),
         taxonomy_count: row.try_get("taxonomy_count").unwrap_or(0),
         location_count: row.try_get("location_count").unwrap_or(0),
     };
 
     let features_vec = vec![
-        calculate_name_length_from_data(&raw_data),                    // feature 0
-        calculate_desc_length_from_data(&raw_data),                    // feature 1
-        calculate_has_email_from_data(&raw_data),                      // feature 2
-        calculate_has_url_from_data(&raw_data),                        // feature 3
-        calculate_status_active_from_data(&raw_data),                  // feature 4
-        calculate_taxonomy_count_from_data(&raw_data),                 // feature 5
-        calculate_location_count_from_data(&raw_data),                 // feature 6
-        calculate_embedding_v2_present_from_data(&raw_data),           // feature 7
-        calculate_organization_name_length_from_data(&raw_data),       // feature 8
+        calculate_name_length_from_data(&raw_data),    // feature 0
+        calculate_desc_length_from_data(&raw_data),    // feature 1
+        calculate_has_email_from_data(&raw_data),      // feature 2
+        calculate_has_url_from_data(&raw_data),        // feature 3
+        calculate_status_active_from_data(&raw_data),  // feature 4
+        calculate_taxonomy_count_from_data(&raw_data), // feature 5
+        calculate_location_count_from_data(&raw_data), // feature 6
+        calculate_embedding_v2_present_from_data(&raw_data), // feature 7
+        calculate_organization_name_length_from_data(&raw_data), // feature 8
         calculate_organization_embedding_present_from_data(&raw_data), // feature 9
     ];
-    
+
     info!(
         "{} Completed calculation of {} service features.",
         service_context,
@@ -360,9 +364,10 @@ pub async fn extract_and_store_service_features(
         service_context,
         features_vec.len()
     );
-    
-    store_individual_service_features(conn, service_id, &features_vec, all_feature_metadata).await?;
-    
+
+    store_individual_service_features(conn, service_id, &features_vec, all_feature_metadata)
+        .await?;
+
     debug!(
         "{} Successfully stored individual features.",
         service_context
@@ -911,13 +916,16 @@ async fn calculate_name_jaro_winkler(
     service1_id: &ServiceId,
     service2_id: &ServiceId,
 ) -> Result<f64> {
-    let row = conn.query_one(
-        "SELECT similarity(LOWER(s1.name), LOWER(s2.name))::DOUBLE PRECISION as similarity
+    let row = conn
+        .query_one(
+            "SELECT similarity(LOWER(s1.name), LOWER(s2.name))::DOUBLE PRECISION as similarity
          FROM public.service s1, public.service s2
          WHERE s1.id = $1 AND s2.id = $2 AND s1.name IS NOT NULL AND s2.name IS NOT NULL",
-        &[&service1_id.0, &service2_id.0],
-    ).await.context("DB query for name_jaro_winkler failed")?;
-    
+            &[&service1_id.0, &service2_id.0],
+        )
+        .await
+        .context("DB query for name_jaro_winkler failed")?;
+
     Ok(row.get::<_, f64>("similarity"))
 }
 
@@ -932,28 +940,34 @@ async fn calculate_embedding_cosine_similarity(
          WHERE s1.id = $1 AND s2.id = $2 AND s1.embedding_v2 IS NOT NULL AND s2.embedding_v2 IS NOT NULL",
         &[&service1_id.0, &service2_id.0],
     ).await.context("DB query for embeddings failed")?;
-    
+
     if let Some(row) = row_opt {
         let emb1_pg: Option<PgVector> = row.try_get("emb1").ok();
         let emb2_pg: Option<PgVector> = row.try_get("emb2").ok();
-        
+
         if let (Some(e1), Some(e2)) = (emb1_pg, emb2_pg) {
             let v1_f32 = e1.to_vec();
             let v2_f32 = e2.to_vec();
-            
+
             if v1_f32.is_empty() || v2_f32.is_empty() {
-                warn!("Empty embedding(s) for service pair ({}, {})", service1_id.0, service2_id.0);
-                return Ok(0.0);
-            }
-            
-            if v1_f32.len() != v2_f32.len() {
                 warn!(
-                    "Embedding dimension mismatch for service pair ({}, {}). v1: {}, v2: {}",
-                    service1_id.0, service2_id.0, v1_f32.len(), v2_f32.len()
+                    "Empty embedding(s) for service pair ({}, {})",
+                    service1_id.0, service2_id.0
                 );
                 return Ok(0.0);
             }
-            
+
+            if v1_f32.len() != v2_f32.len() {
+                warn!(
+                    "Embedding dimension mismatch for service pair ({}, {}). v1: {}, v2: {}",
+                    service1_id.0,
+                    service2_id.0,
+                    v1_f32.len(),
+                    v2_f32.len()
+                );
+                return Ok(0.0);
+            }
+
             cosine_similarity_candle(&v1_f32, &v2_f32)
                 .map_err(|e| anyhow::anyhow!("Candle similarity failed: {}", e))
         } else {
@@ -994,7 +1008,7 @@ async fn calculate_taxonomy_jaccard(
             END as jaccard",
         &[&service1_id.0, &service2_id.0],
     ).await.context("DB query for taxonomy_jaccard failed")?;
-    
+
     Ok(row.get::<_, f64>("jaccard"))
 }
 
@@ -1003,8 +1017,9 @@ async fn calculate_location_jaccard(
     service1_id: &ServiceId,
     service2_id: &ServiceId,
 ) -> Result<f64> {
-    let row = conn.query_one(
-        "WITH
+    let row = conn
+        .query_one(
+            "WITH
          locations1 AS (
             SELECT location_id FROM public.service_at_location WHERE service_id = $1
          ),
@@ -1026,9 +1041,11 @@ async fn calculate_location_jaccard(
                 WHEN (SELECT count FROM union_count) = 0 THEN 0.0
                 ELSE (SELECT count FROM intersection_count)::FLOAT / (SELECT count FROM union_count)
             END as jaccard",
-        &[&service1_id.0, &service2_id.0],
-    ).await.context("DB query for location_jaccard failed")?;
-    
+            &[&service1_id.0, &service2_id.0],
+        )
+        .await
+        .context("DB query for location_jaccard failed")?;
+
     Ok(row.get::<_, f64>("jaccard"))
 }
 
@@ -1047,7 +1064,7 @@ async fn check_same_organization(
          WHERE s1.id = $1 AND s2.id = $2",
         &[&service1_id.0, &service2_id.0],
     ).await.context("DB query for same_organization failed")?;
-    
+
     Ok(row.get::<_, f64>("same_organization"))
 }
 
@@ -1056,17 +1073,20 @@ async fn check_email_exact_match(
     service1_id: &ServiceId,
     service2_id: &ServiceId,
 ) -> Result<f64> {
-    let row = conn.query_one(
-        "SELECT
+    let row = conn
+        .query_one(
+            "SELECT
             CASE
                 WHEN s1.email = s2.email AND s1.email IS NOT NULL AND s1.email <> '' THEN 1.0
                 ELSE 0.0
             END as email_match
          FROM public.service s1, public.service s2
          WHERE s1.id = $1 AND s2.id = $2",
-        &[&service1_id.0, &service2_id.0],
-    ).await.context("DB query for email_exact_match failed")?;
-    
+            &[&service1_id.0, &service2_id.0],
+        )
+        .await
+        .context("DB query for email_exact_match failed")?;
+
     Ok(row.get::<_, f64>("email_match"))
 }
 
@@ -1075,8 +1095,9 @@ async fn check_url_domain_match(
     service1_id: &ServiceId,
     service2_id: &ServiceId,
 ) -> Result<f64> {
-    let row = conn.query_one(
-        "WITH domain_extract AS (
+    let row = conn
+        .query_one(
+            "WITH domain_extract AS (
             SELECT
                 regexp_replace(LOWER(s1.url), '^https?://(www\\.)?|/.*$', '', 'g') as domain1,
                 regexp_replace(LOWER(s2.url), '^https?://(www\\.)?|/.*$', '', 'g') as domain2
@@ -1090,32 +1111,37 @@ async fn check_url_domain_match(
                 AND (SELECT domain1 FROM domain_extract) <> '' THEN 1.0
                 ELSE 0.0
             END as domain_match",
-        &[&service1_id.0, &service2_id.0],
-    ).await.context("DB query for url_domain_match failed")?;
-    
+            &[&service1_id.0, &service2_id.0],
+        )
+        .await
+        .context("DB query for url_domain_match failed")?;
+
     Ok(row.get::<_, f64>("domain_match"))
 }
 
 pub async fn extract_and_store_all_service_context_features(
     pool: &PgPool,
-    feature_cache: &SharedServiceFeatureCache
+    feature_cache: &SharedServiceFeatureCache,
 ) -> Result<usize> {
     let conn = pool.get().await?;
-    
+
     // Get all service IDs
     let rows = conn.query("SELECT id FROM public.service", &[]).await?;
     let service_ids: Vec<ServiceId> = rows.iter().map(|row| ServiceId(row.get(0))).collect();
-    
-    info!("Found {} services for feature extraction", service_ids.len());
-    
+
+    info!(
+        "Found {} services for feature extraction",
+        service_ids.len()
+    );
+
     // Process in batches
     let batch_size = 100;
     let mut processed_count = 0;
-    
+
     for chunk in service_ids.chunks(batch_size) {
         // Create a new connection for this batch
         let batch_conn = pool.get().await?;
-        
+
         // Process each service in this batch
         for service_id in chunk {
             // Get or extract features - this will store them in the DB if needed
@@ -1126,25 +1152,32 @@ pub async fn extract_and_store_all_service_context_features(
                     let cache_key = service_id.0.clone();
                     cache_guard.individual_cache.put(cache_key, features);
                     processed_count += 1;
-                },
+                }
                 Err(e) => {
-                    warn!("Failed to extract features for service {}: {}", service_id.0, e);
+                    warn!(
+                        "Failed to extract features for service {}: {}",
+                        service_id.0, e
+                    );
                 }
             }
         }
-        
-        info!("Processed {}/{} services", processed_count, service_ids.len());
+
+        info!(
+            "Processed {}/{} services",
+            processed_count,
+            service_ids.len()
+        );
     }
-    
+
     // Cache statistics for observability
     {
         let cache_guard = feature_cache.lock().await;
         let (_, _, ind_hits, ind_misses) = cache_guard.get_stats();
         info!(
-            "Individual service features cache stats after pre-extraction: hits={}, misses={}", 
+            "Individual service features cache stats after pre-extraction: hits={}, misses={}",
             ind_hits, ind_misses
         );
     }
-    
+
     Ok(processed_count)
 }

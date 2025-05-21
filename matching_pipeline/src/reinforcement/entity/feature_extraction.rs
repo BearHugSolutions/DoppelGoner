@@ -17,7 +17,9 @@ use candle_core::{Device, Error as CandleError};
 use crate::db::PgPool; // Assuming this is the main pool type from crate::db
 use crate::models::EntityId;
 use crate::reinforcement::types::FeatureMetadata;
-use crate::utils::cosine_similarity_candle; // Assuming this utility is in crate::utils
+use crate::utils::cosine_similarity_candle;
+
+use super::feature_cache_service::SharedFeatureCache; // Assuming this utility is in crate::utils
 
 // Helper to get a Candle device (same as before)
 fn get_candle_device() -> Result<Device, CandleError> {

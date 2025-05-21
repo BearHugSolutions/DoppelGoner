@@ -74,11 +74,12 @@ pub async fn find_matches(
         phone_rows.len()
     );
 
-    // Release initial connection 
+    // Release initial connection
     drop(initial_conn);
 
     // 3. Process phone data into a map of normalized phones to entities
-    let mut phone_map: HashMap<String, HashMap<EntityId, (String, Option<String>)>> = HashMap::new();
+    let mut phone_map: HashMap<String, HashMap<EntityId, (String, Option<String>)>> =
+        HashMap::new();
     for row in &phone_rows {
         let entity_id = EntityId(row.get("entity_id"));
         let number: String = row.get("number");
@@ -157,7 +158,7 @@ pub async fn find_matches(
                 } else {
                     0.85
                 };
-                
+
                 let pre_rl_confidence = base_confidence;
                 let mut final_confidence_score = base_confidence;
                 let mut features_for_snapshot: Option<Vec<f64>> = None;
@@ -168,10 +169,13 @@ pub async fn find_matches(
                     match if let Some(cache) = feature_cache.as_ref() {
                         let orchestrator_arc = Arc::new(orch.clone());
                         let orchestrator_guard = orchestrator_arc.lock().await;
-                        orchestrator_guard.get_pair_features(pool, e1_id, e2_id).await
+                        orchestrator_guard
+                            .get_pair_features(pool, e1_id, e2_id)
+                            .await
                     } else {
                         // Extract features directly
-                        MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await
+                        MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id)
+                            .await
                     } {
                         Ok(features_vec) => {
                             if !features_vec.is_empty() {
@@ -185,7 +189,7 @@ pub async fn find_matches(
                                 ) {
                                     Ok(tuned_score) => {
                                         final_confidence_score = tuned_score;
-                                    },
+                                    }
                                     Err(e) => {
                                         warn!("Phone: Failed to get tuned confidence for pair ({}, {}): {}. Using pre-RL score.", 
                                             e1_id.0, e2_id.0, e);
@@ -195,7 +199,7 @@ pub async fn find_matches(
                                 warn!("Phone: Empty features vector for pair ({}, {}). Using pre-RL score.", 
                                     e1_id.0, e2_id.0);
                             }
-                        },
+                        }
                         Err(e) => {
                             warn!("Phone: Failed to extract features for pair ({}, {}): {}. Using pre-RL score.", 
                                 e1_id.0, e2_id.0, e);
@@ -225,7 +229,9 @@ pub async fn find_matches(
                     &normalized_shared_phone,
                     features_for_snapshot,
                     feature_cache.clone(), // Pass the feature cache
-                ).await {
+                )
+                .await
+                {
                     Ok(created) => {
                         if created {
                             info!(
@@ -237,10 +243,13 @@ pub async fn find_matches(
                             entities_in_new_pairs.insert(e2_id.clone());
                             confidence_scores_for_stats.push(final_confidence_score);
                         }
-                    },
+                    }
                     Err(e) => {
                         individual_operation_errors += 1;
-                        warn!("Phone: Failed to process pair ({}, {}): {}", e1_id.0, e2_id.0, e);
+                        warn!(
+                            "Phone: Failed to process pair ({}, {}): {}",
+                            e1_id.0, e2_id.0, e
+                        );
                     }
                 }
             }
@@ -267,7 +276,11 @@ pub async fn find_matches(
         groups_created: new_pairs_created_count,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 { 2.0 } else { 0.0 },
+        avg_group_size: if new_pairs_created_count > 0 {
+            2.0
+        } else {
+            0.0
+        },
     };
 
     let elapsed = start_time.elapsed();
@@ -299,20 +312,24 @@ async fn create_entity_group(
     feature_cache: Option<SharedFeatureCache>, // Added feature_cache parameter
 ) -> Result<bool> {
     // Get a single connection for all operations
-    let mut conn = pool.get().await
+    let mut conn = pool
+        .get()
+        .await
         .context("Phone: Failed to get DB connection for entity group creation")?;
-    
+
     // Start a transaction that will include all operations
-    let tx = conn.transaction().await
+    let tx = conn
+        .transaction()
+        .await
         .context("Phone: Failed to start transaction for entity group creation")?;
-    
+
     // Generate entity group ID
     let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
-    
+
     // Ensure entity_id_1 < entity_id_2 to satisfy the check_entity_order constraint
     let (ordered_id_1, ordered_id_2);
     let ordered_match_values;
-    
+
     if entity_id_1.0 <= entity_id_2.0 {
         ordered_id_1 = entity_id_1;
         ordered_id_2 = entity_id_2;
@@ -321,7 +338,7 @@ async fn create_entity_group(
         // Swap IDs for ordering
         ordered_id_1 = entity_id_2;
         ordered_id_2 = entity_id_1;
-        
+
         // Create new match values with swapped fields for PhoneMatchValue
         if let MatchValues::Phone(phone_match) = match_values {
             ordered_match_values = MatchValues::Phone(PhoneMatchValue {
@@ -336,36 +353,38 @@ async fn create_entity_group(
             ordered_match_values = match_values.clone();
         }
     }
-    
+
     // Serialize match values
     let match_values_json = serde_json::to_value(&ordered_match_values)
         .context("Phone: Failed to serialize match values")?;
-    
+
     // Extract phone specific data
     let (original_phone1, original_phone2, extension1, extension2) = match &ordered_match_values {
         MatchValues::Phone(p) => (
-            &p.original_phone1, 
+            &p.original_phone1,
             &p.original_phone2,
             &p.extension1,
-            &p.extension2
+            &p.extension2,
         ),
         _ => (&String::new(), &String::new(), &None, &None),
     };
-    
+
     // Insert entity group
-    let rows_affected = tx.execute(
-        INSERT_ENTITY_GROUP_SQL,
-        &[
-            &new_entity_group_id.0,
-            &ordered_id_1.0,
-            &ordered_id_2.0,
-            &MatchMethodType::Phone.as_str(),
-            &match_values_json,
-            &final_confidence_score,
-            &pre_rl_confidence_score,
-        ],
-    ).await?;
-    
+    let rows_affected = tx
+        .execute(
+            INSERT_ENTITY_GROUP_SQL,
+            &[
+                &new_entity_group_id.0,
+                &ordered_id_1.0,
+                &ordered_id_2.0,
+                &MatchMethodType::Phone.as_str(),
+                &match_values_json,
+                &final_confidence_score,
+                &pre_rl_confidence_score,
+            ],
+        )
+        .await?;
+
     if rows_affected > 0 {
         // Create suggestion for low confidence matches if needed
         if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
@@ -374,7 +393,7 @@ async fn create_entity_group(
             } else {
                 1
             };
-            
+
             let details_json = serde_json::json!({
                 "method_type": MatchMethodType::Phone.as_str(),
                 "matched_value": normalized_shared_phone,
@@ -384,12 +403,12 @@ async fn create_entity_group(
                 "extension2": extension2,
                 "entity_group_id": &new_entity_group_id.0,
             });
-            
+
             let reason_message = format!(
                 "Pair ({}, {}) matched by Phone with low confidence ({:.4}). Pre-RL: {:.2}.",
                 ordered_id_1.0, ordered_id_2.0, final_confidence_score, pre_rl_confidence_score
             );
-            
+
             // Insert suggestion directly in this transaction
             const INSERT_SUGGESTION_SQL: &str = "
                 INSERT INTO clustering_metadata.suggested_actions (
@@ -398,31 +417,34 @@ async fn create_entity_group(
                     reviewer_id, reviewed_at, review_notes
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 RETURNING id";
-                
-            if let Err(e) = tx.query_one(
-                INSERT_SUGGESTION_SQL,
-                &[
-                    &Some(pipeline_run_id.to_string()),
-                    &ActionType::ReviewEntityInGroup.as_str(),
-                    &None::<String>,
-                    &Some(new_entity_group_id.0.clone()),
-                    &None::<String>,
-                    &None::<String>,
-                    &Some(final_confidence_score),
-                    &Some(details_json),
-                    &Some("LOW_CONFIDENCE_PAIR".to_string()),
-                    &Some(reason_message),
-                    &(priority as i32),
-                    &SuggestionStatus::PendingReview.as_str(),
-                    &None::<String>,
-                    &None::<NaiveDateTime>,
-                    &None::<String>,
-                ],
-            ).await {
+
+            if let Err(e) = tx
+                .query_one(
+                    INSERT_SUGGESTION_SQL,
+                    &[
+                        &Some(pipeline_run_id.to_string()),
+                        &ActionType::ReviewEntityInGroup.as_str(),
+                        &None::<String>,
+                        &Some(new_entity_group_id.0.clone()),
+                        &None::<String>,
+                        &None::<String>,
+                        &Some(final_confidence_score),
+                        &Some(details_json),
+                        &Some("LOW_CONFIDENCE_PAIR".to_string()),
+                        &Some(reason_message),
+                        &(priority as i32),
+                        &SuggestionStatus::PendingReview.as_str(),
+                        &None::<String>,
+                        &None::<NaiveDateTime>,
+                        &None::<String>,
+                    ],
+                )
+                .await
+            {
                 warn!("Phone: Failed to create suggestion: {}", e);
             }
         }
-        
+
         // Log decision snapshot if orchestrator available
         if let Some(orch) = reinforcement_orchestrator {
             // Use provided features if available, otherwise try to get from cache or extract
@@ -432,26 +454,35 @@ async fn create_entity_group(
                 // Try to get features from cache
                 let orchestrator_arc = Arc::new(orch.clone());
                 let orchestrator_guard = orchestrator_arc.lock().await;
-                match orchestrator_guard.get_pair_features(pool, ordered_id_1, ordered_id_2).await {
+                match orchestrator_guard
+                    .get_pair_features(pool, ordered_id_1, ordered_id_2)
+                    .await
+                {
                     Ok(f) => Some(f),
                     Err(_) => None,
                 }
             } else {
                 // Direct extraction as last resort
-                match MatchingOrchestrator::extract_pair_context_features(pool, ordered_id_1, ordered_id_2).await {
+                match MatchingOrchestrator::extract_pair_context_features(
+                    pool,
+                    ordered_id_1,
+                    ordered_id_2,
+                )
+                .await
+                {
                     Ok(f) => Some(f),
                     Err(_) => None,
                 }
             };
-            
+
             if let Some(features_vec) = features_to_log {
                 let orchestrator_arc = Arc::new(orch.clone());
                 let orchestrator_guard = orchestrator_arc.lock().await;
                 let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
-                
-                let snapshot_features_json = serde_json::to_value(&features_vec)
-                    .unwrap_or(serde_json::Value::Null);
-                    
+
+                let snapshot_features_json =
+                    serde_json::to_value(&features_vec).unwrap_or(serde_json::Value::Null);
+
                 // Insert decision directly with SQL to avoid verification
                 const INSERT_DECISION_SQL: &str = "
                     INSERT INTO clustering_metadata.match_decision_details (
@@ -460,24 +491,27 @@ async fn create_entity_group(
                         tuned_confidence_at_decision, confidence_tuner_version_at_decision
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                     RETURNING id";
-                    
-                if let Err(e) = tx.query_one(
-                    INSERT_DECISION_SQL,
-                    &[
-                        &new_entity_group_id.0,
-                        &pipeline_run_id,
-                        &snapshot_features_json,
-                        &MatchMethodType::Phone.as_str(),
-                        &pre_rl_confidence_score,
-                        &final_confidence_score,
-                        &(confidence_tuner_ver as i32),
-                    ],
-                ).await {
+
+                if let Err(e) = tx
+                    .query_one(
+                        INSERT_DECISION_SQL,
+                        &[
+                            &new_entity_group_id.0,
+                            &pipeline_run_id,
+                            &snapshot_features_json,
+                            &MatchMethodType::Phone.as_str(),
+                            &pre_rl_confidence_score,
+                            &final_confidence_score,
+                            &(confidence_tuner_ver as i32),
+                        ],
+                    )
+                    .await
+                {
                     warn!("Phone: Failed to log decision snapshot: {}", e);
                 }
             }
         }
-        
+
         // Commit the transaction with all operations
         tx.commit().await?;
         Ok(true)
@@ -503,7 +537,7 @@ async fn fetch_existing_pairs(
     for row in rows {
         let id1: String = row.get("entity_id_1");
         let id2: String = row.get("entity_id_2");
-        
+
         // Ensure consistent ordering
         if id1 < id2 {
             existing_pairs.insert((EntityId(id1), EntityId(id2)));
@@ -511,7 +545,7 @@ async fn fetch_existing_pairs(
             existing_pairs.insert((EntityId(id2), EntityId(id1)));
         }
     }
-    
+
     Ok(existing_pairs)
 }
 

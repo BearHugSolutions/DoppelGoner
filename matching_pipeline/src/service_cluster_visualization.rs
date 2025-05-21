@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 // Local imports
 use crate::db::PgPool;
-use crate::models::{ServiceId, ServiceGroupClusterId};
+use crate::models::{ServiceGroupClusterId, ServiceId};
 
 /// Simple struct to hold service_group record details
 struct ServiceGroupRecord {
@@ -190,8 +190,11 @@ async fn process_service_cluster_for_visualization(
 }
 
 /// Fetch all service clusters from the database
-async fn fetch_service_clusters(transaction: &Transaction<'_>) -> Result<Vec<ServiceGroupClusterRecord>> {
-    let query = "SELECT id, name, service_count, average_coherence_score FROM public.service_group_cluster";
+async fn fetch_service_clusters(
+    transaction: &Transaction<'_>,
+) -> Result<Vec<ServiceGroupClusterRecord>> {
+    let query =
+        "SELECT id, name, service_count, average_coherence_score FROM public.service_group_cluster";
 
     let rows = transaction
         .query(query, &[])

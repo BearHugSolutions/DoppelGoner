@@ -49,7 +49,10 @@ async fn fetch_unprocessed_service_match_feedback(
             is_match_correct: row.get("is_match_correct"),
         });
     }
-    debug!("Fetched {} unprocessed service match human feedback items.", items.len());
+    debug!(
+        "Fetched {} unprocessed service match human feedback items.",
+        items.len()
+    );
     Ok(items)
 }
 
@@ -103,7 +106,10 @@ async fn mark_service_match_feedback_as_processed(
         ))?;
 
     if rows_affected == 1 {
-        debug!("Marked service match human feedback ID {} as processed.", feedback_id);
+        debug!(
+            "Marked service match human feedback ID {} as processed.",
+            feedback_id
+        );
     } else {
         warn!(
             "Attempted to mark service match human feedback ID {} as processed, but {} rows were affected (expected 1).",
@@ -138,7 +144,8 @@ pub async fn process_service_feedback_for_tuner(
     let mut error_count = 0;
 
     for feedback_record in feedback_items_to_process {
-        match fetch_service_match_decision_details(&client, &feedback_record.service_group_id).await {
+        match fetch_service_match_decision_details(&client, &feedback_record.service_group_id).await
+        {
             Ok(Some(decision_details)) => {
                 // Deserialize snapshotted_features from JSONB to Vec<f64>
                 let snapshotted_features: Vec<f64> = match serde_json::from_value(
@@ -201,8 +208,11 @@ pub async fn process_service_feedback_for_tuner(
                     continue; // Skip marking as processed if tuner update fails
                 }
 
-                if let Err(e) =
-                    mark_service_match_feedback_as_processed(&client, feedback_record.id.to_string()).await
+                if let Err(e) = mark_service_match_feedback_as_processed(
+                    &client,
+                    feedback_record.id.to_string(),
+                )
+                .await
                 {
                     warn!(
                         "Failed to mark service feedback item {} as processed after tuner update: {}",

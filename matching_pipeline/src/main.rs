@@ -14,9 +14,36 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
 
 use dedupe_lib::{
-    cluster_visualization, config, consolidate_clusters, db::{self, PgPool}, entity_organizations, matching, models::{self, *}, reinforcement::{self, entity::{feature_cache_service::create_shared_cache, orchestrator::MatchingOrchestrator}, service::{service_feature_cache_service::{create_shared_service_cache, SharedServiceFeatureCache}, service_feature_extraction::{extract_and_store_all_service_context_features, get_stored_service_features}, service_orchestrator::{self, ServiceMatchingOrchestrator}}}, results::{
-        self, AddressMatchResult, AnyMatchResult, EmailMatchResult, GeospatialMatchResult, MatchMethodStats, NameMatchResult, PhoneMatchResult, PipelineStats, ServiceMatchResult, UrlMatchResult
-    }, service_cluster_visualization, service_consolidate_clusters, service_matching
+    cluster_visualization, config, consolidate_clusters,
+    db::{self, PgPool},
+    entity_organizations, matching,
+    models::{self, *},
+    reinforcement::{
+        self,
+        entity::{
+            feature_cache_prewarmer::{
+                extract_and_store_all_entity_features_and_prewarm_cache,
+                prewarm_pair_features_cache,
+            },
+            feature_cache_service::{create_shared_cache, SharedFeatureCache},
+            orchestrator::MatchingOrchestrator,
+        },
+        service::{
+            service_feature_cache_service::{
+                create_shared_service_cache, SharedServiceFeatureCache,
+            },
+            service_feature_extraction::{
+                extract_and_store_all_service_context_features, get_stored_service_features,
+            },
+            service_orchestrator::{self, ServiceMatchingOrchestrator},
+        },
+    },
+    results::{
+        self, AddressMatchResult, AnyMatchResult, EmailMatchResult, GeospatialMatchResult,
+        MatchMethodStats, NameMatchResult, PhoneMatchResult, PipelineStats, ServiceMatchResult,
+        UrlMatchResult,
+    },
+    service_cluster_visualization, service_consolidate_clusters, service_matching,
 };
 
 #[tokio::main]
@@ -143,58 +170,84 @@ async fn run_pipeline(
     );
     info!("Pipeline progress: [1/8] phases (12.5%)");
 
-    // Phase 2: Context Feature Extraction
-    info!("Phase 2: Context Feature Extraction");
+    let entity_feature_cache: SharedFeatureCache = create_shared_cache(); //
+
+    // Phase 2: Entity Context Feature Extraction and Cache Pre-warming
+    info!("Phase 2: Entity Context Feature Extraction and Cache Pre-warming");
     let phase2_start = Instant::now();
     if stats.total_entities > 0 {
-        match entity_organizations::extract_and_store_all_entity_context_features(pool).await {
-            Ok(features_count) => info!("Successfully extracted and stored context features for {} entities.", features_count),
-            Err(e) => warn!("Context feature extraction failed: {}. Proceeding without ML-guided features for some operations potentially.", e),
+        // Call the new function from entity_feature_extraction module
+        match extract_and_store_all_entity_features_and_prewarm_cache(pool, &entity_feature_cache).await {
+            Ok(features_count) => info!(
+                "Successfully extracted/retrieved context features and pre-warmed cache for {} entities.",
+                features_count
+            ),
+            Err(e) => warn!(
+                "Entity context feature extraction and cache pre-warming failed: {}. Proceeding with potentially slower matching.",
+                e
+            ),
+        }
+        let max_pairs = 10000;
+        match prewarm_pair_features_cache(pool, &entity_feature_cache, max_pairs).await {
+            Ok(pairs_count) => info!(
+                "Successfully pre-warmed pair features cache for {} likely entity pairs.",
+                pairs_count
+            ),
+            Err(e) => warn!(
+                "Pair features cache pre-warming failed: {}. Proceeding with on-demand feature extraction.",
+                e
+            ),
         }
     } else {
-        info!("Skipping context feature extraction as no entities were identified.");
+        info!("Skipping entity context feature extraction and cache pre-warming as no entities were identified.");
+        //
     }
-    let phase2_duration = phase2_start.elapsed();
-    phase_times.insert("context_feature_extraction".to_string(), phase2_duration);
-    stats.context_feature_extraction_time = phase2_duration.as_secs_f64();
-    info!(
-        "Context Feature Extraction complete in {:.2?}. Phase 2 complete.",
-        phase2_duration
+    let phase2_duration = phase2_start.elapsed(); //
+                                                  // Updated key for clarity
+    phase_times.insert(
+        "entity_context_feature_extraction_and_prewarming".to_string(),
+        phase2_duration,
     );
-    info!("Pipeline progress: [2/8] phases (25%)");
+    stats.context_feature_extraction_time = phase2_duration.as_secs_f64(); //
+    info!(
+        "Entity Context Feature Extraction and Cache Pre-warming complete in {:.2?}. Phase 2 complete.",
+        phase2_duration
+    ); //
+    info!("Pipeline progress: [2/8] phases (25%)"); //
 
-    // Now initialize the ML reinforcement_orchestrator as features should be available
-    info!("Initializing ML-guided matching reinforcement_orchestrator");
-    let reinforcement_orchestrator = MatchingOrchestrator::new(pool)
+    // Now initialize the ML reinforcement_orchestrator
+    info!("Initializing ML-guided matching reinforcement_orchestrator"); //
+    let reinforcement_orchestrator_instance = MatchingOrchestrator::new(pool) //
         .await
-        .context("Failed to initialize ML reinforcement_orchestrator")?;
-    let reinforcement_orchestrator = Mutex::new(reinforcement_orchestrator);
+        .context("Failed to initialize ML reinforcement_orchestrator")?; //
+    let reinforcement_orchestrator = Arc::new(Mutex::new(reinforcement_orchestrator_instance)); //
+
+    // Set the *pre-warmed* feature cache on the orchestrator
+    {
+        let mut orchestrator = reinforcement_orchestrator.lock().await; //
+        orchestrator.set_feature_cache(entity_feature_cache.clone()); // Use the cache we just pre-warmed
+        info!("Pre-warmed entity feature cache attached to RL orchestrator"); //
+    }
 
     // Phase 3: Entity matching
-    info!("Phase 3: Entity matching");
-    info!("Initializing ML-guided matching reinforcement_orchestrator");
-    let reinforcement_orchestrator_instance = MatchingOrchestrator::new(pool)
-        .await
-        .context("Failed to initialize ML reinforcement_orchestrator")?;
-    // Wrap in Arc and Mutex for shared, mutable access across tasks
-    let reinforcement_orchestrator = Arc::new(Mutex::new(reinforcement_orchestrator_instance));
-
-    let phase3_start = Instant::now();
+    info!("Phase 3: Entity matching"); //
+    let phase3_start = Instant::now(); //
     let (total_groups, method_stats_match) = run_matching_pipeline(
         pool,
-        reinforcement_orchestrator.clone(),
-        run_id_clone.clone(),
+        reinforcement_orchestrator.clone(), // This orchestrator instance now holds the pre-warmed cache
+        stats.run_id.clone(),               // Use run_id from stats struct
+        entity_feature_cache.clone(),       // Pass the pre-warmed entity_feature_cache
     )
     .await?;
-    stats.total_groups = total_groups;
-    stats.method_stats.extend(method_stats_match);
-    let phase3_duration = phase3_start.elapsed();
-    phase_times.insert("entity_matching".to_string(), phase3_duration);
-    stats.matching_time = phase3_duration.as_secs_f64();
+    stats.total_groups = total_groups; //
+    stats.method_stats.extend(method_stats_match); //
+    let phase3_duration = phase3_start.elapsed(); //
+    phase_times.insert("entity_matching".to_string(), phase3_duration); //
+    stats.matching_time = phase3_duration.as_secs_f64(); //
     info!(
         "Created {} entity groups in {:.2?}. Phase 3 complete.",
         stats.total_groups, phase3_duration
-    );
+    ); //
     info!("Pipeline progress: [3/8] phases (37.5%)");
 
     // Phase 4: Cluster consolidation
@@ -229,7 +282,7 @@ async fn run_pipeline(
     );
     info!("Pipeline progress: [5/8] phases (62.5%)");
 
-        info!("Initializing service RL orchestrator");
+    info!("Initializing service RL orchestrator");
     let service_orchestrator_instance = ServiceMatchingOrchestrator::new(pool)
         .await
         .context("Failed to initialize service orchestrator")?;
@@ -246,9 +299,13 @@ async fn run_pipeline(
 
     info!("Phase 5.5: Service Context Feature Extraction");
     let phase5_5_start = Instant::now();
-    let service_features_count = extract_and_store_all_service_context_features(pool, &service_feature_cache).await?;
+    let service_features_count =
+        extract_and_store_all_service_context_features(pool, &service_feature_cache).await?;
     let phase5_5_duration = phase5_5_start.elapsed();
-    phase_times.insert("service_context_feature_extraction".to_string(), phase5_5_duration);
+    phase_times.insert(
+        "service_context_feature_extraction".to_string(),
+        phase5_5_duration,
+    );
     stats.service_context_feature_extraction_time = phase5_5_duration.as_secs_f64();
     info!(
         "Extracted and stored context features for {} services in {:.2?}. Phase 5.5 complete.",
@@ -261,32 +318,38 @@ async fn run_pipeline(
 
     // Run the service matching pipeline
     let service_match_result = run_service_matching_pipeline(
-        pool, 
+        pool,
         &run_id_clone,
         service_orchestrator.clone(),
-        service_feature_cache.clone()
-    ).await
-        .context("Service matching failed")?;
+        service_feature_cache.clone(),
+    )
+    .await
+    .context("Service matching failed")?;
 
     stats.total_service_matches = service_match_result.groups_created;
-    stats.method_stats.extend(service_match_result.method_stats.clone());
+    stats
+        .method_stats
+        .extend(service_match_result.method_stats.clone());
 
     if stats.service_stats.is_none() {
         // Create basic service stats from the result
         stats.service_stats = Some(results::ServiceMatchStats {
             total_matches: service_match_result.groups_created,
             avg_similarity: service_match_result.stats.avg_confidence,
-            high_similarity_matches: service_match_result.method_stats
+            high_similarity_matches: service_match_result
+                .method_stats
                 .iter()
                 .filter(|s| s.avg_confidence >= 0.9)
                 .map(|s| s.groups_created)
                 .sum(),
-            medium_similarity_matches: service_match_result.method_stats
+            medium_similarity_matches: service_match_result
+                .method_stats
                 .iter()
                 .filter(|s| s.avg_confidence >= 0.8 && s.avg_confidence < 0.9)
                 .map(|s| s.groups_created)
                 .sum(),
-            low_similarity_matches: service_match_result.method_stats
+            low_similarity_matches: service_match_result
+                .method_stats
                 .iter()
                 .filter(|s| s.avg_confidence < 0.8)
                 .map(|s| s.groups_created)
@@ -300,8 +363,7 @@ async fn run_pipeline(
     stats.service_matching_time = phase6_duration.as_secs_f64();
     info!(
         "Service matching processed in {:.2?}. Found {} service matches. Phase 6 complete.",
-        phase6_duration,
-        stats.total_service_matches
+        phase6_duration, stats.total_service_matches
     );
     info!("Pipeline progress: [6/8] phases (75%)");
 
@@ -309,10 +371,11 @@ async fn run_pipeline(
     info!("Phase 7: Service cluster consolidation");
     let phase7_start = Instant::now();
     stats.total_service_clusters = service_consolidate_clusters::process_clusters(
-        pool, 
+        pool,
         Some(&service_orchestrator),
-        &run_id_clone
-    ).await?;
+        &run_id_clone,
+    )
+    .await?;
     let phase7_duration = phase7_start.elapsed();
     phase_times.insert("service_clustering".to_string(), phase7_duration);
     stats.service_clustering_time = phase7_duration.as_secs_f64();
@@ -339,7 +402,6 @@ async fn run_pipeline(
         stats.total_service_visualization_edges, phase8_duration
     );
     info!("Pipeline progress: [8/8] phases (100%)");
-
 
     // Calculate total processing time
     stats.total_processing_time = stats.entity_processing_time
@@ -410,45 +472,41 @@ async fn identify_entities(pool: &PgPool) -> Result<usize> {
 
 async fn run_matching_pipeline(
     pool: &PgPool,
-    reinforcement_orchestrator: Arc<Mutex<MatchingOrchestrator>>,
+    reinforcement_orchestrator: Arc<Mutex<MatchingOrchestrator>>, // This orchestrator has the pre-warmed cache set on it
     run_id: String,
+    // Add the pre-warmed feature cache as a parameter
+    feature_cache: SharedFeatureCache,
 ) -> Result<(usize, Vec<MatchMethodStats>)> {
-    info!("Initializing matching pipeline with feature caching...");
+    info!("Initializing matching pipeline with pre-warmed feature caching...");
     let start_time_matching = Instant::now();
 
-    // Parse the run_id into a UUID type
-    let run_id_uuid = match Uuid::parse_str(&run_id) {
+    let _run_id_uuid = match Uuid::parse_str(&run_id) {
+        // Renamed to avoid conflict, original name run_id_uuid
         Ok(uuid) => uuid,
         Err(e) => {
             return Err(anyhow::anyhow!("Failed to parse run_id as UUID: {}", e));
         }
     };
 
-    // Create the shared feature cache
-    let feature_cache = create_shared_cache();
-    
-    // Set the feature cache on the orchestrator
-    {
-        let mut orchestrator = reinforcement_orchestrator.lock().await;
-        orchestrator.set_feature_cache(feature_cache.clone());
-        info!("Feature cache attached to RL orchestrator");
-    }
+    // DO NOT create a new feature cache here. Use the one passed in.
+    // The feature cache is already set on the `reinforcement_orchestrator` passed to this function.
+    // The individual matching tasks below (email, phone, etc.) will clone this `reinforcement_orchestrator`
+    // or receive the `feature_cache` directly.
 
-    // The vector of JoinHandles will hold tasks that resolve to Result<AnyMatchResult, anyhow::Error>
     let mut tasks: Vec<JoinHandle<Result<AnyMatchResult, anyhow::Error>>> = Vec::new();
 
     // --- Spawn Email Matching Task ---
     let pool_clone_email = pool.clone();
-    let orchestrator_clone_email = reinforcement_orchestrator.clone();
-    let run_id_clone_email = run_id.clone(); 
-    let feature_cache_clone_email = feature_cache.clone();
+    let orchestrator_clone_email = reinforcement_orchestrator.clone(); // Orchestrator carries its cache
+    let run_id_clone_email = run_id.clone();
+    let feature_cache_clone_email = feature_cache.clone(); // Pass the pre-warmed cache
     tasks.push(tokio::spawn(async move {
         info!("Starting email matching task...");
         let result = matching::email::find_matches(
             &pool_clone_email,
             Some(orchestrator_clone_email),
             &run_id_clone_email,
-            Some(feature_cache_clone_email), // Pass feature cache
+            Some(feature_cache_clone_email), // Pass feature cache explicitly
         )
         .await
         .context("Email matching task failed");
@@ -463,14 +521,14 @@ async fn run_matching_pipeline(
     let pool_clone_phone = pool.clone();
     let orchestrator_clone_phone = reinforcement_orchestrator.clone();
     let run_id_clone_phone = run_id.clone();
-    let feature_cache_clone_phone = feature_cache.clone();
+    let feature_cache_clone_phone = feature_cache.clone(); // Pass the pre-warmed cache
     tasks.push(tokio::spawn(async move {
         info!("Starting phone matching task...");
         let result = matching::phone::find_matches(
             &pool_clone_phone,
-            Some(&orchestrator_clone_phone),
+            Some(&orchestrator_clone_phone), // Note: some find_matches take Option<&Arc<Mutex<...>>
             &run_id_clone_phone,
-            Some(feature_cache_clone_phone), // Pass feature cache
+            Some(feature_cache_clone_phone), // Pass feature cache explicitly
         )
         .await
         .context("Phone matching task failed");
@@ -485,14 +543,14 @@ async fn run_matching_pipeline(
     let pool_clone_url = pool.clone();
     let orchestrator_clone_url = reinforcement_orchestrator.clone();
     let run_id_clone_url = run_id.clone();
-    let feature_cache_clone_url = feature_cache.clone();
+    let feature_cache_clone_url = feature_cache.clone(); // Pass the pre-warmed cache
     tasks.push(tokio::spawn(async move {
         info!("Starting URL matching task...");
         let result = matching::url::find_matches(
             &pool_clone_url,
             Some(orchestrator_clone_url),
             &run_id_clone_url,
-            Some(feature_cache_clone_url),
+            Some(feature_cache_clone_url), // Pass feature cache explicitly
         )
         .await
         .context("URL matching task failed");
@@ -507,14 +565,14 @@ async fn run_matching_pipeline(
     let pool_clone_address = pool.clone();
     let orchestrator_clone_address = reinforcement_orchestrator.clone();
     let run_id_clone_address = run_id.clone();
-    let feature_cache_clone_address = feature_cache.clone();
+    let feature_cache_clone_address = feature_cache.clone(); // Pass the pre-warmed cache
     tasks.push(tokio::spawn(async move {
         info!("Starting address matching task...");
         let result = matching::address::find_matches(
             &pool_clone_address,
             Some(orchestrator_clone_address),
             &run_id_clone_address,
-            Some(feature_cache_clone_address), // Pass feature cache
+            Some(feature_cache_clone_address), // Pass feature cache explicitly
         )
         .await
         .context("Address matching task failed");
@@ -529,14 +587,14 @@ async fn run_matching_pipeline(
     let pool_clone_name = pool.clone();
     let orchestrator_clone_name = reinforcement_orchestrator.clone();
     let run_id_clone_name = run_id.clone();
-    let feature_cache_clone_name = feature_cache.clone();
+    let feature_cache_clone_name = feature_cache.clone(); // Pass the pre-warmed cache
     tasks.push(tokio::spawn(async move {
         info!("Starting name matching task...");
         let result = matching::name::find_matches(
             &pool_clone_name,
             Some(orchestrator_clone_name),
             &run_id_clone_name,
-            Some(feature_cache_clone_name), // Pass feature cache
+            Some(feature_cache_clone_name), // Pass feature cache explicitly
         )
         .await
         .context("Name matching task failed");
@@ -551,14 +609,14 @@ async fn run_matching_pipeline(
     let pool_clone_geo = pool.clone();
     let orchestrator_clone_geo = reinforcement_orchestrator.clone();
     let run_id_clone_geo = run_id.clone();
-    let feature_cache_clone_geo = feature_cache.clone();
+    let feature_cache_clone_geo = feature_cache.clone(); // Pass the pre-warmed cache
     tasks.push(tokio::spawn(async move {
         info!("Starting geospatial matching task...");
         let result = matching::geospatial::find_matches(
             &pool_clone_geo,
             Some(orchestrator_clone_geo),
             &run_id_clone_geo,
-            Some(feature_cache_clone_geo), // Pass feature cache
+            Some(feature_cache_clone_geo), // Pass feature cache explicitly
         )
         .await
         .context("Geospatial matching task failed");
@@ -569,7 +627,8 @@ async fn run_matching_pipeline(
         result
     }));
 
-    // try_join_all awaits all JoinHandles.
+    // The cache statistics reported here will now reflect the usage of the pre-warmed cache.
+    // Clearing the cache here is appropriate as it's done after all matching tasks.
     let join_handle_results = try_join_all(tasks).await;
 
     let mut total_groups = 0;
@@ -577,7 +636,6 @@ async fn run_matching_pipeline(
     let mut completed_methods = 0;
     let total_matching_methods = 6;
 
-    // Handle results from all tasks
     match join_handle_results {
         Ok(individual_task_results) => {
             for (idx, task_result) in individual_task_results.into_iter().enumerate() {
@@ -625,35 +683,34 @@ async fn run_matching_pipeline(
          );
     }
 
-    // Report cache statistics
+    // Report cache statistics from the passed (and now used) cache
     {
-        let mut cache = feature_cache.lock().await;
-        let (hits, misses, ind_hits, ind_misses) = cache.get_stats();
-        
+        let mut cache_guard = feature_cache.lock().await; // Use the passed feature_cache
+        let (hits, misses, ind_hits, ind_misses) = cache_guard.get_stats();
+
         let hit_rate = if hits + misses > 0 {
             (hits as f64 / (hits + misses) as f64) * 100.0
         } else {
             0.0
         };
-        
+
         let individual_hit_rate = if ind_hits + ind_misses > 0 {
             (ind_hits as f64 / (ind_hits + ind_misses) as f64) * 100.0
         } else {
             0.0
         };
-        
+
         info!(
             "Feature cache statistics - Pair features: {} hits, {} misses, {:.2}% hit rate",
             hits, misses, hit_rate
         );
-        
+
         info!(
             "Feature cache statistics - Individual features: {} hits, {} misses, {:.2}% hit rate",
             ind_hits, ind_misses, individual_hit_rate
         );
-        
-        // Clear the cache to free memory
-        cache.clear();
+
+        cache_guard.clear(); // Clear the cache to free memory
     }
 
     info!(
@@ -714,7 +771,7 @@ async fn run_service_matching_pipeline(
     pool: &PgPool,
     pipeline_run_id: &str,
     service_orchestrator: Arc<Mutex<ServiceMatchingOrchestrator>>,
-    feature_cache: SharedServiceFeatureCache
+    feature_cache: SharedServiceFeatureCache,
 ) -> Result<results::ServiceMatchResult> {
     info!("Starting service matching pipeline with parallel execution...");
     let start_time = Instant::now();
@@ -839,9 +896,8 @@ async fn run_service_matching_pipeline(
                             "Service matching task at index {} failed internally: {:?}",
                             idx, task_err
                         );
-                        return Err(
-                            task_err.context(format!("Service matching task at index {} failed", idx))
-                        );
+                        return Err(task_err
+                            .context(format!("Service matching task at index {} failed", idx)));
                     }
                 }
             }
@@ -851,9 +907,8 @@ async fn run_service_matching_pipeline(
                 "A service matching task failed to join (e.g., panicked): {:?}",
                 join_err
             );
-            return Err(
-                anyhow::Error::from(join_err).context("A service matching task panicked or was cancelled")
-            );
+            return Err(anyhow::Error::from(join_err)
+                .context("A service matching task panicked or was cancelled"));
         }
     }
 
@@ -868,51 +923,54 @@ async fn run_service_matching_pipeline(
     info!("Processing human feedback for service confidence tuner");
     let mut orchestrator = service_orchestrator.lock().await;
     let _ = orchestrator.process_feedback_and_update_tuner(pool).await;
-    
+
     // Save the updated service confidence tuner
     let _ = orchestrator.save_models(pool).await;
-    
+
     // Report cache statistics
-    if let Some((hits, misses, ind_hits, ind_misses)) = orchestrator.get_feature_cache_stats().await {
+    if let Some((hits, misses, ind_hits, ind_misses)) = orchestrator.get_feature_cache_stats().await
+    {
         let hit_rate = if hits + misses > 0 {
             (hits as f64 / (hits + misses) as f64) * 100.0
         } else {
             0.0
         };
-        
+
         let individual_hit_rate = if ind_hits + ind_misses > 0 {
             (ind_hits as f64 / (ind_hits + ind_misses) as f64) * 100.0
         } else {
             0.0
         };
-        
+
         info!(
             "Feature cache statistics - Pair features: {} hits, {} misses, {:.2}% hit rate",
             hits, misses, hit_rate
         );
-        
+
         info!(
             "Feature cache statistics - Individual features: {} hits, {} misses, {:.2}% hit rate",
             ind_hits, ind_misses, individual_hit_rate
         );
     }
-    
+
     // Elapsed time
     let elapsed = start_time.elapsed();
-    
+
     info!(
         "Service matching complete in {:.2?}. Created {} service groups total.",
         elapsed, total_groups_created
     );
-    
+
     // Create combined stats for the overall result
     let combined_stats = if !method_stats.is_empty() {
         // Calculate average confidence across all methods
-        let avg_confidence = method_stats.iter()
+        let avg_confidence = method_stats
+            .iter()
             .filter(|s| s.groups_created > 0)
             .map(|s| s.avg_confidence * s.groups_created as f64)
-            .sum::<f64>() / 
-            method_stats.iter()
+            .sum::<f64>()
+            / method_stats
+                .iter()
                 .filter(|s| s.groups_created > 0)
                 .map(|s| s.groups_created as f64)
                 .sum::<f64>()
@@ -921,7 +979,8 @@ async fn run_service_matching_pipeline(
         results::MatchMethodStats {
             method_type: models::MatchMethodType::Custom("service_combined".to_string()),
             groups_created: total_groups_created,
-            entities_matched: method_stats.iter()
+            entities_matched: method_stats
+                .iter()
                 .map(|s| s.entities_matched)
                 .sum::<usize>(),
             avg_confidence,
@@ -937,7 +996,7 @@ async fn run_service_matching_pipeline(
             avg_group_size: 2.0,
         }
     };
-    
+
     // Return combined results
     Ok(ServiceMatchResult {
         groups_created: total_groups_created,

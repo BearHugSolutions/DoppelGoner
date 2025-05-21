@@ -331,35 +331,71 @@ pub async fn insert_match_decision_detail(
 
     // Verify that the entity_group exists with retry logic
     let mut retry_count = 0;
-let max_retries = 8; // Increased from 4 to 8 for more retries
-let mut entity_exists = false;
-let mut last_error = None;
+    let max_retries = 8; // Increased from 4 to 8 for more retries
+    let mut entity_exists = false;
+    let mut last_error = None;
 
-while retry_count <= max_retries {
-    match tx
-        .query(
-            "SELECT COUNT(*) FROM public.entity_group WHERE id = $1",
-            &[&entity_group_id],
-        )
-        .await
-    {
-        Ok(rows) => {
-            if rows.is_empty() {
-                let _ = tx.rollback().await;
-                return Err(anyhow::anyhow!(
+    while retry_count <= max_retries {
+        match tx
+            .query(
+                "SELECT COUNT(*) FROM public.entity_group WHERE id = $1",
+                &[&entity_group_id],
+            )
+            .await
+        {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    let _ = tx.rollback().await;
+                    return Err(anyhow::anyhow!(
                     "Failed to verify entity_group_id {} exists: no rows returned from COUNT query", 
                     entity_group_id
                 ));
+                }
+
+                let count: i64 = rows[0].get(0);
+
+                if count == 0 {
+                    // Entity group doesn't exist, retry after waiting
+                    if retry_count < max_retries {
+                        let wait_time = Duration::from_millis(1000); // Increased from 500ms to 1000ms
+                        info!(
+                            "Entity group with id {} not found, waiting {}s before retry {}/{}...",
+                            entity_group_id,
+                            wait_time.as_secs(),
+                            retry_count + 1,
+                            max_retries
+                        );
+                        sleep(wait_time).await;
+                        retry_count += 1;
+                        continue;
+                    } else {
+                        // Exhausted all retries
+                        let _ = tx.rollback().await;
+                        return Err(anyhow::anyhow!(
+                            "Entity group with id {} does not exist after {} retries",
+                            entity_group_id,
+                            max_retries
+                        ));
+                    }
+                } else if count > 1 {
+                    // Multiple entity groups with the same ID - data integrity issue
+                    warn!(
+                    "Data integrity issue: Found {} entity_groups with ID {}. Proceeding with insertion anyway.",
+                    count, entity_group_id
+                );
+                }
+
+                // If we reach here, entity exists or we're proceeding despite duplicates
+                entity_exists = true;
+                break;
             }
-
-            let count: i64 = rows[0].get(0);
-
-            if count == 0 {
-                // Entity group doesn't exist, retry after waiting
+            Err(e) => {
+                // Error during verification query
+                last_error = Some(e);
                 if retry_count < max_retries {
-                    let wait_time = Duration::from_millis(1000); // Increased from 500ms to 1000ms
-                    info!(
-                        "Entity group with id {} not found, waiting {}s before retry {}/{}...",
+                    let wait_time = Duration::from_secs(2); // Increased from 1s to 2s
+                    warn!(
+                        "Error checking entity group {}, waiting {}s before retry {}/{}...",
                         entity_group_id,
                         wait_time.as_secs(),
                         retry_count + 1,
@@ -372,51 +408,15 @@ while retry_count <= max_retries {
                     // Exhausted all retries
                     let _ = tx.rollback().await;
                     return Err(anyhow::anyhow!(
-                        "Entity group with id {} does not exist after {} retries", 
-                        entity_group_id,
-                        max_retries
-                    ));
-                }
-            } else if count > 1 {
-                // Multiple entity groups with the same ID - data integrity issue
-                warn!(
-                    "Data integrity issue: Found {} entity_groups with ID {}. Proceeding with insertion anyway.",
-                    count, entity_group_id
-                );
-            }
-
-            // If we reach here, entity exists or we're proceeding despite duplicates
-            entity_exists = true;
-            break;
-        }
-        Err(e) => {
-            // Error during verification query
-            last_error = Some(e);
-            if retry_count < max_retries {
-                let wait_time = Duration::from_secs(2); // Increased from 1s to 2s
-                warn!(
-                    "Error checking entity group {}, waiting {}s before retry {}/{}...",
-                    entity_group_id,
-                    wait_time.as_secs(),
-                    retry_count + 1,
-                    max_retries
-                );
-                sleep(wait_time).await;
-                retry_count += 1;
-                continue;
-            } else {
-                // Exhausted all retries
-                let _ = tx.rollback().await;
-                return Err(anyhow::anyhow!(
                     "Database error while verifying entity_group_id {} exists after {} retries: {}", 
                     entity_group_id,
                     max_retries,
                     last_error.unwrap()
                 ));
+                }
             }
         }
     }
-}
     // Entity group exists or we decided to proceed despite issues
     if entity_exists {
         const INSERT_SQL: &str = "
@@ -461,8 +461,10 @@ while retry_count <= max_retries {
                 // Rollback the transaction
                 let _rollback_result = tx.rollback().await;
                 Err(anyhow::anyhow!(
-                    "Failed to insert match_decision_detail for entity_group_id {}, method {}: {}", 
-                    entity_group_id, method_type_at_decision, e
+                    "Failed to insert match_decision_detail for entity_group_id {}, method {}: {}",
+                    entity_group_id,
+                    method_type_at_decision,
+                    e
                 ))
             }
         }
@@ -471,7 +473,7 @@ while retry_count <= max_retries {
         // But keeping it for logical completeness
         let _ = tx.rollback().await;
         Err(anyhow::anyhow!(
-            "Failed to verify entity_group_id {} exists after all retries", 
+            "Failed to verify entity_group_id {} exists after all retries",
             entity_group_id
         ))
     }
