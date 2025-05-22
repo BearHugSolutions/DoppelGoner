@@ -106,7 +106,7 @@ async fn build_weighted_xgraph(
     pipeline_run_id: &str,
 ) -> Result<(Graph<f64, EntityGroupId, ()>, NodeMapper)> {
     info!(
-        "Building weighted xgraph for cluster consolidation (run ID: {})...",
+        "Building weighted xgraph for cluster consolidation (run ID: {}) using streaming approach...",
         pipeline_run_id
     );
     let start_time = Instant::now();
@@ -131,6 +131,9 @@ async fn build_weighted_xgraph(
     // Map to store confidence of each pairwise group (node)
     let mut group_confidences: HashMap<EntityGroupId, f64> = HashMap::new();
 
+    info!("Loading {} pairwise entity groups...", group_rows.len());
+    let loading_start = Instant::now();
+
     for row in &group_rows {
         let group_id_str: String = row.get("id");
         let entity_group_id = EntityGroupId(group_id_str);
@@ -143,7 +146,6 @@ async fn build_weighted_xgraph(
         if let Some(conf) = confidence_score {
             group_confidences.insert(entity_group_id.clone(), conf);
         } else {
-            // Default to 0.0 if confidence is NULL, though ideally it should always be present
             warn!(
                 "Pairwise group {} has NULL confidence_score. Defaulting to 0.0.",
                 entity_group_id.0
@@ -162,172 +164,299 @@ async fn build_weighted_xgraph(
     }
 
     info!(
-        "Loaded {} pairwise entity groups as nodes.",
-        node_mapper.get_node_count()
+        "Loaded {} pairwise entity groups as nodes in {:.2?}.",
+        node_mapper.get_node_count(),
+        loading_start.elapsed()
     );
     info!(
         "Processed entity memberships for {} unique entities in these pairs.",
         entity_to_pairwise_groups.len()
     );
 
-    // 2. Edge Creation & Weighting: Edges between PAIRS that share an entity
-    // Store W_z values and details per edge candidate (edge between two groups)
-    let mut edge_contributions: HashMap<
-        (EntityGroupId, EntityGroupId), // Key: (PairwiseGroupId1, PairwiseGroupId2)
-        Vec<ContributingSharedEntityDetail>, // Value: Details of the shared entity
-    > = HashMap::new();
+    // 2. Edge Creation & Weighting: Stream processing with batching
+    const ENTITY_BATCH_SIZE: usize = 100; // Process entities in batches
+    const EDGE_BATCH_SIZE: usize = 1000; // Database batch size
+    const PROGRESS_INTERVAL: usize = 10000; // Log progress every N edges
 
-    for (entity_z, groups_sharing_entity_z) in entity_to_pairwise_groups {
-        if groups_sharing_entity_z.len() < 2 {
-            continue; // No edge can be formed by this shared entity
-        }
+    let total_entities = entity_to_pairwise_groups.len();
+    let mut processed_entities = 0;
+    let mut total_edges_processed = 0;
+    let mut valid_edges_added = 0;
 
-        // Generate pairs of *pairwise groups* that share entity_z
-        for i in 0..groups_sharing_entity_z.len() {
-            for j in (i + 1)..groups_sharing_entity_z.len() {
-                let group_a_id = &groups_sharing_entity_z[i]; // This is a pairwise group
-                let group_b_id = &groups_sharing_entity_z[j]; // This is another pairwise group
-
-                // Confidence of GroupA (pair A) is its direct confidence_score
-                let c_a = group_confidences
-                    .get(group_a_id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "Confidence not found for group_a_id {}. Defaulting to 0.0",
-                            group_a_id.0
-                        );
-                        0.0
-                    });
-
-                // Confidence of GroupB (pair B) is its direct confidence_score
-                let c_b = group_confidences
-                    .get(group_b_id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "Confidence not found for group_b_id {}. Defaulting to 0.0",
-                            group_b_id.0
-                        );
-                        0.0
-                    });
-
-                // W_z is the average confidence of the two pairs linked by entity_z
-                let w_z = (c_a + c_b) / 2.0;
-
-                let key = if group_a_id.0 < group_b_id.0 {
-                    (group_a_id.clone(), group_b_id.clone())
-                } else {
-                    (group_b_id.clone(), group_a_id.clone())
-                };
-
-                edge_contributions
-                    .entry(key)
-                    .or_default()
-                    .push(ContributingSharedEntityDetail {
-                        entity_id: entity_z.0.clone(),    // The shared entity
-                        conf_entity_in_source_group: c_a, // Confidence of source pair
-                        conf_entity_in_target_group: c_b, // Confidence of target pair
-                        w_z,
-                    });
-            }
-        }
-    }
-
+    // Estimate total potential edges for progress tracking
+    let estimated_total_edges: usize = entity_to_pairwise_groups
+        .values()
+        .map(|groups| if groups.len() >= 2 { groups.len() * (groups.len() - 1) / 2 } else { 0 })
+        .sum();
+    
     info!(
-        "Calculated initial W_z contributions for {} potential inter-group edges.",
-        edge_contributions.len()
+        "Estimated {} potential edges to process from {} entities.",
+        estimated_total_edges, total_entities
     );
 
-    for ((group_a_id, group_b_id), contributions) in edge_contributions {
-        if contributions.is_empty() {
-            continue;
+    let edge_processing_start = Instant::now();
+    
+    // Batch processing buffers
+    let mut batch_edges = Vec::with_capacity(EDGE_BATCH_SIZE);
+    let mut batch_suggestions = Vec::with_capacity(EDGE_BATCH_SIZE);
+    
+    // Process entities in chunks to limit memory usage
+    let entities_vec: Vec<_> = entity_to_pairwise_groups.into_iter().collect();
+    let entity_chunks = entities_vec.chunks(ENTITY_BATCH_SIZE);
+    let total_chunks = entities_vec.len().div_ceil(ENTITY_BATCH_SIZE);
+
+    for (chunk_idx, entity_chunk) in entity_chunks.enumerate() {
+        // Accumulate edge contributions for this chunk
+        let mut chunk_edge_contributions: HashMap<
+            (EntityGroupId, EntityGroupId),
+            Vec<ContributingSharedEntityDetail>,
+        > = HashMap::new();
+
+        // Process each entity in the chunk
+        for (entity_z, groups_sharing_entity_z) in entity_chunk {
+            processed_entities += 1;
+            
+            if groups_sharing_entity_z.len() < 2 {
+                continue; // No edge can be formed by this shared entity
+            }
+
+            // Generate pairs of *pairwise groups* that share entity_z
+            for i in 0..groups_sharing_entity_z.len() {
+                for j in (i + 1)..groups_sharing_entity_z.len() {
+                    let group_a_id = &groups_sharing_entity_z[i];
+                    let group_b_id = &groups_sharing_entity_z[j];
+
+                    // Confidence of GroupA (pair A) is its direct confidence_score
+                    let c_a = group_confidences
+                        .get(group_a_id)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            warn!(
+                                "Confidence not found for group_a_id {}. Defaulting to 0.0",
+                                group_a_id.0
+                            );
+                            0.0
+                        });
+
+                    // Confidence of GroupB (pair B) is its direct confidence_score
+                    let c_b = group_confidences
+                        .get(group_b_id)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            warn!(
+                                "Confidence not found for group_b_id {}. Defaulting to 0.0",
+                                group_b_id.0
+                            );
+                            0.0
+                        });
+
+                    // W_z is the average confidence of the two pairs linked by entity_z
+                    let w_z = (c_a + c_b) / 2.0;
+
+                    let key = if group_a_id.0 < group_b_id.0 {
+                        (group_a_id.clone(), group_b_id.clone())
+                    } else {
+                        (group_b_id.clone(), group_a_id.clone())
+                    };
+
+                    chunk_edge_contributions
+                        .entry(key)
+                        .or_default()
+                        .push(ContributingSharedEntityDetail {
+                            entity_id: entity_z.0.clone(),
+                            conf_entity_in_source_group: c_a,
+                            conf_entity_in_target_group: c_b,
+                            w_z,
+                        });
+                }
+            }
         }
 
-        let product_of_negations = contributions.iter().fold(1.0, |acc, detail| {
-            acc * (1.0 - detail.w_z.max(0.0).min(1.0)) // Clamp w_z
-        });
-        let edge_weight = 1.0 - product_of_negations;
-
-        if edge_weight <= 0.0 {
-            debug!(
-                "Skipping edge between {} and {} due to non-positive weight {:.4}",
-                group_a_id.0, group_b_id.0, edge_weight
-            );
-            continue;
-        }
-
-        let node_a_idx = node_mapper.get_or_add_node(&mut xgraph_instance, &group_a_id);
-        let node_b_idx = node_mapper.get_or_add_node(&mut xgraph_instance, &group_b_id);
-
-        if let Err(e) = xgraph_instance.add_edge(node_a_idx, node_b_idx, edge_weight, ()) {
-            warn!(
-                "Failed to add edge to xgraph between {} ({:?}) and {} ({:?}): {}",
-                group_a_id.0, node_a_idx, group_b_id.0, node_b_idx, e
-            );
-            continue;
-        }
-        debug!(
-            "Added edge to xgraph: {} --({:.4})-- {}",
-            group_a_id.0, edge_weight, group_b_id.0
+        // Process accumulated edges for this chunk
+        info!(
+            "Processing chunk {}/{} with {} potential edges...",
+            chunk_idx + 1,
+            total_chunks,
+            chunk_edge_contributions.len()
         );
 
-        let contributing_entities_json = serde_json::to_value(&contributions).ok();
-        let cfe = NewClusterFormationEdge {
-            pipeline_run_id: pipeline_run_id.to_string(),
-            source_group_id: group_a_id.0.clone(),
-            target_group_id: group_b_id.0.clone(),
-            calculated_edge_weight: edge_weight,
-            contributing_shared_entities: contributing_entities_json,
-        };
-        if let Err(e) = db::insert_cluster_formation_edge(transaction, &cfe).await {
-            warn!(
-                "Failed to log cluster formation edge between {} and {}: {}",
-                group_a_id.0, group_b_id.0, e
-            );
-        }
+        for ((group_a_id, group_b_id), contributions) in chunk_edge_contributions {
+            if contributions.is_empty() {
+                total_edges_processed += 1;
+                continue;
+            }
 
-        if edge_weight > 0.0 && edge_weight < config::WEAK_LINK_THRESHOLD {
-            let details_json = serde_json::json!({
-                "calculated_edge_weight": edge_weight,
-                "contributing_links_count": contributions.len(),
-                "shared_entity_details": contributions, // Log full contribution details
+            let product_of_negations = contributions.iter().fold(1.0, |acc, detail| {
+                acc * (1.0 - detail.w_z.max(0.0).min(1.0)) // Clamp w_z
             });
-            let reason_message = format!(
-                "Inter-pairwise-group link between PairwiseGroup {} and PairwiseGroup {} has a weak calculated weight of {:.4}",
-                group_a_id.0, group_b_id.0, edge_weight
-            );
-            let suggestion = NewSuggestedAction {
-                pipeline_run_id: Some(pipeline_run_id.to_string()),
-                action_type: ActionType::ReviewInterGroupLink.as_str().to_string(), // ActionType name might need review
-                entity_id: None, // Not directly about one entity, but a link between groups of entities
-                group_id_1: Some(group_a_id.0.clone()),
-                group_id_2: Some(group_b_id.0.clone()),
-                cluster_id: None,
-                triggering_confidence: Some(edge_weight),
-                details: Some(details_json),
-                reason_code: Some("WEAK_INTER_PAIRWISE_GROUP_EDGE".to_string()),
-                reason_message: Some(reason_message),
-                priority: 0,
-                status: SuggestionStatus::PendingReview.as_str().to_string(),
-                reviewer_id: None,
-                reviewed_at: None,
-                review_notes: None,
-            };
-            if let Err(e) = db::insert_suggestion(transaction, &suggestion).await {
+            let edge_weight = 1.0 - product_of_negations;
+
+            if edge_weight <= 0.0 {
+                debug!(
+                    "Skipping edge between {} and {} due to non-positive weight {:.4}",
+                    group_a_id.0, group_b_id.0, edge_weight
+                );
+                total_edges_processed += 1;
+                continue;
+            }
+
+            let node_a_idx = node_mapper.get_or_add_node(&mut xgraph_instance, &group_a_id);
+            let node_b_idx = node_mapper.get_or_add_node(&mut xgraph_instance, &group_b_id);
+
+            if let Err(e) = xgraph_instance.add_edge(node_a_idx, node_b_idx, edge_weight, ()) {
                 warn!(
-                    "Failed to log suggestion for weak inter-pairwise-group link: {}",
-                    e
+                    "Failed to add edge to xgraph between {} ({:?}) and {} ({:?}): {}",
+                    group_a_id.0, node_a_idx, group_b_id.0, node_b_idx, e
+                );
+                total_edges_processed += 1;
+                continue;
+            }
+
+            valid_edges_added += 1;
+            debug!(
+                "Added edge to xgraph: {} --({:.4})-- {}",
+                group_a_id.0, edge_weight, group_b_id.0
+            );
+
+            // Prepare for batch database insertion
+            let contributing_entities_json = serde_json::to_value(&contributions).ok();
+            let cfe = NewClusterFormationEdge {
+                pipeline_run_id: pipeline_run_id.to_string(),
+                source_group_id: group_a_id.0.clone(),
+                target_group_id: group_b_id.0.clone(),
+                calculated_edge_weight: edge_weight,
+                contributing_shared_entities: contributing_entities_json,
+            };
+            batch_edges.push(cfe);
+
+            // Handle weak edge suggestions
+            if edge_weight > 0.0 && edge_weight < config::WEAK_LINK_THRESHOLD {
+                let details_json = serde_json::json!({
+                    "calculated_edge_weight": edge_weight,
+                    "contributing_links_count": contributions.len(),
+                    "shared_entity_details": contributions,
+                });
+                let reason_message = format!(
+                    "Inter-pairwise-group link between PairwiseGroup {} and PairwiseGroup {} has a weak calculated weight of {:.4}",
+                    group_a_id.0, group_b_id.0, edge_weight
+                );
+                let suggestion = NewSuggestedAction {
+                    pipeline_run_id: Some(pipeline_run_id.to_string()),
+                    action_type: ActionType::ReviewInterGroupLink.as_str().to_string(),
+                    entity_id: None,
+                    group_id_1: Some(group_a_id.0.clone()),
+                    group_id_2: Some(group_b_id.0.clone()),
+                    cluster_id: None,
+                    triggering_confidence: Some(edge_weight),
+                    details: Some(details_json),
+                    reason_code: Some("WEAK_INTER_PAIRWISE_GROUP_EDGE".to_string()),
+                    reason_message: Some(reason_message),
+                    priority: 0,
+                    status: SuggestionStatus::PendingReview.as_str().to_string(),
+                    reviewer_id: None,
+                    reviewed_at: None,
+                    review_notes: None,
+                };
+                batch_suggestions.push(suggestion);
+            }
+
+            total_edges_processed += 1;
+
+            // Process database batches when they're full
+            if batch_edges.len() >= EDGE_BATCH_SIZE {
+                if let Err(e) = db::insert_cluster_formation_edges_batch(transaction, &batch_edges).await {
+                    warn!("Failed to insert batch of cluster formation edges: {}", e);
+                } else {
+                    debug!("Inserted batch of {} cluster formation edges", batch_edges.len());
+                }
+                batch_edges.clear();
+
+                if !batch_suggestions.is_empty() {
+                    if let Err(e) = db::insert_suggestions_batch(transaction, &batch_suggestions).await {
+                        warn!("Failed to insert batch of suggestions: {}", e);
+                    } else {
+                        debug!("Inserted batch of {} suggestions", batch_suggestions.len());
+                    }
+                    batch_suggestions.clear();
+                }
+            }
+
+            // Progress logging
+            if total_edges_processed % PROGRESS_INTERVAL == 0 && total_edges_processed > 0 {
+                let elapsed = edge_processing_start.elapsed();
+                let rate = total_edges_processed as f64 / elapsed.as_secs_f64();
+                let eta_seconds = if rate > 0.0 {
+                    (estimated_total_edges.saturating_sub(total_edges_processed)) as f64 / rate
+                } else {
+                    0.0
+                };
+                
+                info!(
+                    "Edge processing progress: {}/{} ({:.1}%) | Valid edges: {} | Rate: {:.0} edges/sec | ETA: {:.1}min",
+                    total_edges_processed,
+                    estimated_total_edges,
+                    (total_edges_processed as f64 / estimated_total_edges.max(1) as f64) * 100.0,
+                    valid_edges_added,
+                    rate,
+                    eta_seconds / 60.0
                 );
             }
         }
+
+        // Progress logging per chunk
+        let chunk_elapsed = edge_processing_start.elapsed();
+        let entity_rate = processed_entities as f64 / chunk_elapsed.as_secs_f64();
+        let entities_eta = if entity_rate > 0.0 {
+            (total_entities.saturating_sub(processed_entities)) as f64 / entity_rate
+        } else {
+            0.0
+        };
+
+        info!(
+            "Chunk {}/{} completed. Processed {}/{} entities ({:.1}%) | Entity rate: {:.0}/sec | ETA: {:.1}min",
+            chunk_idx + 1,
+            total_chunks,
+            processed_entities,
+            total_entities,
+            (processed_entities as f64 / total_entities as f64) * 100.0,
+            entity_rate,
+            entities_eta / 60.0
+        );
     }
 
+    // Process remaining batches
+    if !batch_edges.is_empty() {
+        if let Err(e) = db::insert_cluster_formation_edges_batch(transaction, &batch_edges).await {
+            warn!("Failed to insert final batch of cluster formation edges: {}", e);
+        } else {
+            info!("Inserted final batch of {} cluster formation edges", batch_edges.len());
+        }
+    }
+
+    if !batch_suggestions.is_empty() {
+        if let Err(e) = db::insert_suggestions_batch(transaction, &batch_suggestions).await {
+            warn!("Failed to insert final batch of suggestions: {}", e);
+        } else {
+            info!("Inserted final batch of {} suggestions", batch_suggestions.len());
+        }
+    }
+
+    let total_elapsed = start_time.elapsed();
+    let edge_processing_elapsed = edge_processing_start.elapsed();
+    
     info!(
-        "Weighted xgraph built in {:.2?} with {} nodes and {} edges.",
-        start_time.elapsed(),
+        "Weighted xgraph built in {:.2?} (edge processing: {:.2?}) with {} nodes and {} edges.",
+        total_elapsed,
+        edge_processing_elapsed,
         node_mapper.get_node_count(),
         xgraph_instance.edges.len()
+    );
+    
+    info!(
+        "Edge processing summary: {}/{} edges processed, {} valid edges added to graph",
+        total_edges_processed,
+        estimated_total_edges,
+        valid_edges_added
     );
 
     Ok((xgraph_instance, node_mapper))
@@ -641,8 +770,7 @@ async fn verify_clusters(
                 "No pairwise groups found for cluster {} during verification. Skipping.",
                 cluster_id.0
             );
-            // If no entities, we can't calculate a score, so update with NULL or skip.
-            // Let's ensure it's NULL if we can't calculate.
+            // If no entities, we can't calculate a score, so update with NULL.
             let update_null_score_query = "
                 UPDATE public.entity_group_cluster
                 SET average_coherence_score = NULL
@@ -746,16 +874,66 @@ async fn verify_clusters(
 
         let mut verification_scores: Vec<f64> = Vec::new();
 
+        // Get the orchestrator to leverage its feature cache for efficient feature extraction
+        let orchestrator = reinforcement_orchestrator_mutex.lock().await;
+
         for (entity1_id, entity2_id) in entity_pairs_to_check {
             debug!(
                 "Verifying pair: ({}, {}) for cluster {}",
                 entity1_id.0, entity2_id.0, cluster_id.0
             );
 
-            let context_features_result =
-                MatchingOrchestrator::extract_pair_context_features(pool, &entity1_id, &entity2_id)
-                    .await;
+            // Use the orchestrator's cached feature extraction to get the 31-element context vector
+            match orchestrator.get_pair_features(pool, &entity1_id, &entity2_id).await {
+                Ok(context_features) => {
+                    // Calculate cluster coherence score directly from context features
+                    // We'll use key similarity features from the 31-element vector:
+                    // - Index 13: embedding_similarity (pairwise feature)
+                    // - Index 12: name_similarity (pairwise feature) 
+                    // - Index 14: max_service_similarity (pairwise feature)
+                    // - Index 15: geographic_distance (pairwise feature, inverted for similarity)
+                    
+                    if context_features.len() >= 19 { // Ensure we have all the features we need
+                        let name_sim = context_features[12].max(0.0).min(1.0);
+                        let embedding_sim = context_features[13].max(-1.0).min(1.0);
+                        let service_sim = context_features[14].max(-1.0).min(1.0);
+                        let geo_proximity = context_features[15].max(0.0).min(1.0); // Already normalized as proximity
+                        
+                        // Composite coherence score: weighted average of key similarity measures
+                        // Embedding similarity gets highest weight as it's most comprehensive
+                        let coherence_score = (embedding_sim * 0.4) + 
+                                            (name_sim * 0.3) + 
+                                            (service_sim * 0.2) + 
+                                            (geo_proximity * 0.1);
+                        
+                        // Normalize to 0-1 range (embedding_sim can be negative)
+                        let normalized_coherence = ((coherence_score + 1.0) / 2.0).max(0.0).min(1.0);
+                        
+                        verification_scores.push(normalized_coherence);
+                        debug!(
+                            "Cluster {} coherence: pair ({}, {}) scored {:.4} (name:{:.3}, emb:{:.3}, svc:{:.3}, geo:{:.3})",
+                            cluster_id.0, entity1_id.0, entity2_id.0, normalized_coherence, 
+                            name_sim, embedding_sim, service_sim, geo_proximity
+                        );
+                    } else {
+                        warn!(
+                            "Insufficient features ({}) for coherence calculation of pair ({}, {}) in cluster {}",
+                            context_features.len(), entity1_id.0, entity2_id.0, cluster_id.0
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to extract features for pair ({}, {}) in cluster {}: {}",
+                        entity1_id.0, entity2_id.0, cluster_id.0, e
+                    );
+                    // Continue with other pairs rather than failing completely
+                }
+            }
         }
+
+        // Drop the orchestrator lock
+        drop(orchestrator);
 
         let avg_score_to_store: Option<f64>; // Use Option for clarity in update
 
