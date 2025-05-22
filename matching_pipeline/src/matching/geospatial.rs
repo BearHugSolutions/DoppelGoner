@@ -1,4 +1,4 @@
-// src/matching/geospatial.rs - Optimized with parallel batch processing and batch DB operations
+// src/matching/geospatial.rs - Fixed version with better duplicate detection
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use futures::future::{join_all, try_join_all};
@@ -63,23 +63,15 @@ pub async fn find_matches(
         valid_entities.len()
     );
 
-    // Cache existing pairs for faster lookup
-    let existing_processed_pairs_set =
-        fetch_existing_pairs(&*init_conn, MatchMethodType::Geospatial).await?;
-    info!(
-        "Geospatial: Found {} existing geospatial-matched pairs to skip.",
-        existing_processed_pairs_set.len()
-    );
-
-    // Fetch all candidate pairs in a single query
-    let candidate_pairs = fetch_candidate_pairs(&*init_conn).await?;
+    // Fetch all candidate pairs in a single query with ANTI-JOIN to exclude existing pairs
+    let candidate_pairs = fetch_candidate_pairs_excluding_existing(&*init_conn).await?;
 
     // Done with initial connection
     drop(init_conn);
 
     let total_candidate_count = candidate_pairs.len();
     info!(
-        "Geospatial: Found {} potential geospatial pairs from DB query.",
+        "Geospatial: Found {} new geospatial pairs from DB query (excluding already processed).",
         total_candidate_count
     );
 
@@ -95,6 +87,25 @@ pub async fn find_matches(
         filtered_candidates.len()
     );
 
+    // If no pairs to process, return early
+    if filtered_candidates.is_empty() {
+        info!("Geospatial: No new pairs to process.");
+        let method_stats = MatchMethodStats {
+            method_type: MatchMethodType::Geospatial,
+            groups_created: 0,
+            entities_matched: 0,
+            avg_confidence: 0.0,
+            avg_group_size: 0.0,
+        };
+
+        let geospatial_specific_result = GeospatialMatchResult {
+            groups_created: 0,
+            stats: method_stats,
+        };
+
+        return Ok(AnyMatchResult::Geospatial(geospatial_specific_result));
+    }
+
     // Track stats
     let stats_mutex = Arc::new(Mutex::new((
         0,              // new_pairs_created_count
@@ -104,7 +115,7 @@ pub async fn find_matches(
         0,              // pairs_processed_count
         0,              // feature_extraction_count
         0,              // feature_extraction_failures
-        0,              // skipped_existing_pairs
+        0,              // skipped_existing_pairs (should be 0 now due to pre-filtering)
     )));
 
     // Process batches in parallel with controlled concurrency
@@ -116,25 +127,21 @@ pub async fn find_matches(
     );
 
     // Process all batches with controlled parallelism
+    let mut global_batch_num = 0;
+
     for chunk_of_batches in filtered_candidates.chunks(BATCH_SIZE * MAX_PARALLEL_BATCHES) {
         let mut batch_futures = Vec::new();
 
-        // Create a future for each batch in this chunk
-        for (batch_idx, batch) in chunk_of_batches.chunks(BATCH_SIZE).enumerate() {
+        for batch in chunk_of_batches.chunks(BATCH_SIZE) {
+            global_batch_num += 1;
             let batch_to_process = batch.to_vec();
             let pool_clone = pool.clone();
             let ro_option_clone = reinforcement_orchestrator_option.clone();
             let run_id = pipeline_run_id.to_string();
             let feature_cache_clone = feature_cache.clone();
-            let existing_pairs = existing_processed_pairs_set.clone();
             let stats_arc = stats_mutex.clone();
-            let current_batch_num = batch_idx
-                + (chunk_of_batches.as_ptr() as usize - filtered_candidates.as_ptr() as usize)
-                    / (BATCH_SIZE * std::mem::size_of_val(&filtered_candidates[0]))
-                    / MAX_PARALLEL_BATCHES
-                + 1;
+            let current_batch_num = global_batch_num;
 
-            // Create a future for processing this batch
             let batch_future = tokio::spawn(async move {
                 process_batch(
                     batch_to_process,
@@ -142,7 +149,6 @@ pub async fn find_matches(
                     ro_option_clone.as_ref(),
                     &run_id,
                     feature_cache_clone,
-                    &existing_pairs,
                     stats_arc,
                     current_batch_num,
                     total_batches,
@@ -153,12 +159,8 @@ pub async fn find_matches(
             batch_futures.push(batch_future);
         }
 
-        // Wait for all futures in this chunk to complete
-        // We're using join_all rather than try_join_all to ensure we process all batches
-        // even if some fail
         let results = join_all(batch_futures).await;
 
-        // Check for errors
         for (i, result) in results.iter().enumerate() {
             if let Err(e) = result {
                 warn!("Geospatial: Batch processing task {} error: {}", i, e);
@@ -234,13 +236,13 @@ pub async fn find_matches(
 }
 
 /// Process a batch of candidate pairs with batch database operations
+/// Note: existing pairs are now pre-filtered, so no need to check again
 async fn process_batch(
     batch: Vec<(EntityId, EntityId, f64, f64, f64, f64, f64)>,
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedFeatureCache>,
-    existing_processed_pairs_set: &HashSet<(EntityId, EntityId)>,
     stats_mutex: Arc<
         Mutex<(
             usize,
@@ -276,9 +278,9 @@ async fn process_batch(
     let mut local_pairs_processed = 0;
     let mut local_feature_extractions = 0;
     let mut local_feature_failures = 0;
-    let mut local_skipped_pairs = 0;
+    let mut local_skipped_pairs = 0; // Should be 0 since pairs are pre-filtered
 
-    // NEW: Collect pairs that need feature extraction due to cache misses
+    // Collect pairs that need feature extraction due to cache misses
     let mut cache_miss_pairs: Vec<(
         EntityId,
         EntityId,
@@ -288,7 +290,6 @@ async fn process_batch(
         f64,
         f64,
         f64,
-        // Need to store the normalized pair info and pre_rl score
         EntityGroupId,
         EntityId,
         EntityId,
@@ -297,60 +298,15 @@ async fn process_batch(
 
     // First pass: Process pairs with cache hits immediately, collect cache misses for batch processing
     for (e1_id, e2_id, lat1, lon1, lat2, lon2, distance_meters) in batch {
-        // Normalize order of entity IDs for consistent lookup
-        let (id_to_check_1, id_to_check_2) = if e1_id.0 < e2_id.0 {
-            (e1_id.clone(), e2_id.clone())
-        } else {
-            (e2_id.clone(), e1_id.clone())
-        };
-
-        // Skip if already processed (using the normalized pair)
-        if existing_processed_pairs_set.contains(&(id_to_check_1.clone(), id_to_check_2.clone())) {
-            local_skipped_pairs += 1;
-            continue;
-        }
+        // Since pairs are pre-filtered, we don't need to check existing pairs again
+        // But we still need to ensure proper ordering for consistency
+        let (ordered_id_1, ordered_id_2, ordered_match_values) = 
+            normalize_pair_for_storage(e1_id, e2_id, lat1, lon1, lat2, lon2, distance_meters);
 
         local_pairs_processed += 1;
 
         // Calculate pre-RL confidence score
         let pre_rl_confidence_score = 0.85; // Default confidence
-
-        // Create match values
-        let match_values = MatchValues::Geospatial(GeospatialMatchValue {
-            latitude1: lat1,
-            longitude1: lon1,
-            latitude2: lat2,
-            longitude2: lon2,
-            distance: distance_meters,
-        });
-
-        // Ensure entity_id_1 < entity_id_2 to satisfy any database ordering constraints
-        let (ordered_id_1, ordered_id_2);
-        let ordered_match_values;
-
-        if e1_id.0 <= e2_id.0 {
-            ordered_id_1 = e1_id.clone();
-            ordered_id_2 = e2_id.clone();
-            ordered_match_values = match_values;
-        } else {
-            // Need to swap the entity IDs to maintain consistent ordering
-            ordered_id_1 = e2_id.clone();
-            ordered_id_2 = e1_id.clone();
-
-            // Create new match values with swapped fields for GeospatialMatchValue
-            if let MatchValues::Geospatial(geo_match) = match_values {
-                ordered_match_values = MatchValues::Geospatial(GeospatialMatchValue {
-                    latitude1: geo_match.latitude2,
-                    longitude1: geo_match.longitude2,
-                    latitude2: geo_match.latitude1,
-                    longitude2: geo_match.longitude1,
-                    distance: geo_match.distance,
-                });
-            } else {
-                // This shouldn't happen for geospatial matching
-                ordered_match_values = match_values;
-            }
-        }
 
         // Generate entity group ID
         let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
@@ -362,13 +318,11 @@ async fn process_batch(
 
         if should_check_cache {
             if let Some(cache) = &feature_cache {
-                // Quick check if this pair is in cache without extracting
                 let key = FeatureCacheService::get_pair_key(&ordered_id_1, &ordered_id_2);
                 let cache_guard = cache.lock().await;
                 if cache_guard.pair_cache.contains(&key) {
                     cache_hit = true;
                 }
-                // Release the lock immediately
                 drop(cache_guard);
             }
         }
@@ -389,7 +343,7 @@ async fn process_batch(
                 ordered_id_2,
                 ordered_match_values,
             ));
-            continue; // Skip processing this pair for now
+            continue;
         }
 
         // Process pairs with cache hit or those not needing RL scoring immediately
@@ -398,15 +352,12 @@ async fn process_batch(
 
         // Apply RL tuning if available (and we have a cache hit)
         if let Some(ro_arc) = reinforcement_orchestrator_option {
-            // Use the feature cache if available
             match if let Some(cache) = feature_cache.as_ref() {
-                // Use the cache through the orchestrator
                 let orchestrator_guard = ro_arc.lock().await;
                 orchestrator_guard
                     .get_pair_features(pool, &ordered_id_1, &ordered_id_2)
                     .await
             } else {
-                // Fall back to direct extraction if no cache
                 MatchingOrchestrator::extract_pair_context_features(
                     pool,
                     &ordered_id_1,
@@ -464,17 +415,15 @@ async fn process_batch(
         local_confidence_scores.push(final_confidence_score);
     }
 
-    // NEW: Process all cache misses in a batch
+    // Process all cache misses in a batch
     if !cache_miss_pairs.is_empty() {
         info!(
             "Geospatial: Processing {} cache misses in batch",
             cache_miss_pairs.len()
         );
 
-        // Extract feature cache once to avoid locking it multiple times
         let feature_cache_ref = feature_cache.as_ref();
 
-        // Now batch process all the cache misses together
         let results = batch_extract_features(
             pool,
             &cache_miss_pairs
@@ -485,7 +434,7 @@ async fn process_batch(
         )
         .await;
 
-        // Now process each pair with its extracted features
+        // Process each pair with its extracted features
         for (
             i,
             (
@@ -515,7 +464,6 @@ async fn process_batch(
 
             match features_result {
                 Ok(features_vec) => {
-                    // Successfully extracted features
                     local_feature_extractions += 1;
 
                     // Update the cache
@@ -542,67 +490,40 @@ async fn process_batch(
                             }
                         }
                     }
-
-                    // Now process this pair with the extracted features
-                    process_single_pair(
-                        &mut pairs_to_create,
-                        &mut suggestions_to_create,
-                        &mut decision_snapshots_to_create,
-                        new_entity_group_id,
-                        ordered_id_1,
-                        ordered_id_2,
-                        ordered_match_values,
-                        final_confidence_score,
-                        *pre_rl_confidence_score,
-                        features_for_snapshot,
-                        reinforcement_orchestrator_option,
-                        pipeline_run_id,
-                        *distance_meters,
-                        *lat1,
-                        *lon1,
-                        *lat2,
-                        *lon2,
-                    );
-
-                    // Update local stats
-                    local_new_pairs += 1;
-                    local_entities.insert(ordered_id_1.clone());
-                    local_entities.insert(ordered_id_2.clone());
-                    local_confidence_scores.push(final_confidence_score);
                 }
                 Err(e) => {
                     local_feature_failures += 1;
                     warn!("Geospatial: Batch feature extraction failed for ({}, {}): {}. Using pre-RL score.", 
                         ordered_id_1.0, ordered_id_2.0, e);
-
-                    // Process anyway using the pre-RL score
-                    process_single_pair(
-                        &mut pairs_to_create,
-                        &mut suggestions_to_create,
-                        &mut decision_snapshots_to_create,
-                        new_entity_group_id,
-                        ordered_id_1,
-                        ordered_id_2,
-                        ordered_match_values,
-                        *pre_rl_confidence_score, // Use pre-RL score since tuning failed
-                        *pre_rl_confidence_score,
-                        None, // No features available
-                        reinforcement_orchestrator_option,
-                        pipeline_run_id,
-                        *distance_meters,
-                        *lat1,
-                        *lon1,
-                        *lat2,
-                        *lon2,
-                    );
-
-                    // Update local stats
-                    local_new_pairs += 1;
-                    local_entities.insert(ordered_id_1.clone());
-                    local_entities.insert(ordered_id_2.clone());
-                    local_confidence_scores.push(*pre_rl_confidence_score);
                 }
             }
+
+            // Process this pair
+            process_single_pair(
+                &mut pairs_to_create,
+                &mut suggestions_to_create,
+                &mut decision_snapshots_to_create,
+                new_entity_group_id,
+                ordered_id_1,
+                ordered_id_2,
+                ordered_match_values,
+                final_confidence_score,
+                *pre_rl_confidence_score,
+                features_for_snapshot,
+                reinforcement_orchestrator_option,
+                pipeline_run_id,
+                *distance_meters,
+                *lat1,
+                *lon1,
+                *lat2,
+                *lon2,
+            );
+
+            // Update local stats
+            local_new_pairs += 1;
+            local_entities.insert(ordered_id_1.clone());
+            local_entities.insert(ordered_id_2.clone());
+            local_confidence_scores.push(final_confidence_score);
         }
     }
 
@@ -621,7 +542,6 @@ async fn process_batch(
                     "Geospatial: Successfully created {} pairs in batch",
                     created_count
                 );
-                // Actually, we'll stick with our local counts since they're more accurate
             }
             Err(e) => {
                 warn!("Geospatial: Batch creation failed: {}", e);
@@ -642,7 +562,6 @@ async fn process_batch(
         stats.6 += local_feature_failures;
         stats.7 += local_skipped_pairs;
 
-        // Log progress
         if local_new_pairs > 0 {
             info!(
                 "Geospatial: Batch {}/{} complete - created {} new pairs (total: {})",
@@ -657,6 +576,121 @@ async fn process_batch(
     }
 
     Ok(())
+}
+
+/// Helper function to normalize pair order and create match values
+fn normalize_pair_for_storage(
+    e1_id: EntityId,
+    e2_id: EntityId,
+    lat1: f64,
+    lon1: f64,
+    lat2: f64,
+    lon2: f64,
+    distance_meters: f64,
+) -> (EntityId, EntityId, MatchValues) {
+    // Ensure entity_id_1 < entity_id_2 to satisfy database ordering constraints
+    if e1_id.0 <= e2_id.0 {
+        let match_values = MatchValues::Geospatial(GeospatialMatchValue {
+            latitude1: lat1,
+            longitude1: lon1,
+            latitude2: lat2,
+            longitude2: lon2,
+            distance: distance_meters,
+        });
+        (e1_id, e2_id, match_values)
+    } else {
+        // Swap entity IDs and corresponding coordinates
+        let match_values = MatchValues::Geospatial(GeospatialMatchValue {
+            latitude1: lat2,
+            longitude1: lon2,
+            latitude2: lat1,
+            longitude2: lon1,
+            distance: distance_meters,
+        });
+        (e2_id, e1_id, match_values)
+    }
+}
+
+/// Modified candidate pairs query that excludes already existing pairs using ANTI-JOIN
+async fn fetch_candidate_pairs_excluding_existing(
+    conn: &impl tokio_postgres::GenericClient,
+) -> Result<Vec<(EntityId, EntityId, f64, f64, f64, f64, f64)>> {
+    let geo_candidates_query = "
+        WITH EntityLocations AS (
+            SELECT
+                e.id AS entity_id,
+                l.geom,
+                l.latitude,
+                l.longitude
+            FROM
+                public.entity e
+            JOIN
+                public.location l ON e.organization_id = l.organization_id
+            WHERE
+                l.geom IS NOT NULL AND e.id IS NOT NULL
+        ),
+        CandidatePairs AS (
+            SELECT
+                el1.entity_id AS entity_id_1_str,
+                el2.entity_id AS entity_id_2_str,
+                el1.latitude AS lat1,
+                el1.longitude AS lon1,
+                el2.latitude AS lat2,
+                el2.longitude AS lon2,
+                ST_Distance(el1.geom, el2.geom) AS distance_meters
+            FROM
+                EntityLocations el1
+            JOIN
+                EntityLocations el2 ON el1.entity_id < el2.entity_id -- Ensures order & avoids self-match
+                AND ST_DWithin(el1.geom, el2.geom, $1)
+        )
+        SELECT
+            cp.entity_id_1_str,
+            cp.entity_id_2_str,
+            cp.lat1,
+            cp.lon1,
+            cp.lat2,
+            cp.lon2,
+            cp.distance_meters
+        FROM
+            CandidatePairs cp
+        LEFT JOIN
+            public.entity_group eg ON 
+                cp.entity_id_1_str = eg.entity_id_1 
+                AND cp.entity_id_2_str = eg.entity_id_2 
+                AND eg.method_type = 'geospatial'
+        WHERE
+            eg.id IS NULL  -- Only include pairs that don't already exist
+    ";
+
+    debug!("Geospatial: Executing geospatial candidate query with existing pair exclusion...");
+    let candidate_rows = conn
+        .query(geo_candidates_query, &[&METERS_TO_CHECK])
+        .await
+        .context("Geospatial: Candidate query with exclusion failed")?;
+
+    let mut result = Vec::with_capacity(candidate_rows.len());
+    for row in candidate_rows {
+        let entity_id1_str: String = row.get("entity_id_1_str");
+        let entity_id2_str: String = row.get("entity_id_2_str");
+        let lat1: f64 = row.get("lat1");
+        let lon1: f64 = row.get("lon1");
+        let lat2: f64 = row.get("lat2");
+        let lon2: f64 = row.get("lon2");
+        let distance_meters: f64 = row.get("distance_meters");
+
+        result.push((
+            EntityId(entity_id1_str),
+            EntityId(entity_id2_str),
+            lat1,
+            lon1,
+            lat2,
+            lon2,
+            distance_meters,
+        ));
+    }
+
+    Ok(result)
 }
 
 // New function to batch extract features for multiple pairs
