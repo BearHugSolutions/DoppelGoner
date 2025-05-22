@@ -5,6 +5,7 @@ use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use chrono::NaiveDateTime; // For human_feedback table
 use log::{debug, info, warn};
+use postgres_types::ToSql;
 use std::time::Duration;
 use tokio_postgres::{Config, GenericClient, NoTls, Row as PgRow};
 use uuid::Uuid;
@@ -577,6 +578,123 @@ pub async fn mark_human_feedback_as_processed(
         warn!("Attempted to mark human feedback ID {} as processed, but {} rows were affected (expected 0 or 1).", feedback_id_str, rows_affected);
     }
     Ok(rows_affected)
+}
+
+/// Batch insert cluster formation edges for better performance
+pub async fn insert_cluster_formation_edges_batch(
+    conn: &impl GenericClient,
+    edges: &[NewClusterFormationEdge],
+) -> Result<Vec<Uuid>> {
+    if edges.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = String::from(
+        "INSERT INTO clustering_metadata.cluster_formation_edges (
+            pipeline_run_id, source_group_id, target_group_id,
+            calculated_edge_weight, contributing_shared_entities
+        ) VALUES "
+    );
+
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    let mut param_groups = Vec::new();
+    
+    for (i, edge) in edges.iter().enumerate() {
+        let base_idx = i * 5;
+        param_groups.push(format!(
+            "(${}, ${}, ${}, ${}, ${})",
+            base_idx + 1, base_idx + 2, base_idx + 3, base_idx + 4, base_idx + 5
+        ));
+        
+        params.push(&edge.pipeline_run_id);
+        params.push(&edge.source_group_id);
+        params.push(&edge.target_group_id);
+        params.push(&edge.calculated_edge_weight);
+        params.push(&edge.contributing_shared_entities);
+    }
+    
+    query.push_str(&param_groups.join(", "));
+    query.push_str(" RETURNING id");
+
+    let rows = conn
+        .query(&query, &params[..])
+        .await
+        .context("Failed to batch insert cluster_formation_edges")?;
+
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id_str: String = row.get(0);
+        let id = Uuid::parse_str(&id_str)
+            .context("Failed to parse returned ID string as UUID")?;
+        ids.push(id);
+    }
+
+    Ok(ids)
+}
+
+/// Batch insert suggestions for better performance
+pub async fn insert_suggestions_batch(
+    conn: &impl GenericClient,
+    suggestions: &[NewSuggestedAction],
+) -> Result<Vec<Uuid>> {
+    if suggestions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = String::from(
+        "INSERT INTO clustering_metadata.suggested_actions (
+            pipeline_run_id, action_type, entity_id, group_id_1, group_id_2, cluster_id,
+            triggering_confidence, details, reason_code, reason_message, priority, status,
+            reviewer_id, reviewed_at, review_notes
+        ) VALUES "
+    );
+
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    let mut param_groups = Vec::new();
+    
+    for (i, suggestion) in suggestions.iter().enumerate() {
+        let base_idx = i * 15;
+        param_groups.push(format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base_idx + 1, base_idx + 2, base_idx + 3, base_idx + 4, base_idx + 5,
+            base_idx + 6, base_idx + 7, base_idx + 8, base_idx + 9, base_idx + 10,
+            base_idx + 11, base_idx + 12, base_idx + 13, base_idx + 14, base_idx + 15
+        ));
+        
+        params.push(&suggestion.pipeline_run_id);
+        params.push(&suggestion.action_type);
+        params.push(&suggestion.entity_id);
+        params.push(&suggestion.group_id_1);
+        params.push(&suggestion.group_id_2);
+        params.push(&suggestion.cluster_id);
+        params.push(&suggestion.triggering_confidence);
+        params.push(&suggestion.details);
+        params.push(&suggestion.reason_code);
+        params.push(&suggestion.reason_message);
+        params.push(&suggestion.priority);
+        params.push(&suggestion.status);
+        params.push(&suggestion.reviewer_id);
+        params.push(&suggestion.reviewed_at);
+        params.push(&suggestion.review_notes);
+    }
+    
+    query.push_str(&param_groups.join(", "));
+    query.push_str(" RETURNING id");
+
+    let rows = conn
+        .query(&query, &params[..])
+        .await
+        .context("Failed to batch insert suggested_actions")?;
+
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id_str: String = row.get(0);
+        let id = Uuid::parse_str(&id_str)
+            .context("Failed to parse returned ID string as UUID")?;
+        ids.push(id);
+    }
+
+    Ok(ids)
 }
 
 // The old `fetch_recent_feedback_items` that used `FeedbackItem` and `view_rl_feedback_items`
