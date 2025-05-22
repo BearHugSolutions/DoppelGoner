@@ -67,6 +67,10 @@ regex = "1.7.0"
 lru = "0.9"  # For feature caching
 num_cpus = "1.15"  # For detecting available CPU cores
 
+# Hashing calculations
+sha2 = "0.10"
+hex = "0.4"
+
 # Define binary targets
 [[bin]]
 name = "dedupe"
@@ -83,6 +87,10 @@ path = "src/bin/extract_context_features.rs"
 [[bin]]
 name = "extract_service_context_features"
 path = "src/bin/extract_service_context_features.rs"
+
+[[bin]]
+name = "calculate_signatures"
+path = "src/bin/calculate_signatures.rs"
 
 [lib]
 name = "dedupe_lib"
