@@ -778,7 +778,7 @@ async fn consolidate_clusters_helper(
 
     // Call the actual implementation
     let clusters_created =
-        consolidate_clusters::process_clusters(pool, Some(&reinforcement_orchestrator), &run_id)
+        consolidate_clusters::process_clusters(pool, &run_id)
             .await
             .context("Failed to process clusters")?;
 
