@@ -12,6 +12,7 @@ pub mod service_cluster_visualization;
 pub mod service_consolidate_clusters;
 pub mod service_matching;
 pub mod utils;
+pub mod pipeline_state_utils;
 
 // Re-export common types for easier access
 pub use models::{
