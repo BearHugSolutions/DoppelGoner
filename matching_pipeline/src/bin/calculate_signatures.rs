@@ -81,7 +81,10 @@ async fn main() -> Result<()> {
 
 async fn calculate_all_signatures_parallel(pool: &PgPool) -> Result<()> {
     let cpu_count = num_cpus::get();
-    info!("Detected {} CPU cores, optimizing parallel processing", cpu_count);
+    info!(
+        "Detected {} CPU cores, optimizing parallel processing",
+        cpu_count
+    );
 
     // Calculate entity signatures in parallel
     info!("Calculating entity signatures...");
@@ -97,10 +100,7 @@ async fn calculate_all_signatures_parallel(pool: &PgPool) -> Result<()> {
 }
 
 async fn calculate_changed_signatures_parallel(pool: &PgPool) -> Result<()> {
-    let conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection")?;
+    let conn = pool.get().await.context("Failed to get DB connection")?;
 
     // Find entities with changed data
     let changed_entities_query = r#"
@@ -138,10 +138,8 @@ async fn calculate_changed_signatures_parallel(pool: &PgPool) -> Result<()> {
         .await
         .context("Failed to query changed entities")?;
 
-    let changed_entity_ids: Vec<EntityId> = rows
-        .into_iter()
-        .map(|row| EntityId(row.get(0)))
-        .collect();
+    let changed_entity_ids: Vec<EntityId> =
+        rows.into_iter().map(|row| EntityId(row.get(0))).collect();
 
     if !changed_entity_ids.is_empty() {
         info!("Found {} entities with changes", changed_entity_ids.len());
@@ -186,10 +184,8 @@ async fn calculate_changed_signatures_parallel(pool: &PgPool) -> Result<()> {
         .await
         .context("Failed to query changed services")?;
 
-    let changed_service_ids: Vec<ServiceId> = rows
-        .into_iter()
-        .map(|row| ServiceId(row.get(0)))
-        .collect();
+    let changed_service_ids: Vec<ServiceId> =
+        rows.into_iter().map(|row| ServiceId(row.get(0))).collect();
 
     if !changed_service_ids.is_empty() {
         info!("Found {} services with changes", changed_service_ids.len());
@@ -203,11 +199,8 @@ async fn calculate_changed_signatures_parallel(pool: &PgPool) -> Result<()> {
 
 async fn recalculate_affected_entity_signatures_parallel(pool: &PgPool) -> Result<()> {
     info!("Checking for entities affected by missing service references...");
-    
-    let conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection")?;
+
+    let conn = pool.get().await.context("Failed to get DB connection")?;
 
     // Find entities that reference non-existent services
     let affected_entities_query = r#"
@@ -216,16 +209,16 @@ async fn recalculate_affected_entity_signatures_parallel(pool: &PgPool) -> Resul
         LEFT JOIN public.service s ON ef.table_id = s.id
         WHERE ef.table_name = 'service' AND s.id IS NULL
     "#;
-    
+
     let rows = conn.query(affected_entities_query, &[]).await?;
-    let affected_entity_ids: Vec<EntityId> = rows
-        .into_iter()
-        .map(|row| EntityId(row.get(0)))
-        .collect();
+    let affected_entity_ids: Vec<EntityId> =
+        rows.into_iter().map(|row| EntityId(row.get(0))).collect();
 
     if !affected_entity_ids.is_empty() {
-        info!("Found {} entities with missing service references. Recalculating their signatures...", 
-              affected_entity_ids.len());
+        info!(
+            "Found {} entities with missing service references. Recalculating their signatures...",
+            affected_entity_ids.len()
+        );
         calculate_entity_signatures_parallel(pool, Some(affected_entity_ids)).await?;
     } else {
         info!("No entities affected by missing service references");
@@ -238,10 +231,7 @@ async fn calculate_entity_signatures_parallel(
     pool: &PgPool,
     entity_ids: Option<Vec<EntityId>>,
 ) -> Result<usize> {
-    let conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection")?;
+    let conn = pool.get().await.context("Failed to get DB connection")?;
 
     // Get entities to process
     let entities_query = if entity_ids.is_some() {
@@ -257,10 +247,7 @@ async fn calculate_entity_signatures_parallel(
         conn.query(entities_query, &[]).await?
     };
 
-    let all_entity_ids: Vec<EntityId> = rows
-        .into_iter()
-        .map(|row| EntityId(row.get(0)))
-        .collect();
+    let all_entity_ids: Vec<EntityId> = rows.into_iter().map(|row| EntityId(row.get(0))).collect();
 
     let total_count = all_entity_ids.len();
     info!("Processing {} entities", total_count);
@@ -292,11 +279,12 @@ async fn calculate_entity_signatures_parallel(
     for batch in batches {
         let pool_clone = pool.clone();
         let processed_clone = processed.clone();
-        
+
         join_set.spawn(async move {
             match process_entity_batch_optimized(&pool_clone, batch).await {
                 Ok(count) => {
-                    let current_processed = processed_clone.fetch_add(count, Ordering::Relaxed) + count;
+                    let current_processed =
+                        processed_clone.fetch_add(count, Ordering::Relaxed) + count;
                     if current_processed % 1000 == 0 || current_processed >= total_count {
                         info!("Processed {}/{} entities", current_processed, total_count);
                     }
@@ -328,10 +316,7 @@ async fn calculate_service_signatures_parallel(
     pool: &PgPool,
     service_ids: Option<Vec<ServiceId>>,
 ) -> Result<usize> {
-    let conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection")?;
+    let conn = pool.get().await.context("Failed to get DB connection")?;
 
     // Get services to process
     let services_query = if service_ids.is_some() {
@@ -347,10 +332,8 @@ async fn calculate_service_signatures_parallel(
         conn.query(services_query, &[]).await?
     };
 
-    let all_service_ids: Vec<ServiceId> = rows
-        .into_iter()
-        .map(|row| ServiceId(row.get(0)))
-        .collect();
+    let all_service_ids: Vec<ServiceId> =
+        rows.into_iter().map(|row| ServiceId(row.get(0))).collect();
 
     let total_count = all_service_ids.len();
     info!("Processing {} services", total_count);
@@ -382,11 +365,12 @@ async fn calculate_service_signatures_parallel(
     for batch in batches {
         let pool_clone = pool.clone();
         let processed_clone = processed.clone();
-        
+
         join_set.spawn(async move {
             match process_service_batch_optimized(&pool_clone, batch).await {
                 Ok(count) => {
-                    let current_processed = processed_clone.fetch_add(count, Ordering::Relaxed) + count;
+                    let current_processed =
+                        processed_clone.fetch_add(count, Ordering::Relaxed) + count;
                     if current_processed % 1000 == 0 || current_processed >= total_count {
                         info!("Processed {}/{} services", current_processed, total_count);
                     }
@@ -418,19 +402,16 @@ fn calculate_optimal_batch_size(total_items: usize, cpu_count: usize) -> usize {
     // Calculate batch size based on CPU count and total items
     let target_batches_per_cpu = 4; // Allow some work distribution flexibility
     let ideal_batch_size = total_items / (cpu_count * target_batches_per_cpu);
-    
+
     // Clamp to reasonable bounds
     std::cmp::max(
         MIN_BATCH_SIZE,
-        std::cmp::min(MAX_BATCH_SIZE, ideal_batch_size.max(1))
+        std::cmp::min(MAX_BATCH_SIZE, ideal_batch_size.max(1)),
     )
 }
 
 async fn process_entity_batch_optimized(pool: &PgPool, entity_ids: Vec<EntityId>) -> Result<usize> {
-    let mut conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection")?;
+    let mut conn = pool.get().await.context("Failed to get DB connection")?;
 
     let tx = conn
         .transaction()
@@ -456,22 +437,35 @@ async fn process_entity_batch_optimized(pool: &PgPool, entity_ids: Vec<EntityId>
                 "#;
 
                 if let Err(e) = tx
-                    .execute(upsert_query, &[&entity_id.0, &signature, &last_updated, &feature_snapshot])
+                    .execute(
+                        upsert_query,
+                        &[&entity_id.0, &signature, &last_updated, &feature_snapshot],
+                    )
                     .await
                 {
-                    error!("Failed to store signature for entity {}: {}", entity_id.0, e);
+                    error!(
+                        "Failed to store signature for entity {}: {}",
+                        entity_id.0, e
+                    );
                 } else {
                     success_count += 1;
                 }
             }
             Err(e) => {
-                error!("Failed to calculate signature for entity {}: {}", entity_id.0, e);
+                error!(
+                    "Failed to calculate signature for entity {}: {}",
+                    entity_id.0, e
+                );
             }
         }
 
         // Periodic progress within batch
         if batch_size > 100 && (idx + 1) % 50 == 0 {
-            debug!("Batch progress: {}/{} entities processed", idx + 1, batch_size);
+            debug!(
+                "Batch progress: {}/{} entities processed",
+                idx + 1,
+                batch_size
+            );
         }
     }
 
@@ -479,11 +473,11 @@ async fn process_entity_batch_optimized(pool: &PgPool, entity_ids: Vec<EntityId>
     Ok(success_count)
 }
 
-async fn process_service_batch_optimized(pool: &PgPool, service_ids: Vec<ServiceId>) -> Result<usize> {
-    let mut conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection")?;
+async fn process_service_batch_optimized(
+    pool: &PgPool,
+    service_ids: Vec<ServiceId>,
+) -> Result<usize> {
+    let mut conn = pool.get().await.context("Failed to get DB connection")?;
 
     let tx = conn
         .transaction()
@@ -509,22 +503,35 @@ async fn process_service_batch_optimized(pool: &PgPool, service_ids: Vec<Service
                 "#;
 
                 if let Err(e) = tx
-                    .execute(upsert_query, &[&service_id.0, &signature, &last_updated, &feature_snapshot])
+                    .execute(
+                        upsert_query,
+                        &[&service_id.0, &signature, &last_updated, &feature_snapshot],
+                    )
                     .await
                 {
-                    error!("Failed to store signature for service {}: {}", service_id.0, e);
+                    error!(
+                        "Failed to store signature for service {}: {}",
+                        service_id.0, e
+                    );
                 } else {
                     success_count += 1;
                 }
             }
             Err(e) => {
-                error!("Failed to calculate signature for service {}: {}", service_id.0, e);
+                error!(
+                    "Failed to calculate signature for service {}: {}",
+                    service_id.0, e
+                );
             }
         }
 
         // Periodic progress within batch
         if batch_size > 100 && (idx + 1) % 50 == 0 {
-            debug!("Batch progress: {}/{} services processed", idx + 1, batch_size);
+            debug!(
+                "Batch progress: {}/{} services processed",
+                idx + 1,
+                batch_size
+            );
         }
     }
 
@@ -548,13 +555,16 @@ async fn validate_data_integrity(pool: &PgPool) -> Result<()> {
         LEFT JOIN public.service s ON ef.table_id = s.id
         WHERE ef.table_name = 'service' AND s.id IS NULL
     "#;
-    
+
     let row = conn.query_one(orphaned_services_query, &[]).await?;
     let orphaned_count: i64 = row.get(0);
-    
+
     if orphaned_count > 0 {
-        warn!("Found {} orphaned service references in entity_feature table!", orphaned_count);
-        
+        warn!(
+            "Found {} orphaned service references in entity_feature table!",
+            orphaned_count
+        );
+
         // Get details of orphaned services
         let details_query = r#"
             SELECT ef.entity_id, ef.table_id
@@ -563,18 +573,25 @@ async fn validate_data_integrity(pool: &PgPool) -> Result<()> {
             WHERE ef.table_name = 'service' AND s.id IS NULL
             LIMIT 10
         "#;
-        
+
         let rows = conn.query(details_query, &[]).await?;
         for row in rows {
             let entity_id: String = row.get(0);
             let service_id: String = row.get(1);
-            warn!("Entity {} references non-existent service {}", entity_id, service_id);
+            warn!(
+                "Entity {} references non-existent service {}",
+                entity_id, service_id
+            );
         }
     }
 
     // Check for other orphaned feature references
-    let feature_tables = vec![("location", "location"), ("phone", "phone"), ("contact", "contact")];
-    
+    let feature_tables = vec![
+        ("location", "location"),
+        ("phone", "phone"),
+        ("contact", "contact"),
+    ];
+
     for (table_name, actual_table) in feature_tables {
         let orphan_check_query = format!(
             r#"
@@ -585,11 +602,14 @@ async fn validate_data_integrity(pool: &PgPool) -> Result<()> {
             "#,
             actual_table, table_name
         );
-        
+
         let row = conn.query_one(&orphan_check_query, &[]).await?;
         let orphaned: i64 = row.get(0);
         if orphaned > 0 {
-            warn!("Found {} orphaned {} references in entity_feature table!", orphaned, table_name);
+            warn!(
+                "Found {} orphaned {} references in entity_feature table!",
+                orphaned, table_name
+            );
         }
     }
 
@@ -601,10 +621,14 @@ async fn validate_data_integrity(pool: &PgPool) -> Result<()> {
             COUNT(*) as total
         FROM public.service
     "#;
-    
+
     let row = conn.query_one(service_format_query, &[]).await?;
-    info!("Service ID formats - UUID: {}, Other: {}, Total: {}", 
-          row.get::<_, i64>(0), row.get::<_, i64>(1), row.get::<_, i64>(2));
+    info!(
+        "Service ID formats - UUID: {}, Other: {}, Total: {}",
+        row.get::<_, i64>(0),
+        row.get::<_, i64>(1),
+        row.get::<_, i64>(2)
+    );
 
     Ok(())
 }
@@ -621,16 +645,26 @@ async fn calculate_single_entity_signature(
     let mut feature_snapshot = json!({});
 
     // 1. Entity core data
-    let entity_query = "SELECT name, source_system, source_id, updated_at FROM public.entity WHERE id = $1";
+    let entity_query =
+        "SELECT name, source_system, source_id, updated_at FROM public.entity WHERE id = $1";
     let entity_row = conn
         .query_one(entity_query, &[&entity_id.0])
         .await
         .context("Failed to fetch entity data")?;
 
-    components.insert("entity_name".to_string(), json!(entity_row.get::<_, Option<String>>(0)));
-    components.insert("source_system".to_string(), json!(entity_row.get::<_, Option<String>>(1)));
-    components.insert("source_id".to_string(), json!(entity_row.get::<_, Option<String>>(2)));
-    
+    components.insert(
+        "entity_name".to_string(),
+        json!(entity_row.get::<_, Option<String>>(0)),
+    );
+    components.insert(
+        "source_system".to_string(),
+        json!(entity_row.get::<_, Option<String>>(1)),
+    );
+    components.insert(
+        "source_id".to_string(),
+        json!(entity_row.get::<_, Option<String>>(2)),
+    );
+
     if let Ok(updated) = entity_row.try_get::<_, chrono::NaiveDateTime>(3) {
         let updated_utc = DateTime::<Utc>::from_naive_utc_and_offset(updated, Utc);
         last_updated = last_updated.max(updated_utc);
@@ -645,21 +679,42 @@ async fn calculate_single_entity_signature(
         JOIN public.entity e ON e.organization_id = o.id
         WHERE e.id = $1
     "#;
-    
+
     if let Ok(org_row) = conn.query_one(org_query, &[&entity_id.0]).await {
-        components.insert("org_name".to_string(), json!(org_row.get::<_, Option<String>>(0)));
-        components.insert("org_email".to_string(), json!(org_row.get::<_, Option<String>>(1)));
-        components.insert("org_url".to_string(), json!(org_row.get::<_, Option<String>>(2)));
-        components.insert("tax_status".to_string(), json!(org_row.get::<_, Option<String>>(3)));
-        components.insert("tax_id".to_string(), json!(org_row.get::<_, Option<String>>(4)));
-        components.insert("year_incorporated".to_string(), json!(org_row.get::<_, Option<String>>(5)));
-        components.insert("legal_status".to_string(), json!(org_row.get::<_, Option<String>>(6)));
-        
+        components.insert(
+            "org_name".to_string(),
+            json!(org_row.get::<_, Option<String>>(0)),
+        );
+        components.insert(
+            "org_email".to_string(),
+            json!(org_row.get::<_, Option<String>>(1)),
+        );
+        components.insert(
+            "org_url".to_string(),
+            json!(org_row.get::<_, Option<String>>(2)),
+        );
+        components.insert(
+            "tax_status".to_string(),
+            json!(org_row.get::<_, Option<String>>(3)),
+        );
+        components.insert(
+            "tax_id".to_string(),
+            json!(org_row.get::<_, Option<String>>(4)),
+        );
+        components.insert(
+            "year_incorporated".to_string(),
+            json!(org_row.get::<_, Option<String>>(5)),
+        );
+        components.insert(
+            "legal_status".to_string(),
+            json!(org_row.get::<_, Option<String>>(6)),
+        );
+
         // Track embedding update time instead of full vector
         if let Ok(emb_updated) = org_row.try_get::<_, Option<DateTime<Utc>>>(8) {
             components.insert("embedding_updated_at".to_string(), json!(emb_updated));
         }
-        
+
         if let Ok(modified) = org_row.try_get::<_, chrono::NaiveDateTime>(7) {
             let modified_utc = DateTime::<Utc>::from_naive_utc_and_offset(modified, Utc);
             last_updated = last_updated.max(modified_utc);
@@ -673,7 +728,7 @@ async fn calculate_single_entity_signature(
         WHERE ef.entity_id = $1
         ORDER BY ef.table_name, ef.table_id
     "#;
-    
+
     let feature_rows = conn
         .query(features_query, &[&entity_id.0])
         .await
@@ -682,18 +737,25 @@ async fn calculate_single_entity_signature(
     for row in feature_rows {
         let table_name: String = row.get(0);
         let table_id: String = row.get(1);
-        
+
         let feature_result = match table_name.as_str() {
-            "location" => fetch_location_data(conn, &table_id).await
+            "location" => fetch_location_data(conn, &table_id)
+                .await
                 .map(|data| (format!("location_{}", table_id), data.0, data.1)),
-            "phone" => fetch_phone_data(conn, &table_id).await
+            "phone" => fetch_phone_data(conn, &table_id)
+                .await
                 .map(|data| (format!("phone_{}", table_id), data.0, data.1)),
-            "service" => fetch_service_feature_data_safe(conn, &table_id).await
+            "service" => fetch_service_feature_data_safe(conn, &table_id)
+                .await
                 .map(|data| (format!("service_{}", table_id), data.0, data.1)),
-            "contact" => fetch_contact_data(conn, &table_id).await
+            "contact" => fetch_contact_data(conn, &table_id)
+                .await
                 .map(|data| (format!("contact_{}", table_id), data.0, data.1)),
             _ => {
-                warn!("Unknown feature table: {} for entity {}", table_name, entity_id.0);
+                warn!(
+                    "Unknown feature table: {} for entity {}",
+                    table_name, entity_id.0
+                );
                 continue;
             }
         };
@@ -705,15 +767,22 @@ async fn calculate_single_entity_signature(
                 last_updated = last_updated.max(updated);
             }
             Err(e) => {
-                feature_errors.push(format!("Failed to fetch {} {}: {}", table_name, table_id, e));
+                feature_errors.push(format!(
+                    "Failed to fetch {} {}: {}",
+                    table_name, table_id, e
+                ));
                 // Continue processing other features instead of failing entirely
             }
         }
     }
 
     if !feature_errors.is_empty() {
-        warn!("Entity {} had {} feature fetch errors: {:?}", 
-              entity_id.0, feature_errors.len(), feature_errors);
+        warn!(
+            "Entity {} had {} feature fetch errors: {:?}",
+            entity_id.0,
+            feature_errors.len(),
+            feature_errors
+        );
         feature_snapshot["_errors"] = json!(feature_errors);
     }
 
@@ -722,7 +791,7 @@ async fn calculate_single_entity_signature(
     for (key, value) in components {
         hasher.update(format!("{}:{}", key, value.to_string()).as_bytes());
     }
-    
+
     let signature = hex::encode(hasher.finalize());
     Ok((signature, last_updated, feature_snapshot))
 }
@@ -745,7 +814,7 @@ async fn calculate_single_service_signature(
                last_modified, embedding_v2_updated_at -- Removed embedding_updated_at
         FROM public.service WHERE id = $1
     "#;
-    
+
     let service_row_opt = conn
         .query_opt(service_query, &[&service_id.0])
         .await
@@ -754,23 +823,53 @@ async fn calculate_single_service_signature(
     match service_row_opt {
         Some(service_row) => {
             components.insert("name".to_string(), json!(service_row.get::<_, String>(0)));
-            components.insert("alternate_name".to_string(), json!(service_row.get::<_, Option<String>>(1)));
-            components.insert("description_hash".to_string(), json!(hash_long_field(&service_row.get::<_, Option<String>>(2))));
-            components.insert("url".to_string(), json!(service_row.get::<_, Option<String>>(3)));
-            components.insert("email".to_string(), json!(service_row.get::<_, Option<String>>(4)));
+            components.insert(
+                "alternate_name".to_string(),
+                json!(service_row.get::<_, Option<String>>(1)),
+            );
+            components.insert(
+                "description_hash".to_string(),
+                json!(hash_long_field(&service_row.get::<_, Option<String>>(2))),
+            );
+            components.insert(
+                "url".to_string(),
+                json!(service_row.get::<_, Option<String>>(3)),
+            );
+            components.insert(
+                "email".to_string(),
+                json!(service_row.get::<_, Option<String>>(4)),
+            );
             components.insert("status".to_string(), json!(service_row.get::<_, String>(5)));
-            components.insert("interpretation_services".to_string(), json!(service_row.get::<_, Option<String>>(6)));
-            components.insert("application_process".to_string(), json!(service_row.get::<_, Option<String>>(7)));
-            components.insert("fees_description".to_string(), json!(service_row.get::<_, Option<String>>(8)));
-            components.insert("eligibility_description".to_string(), json!(service_row.get::<_, Option<String>>(9)));
-            components.insert("minimum_age".to_string(), json!(service_row.get::<_, Option<i32>>(10)));
-            components.insert("maximum_age".to_string(), json!(service_row.get::<_, Option<i32>>(11)));
-            
+            components.insert(
+                "interpretation_services".to_string(),
+                json!(service_row.get::<_, Option<String>>(6)),
+            );
+            components.insert(
+                "application_process".to_string(),
+                json!(service_row.get::<_, Option<String>>(7)),
+            );
+            components.insert(
+                "fees_description".to_string(),
+                json!(service_row.get::<_, Option<String>>(8)),
+            );
+            components.insert(
+                "eligibility_description".to_string(),
+                json!(service_row.get::<_, Option<String>>(9)),
+            );
+            components.insert(
+                "minimum_age".to_string(),
+                json!(service_row.get::<_, Option<i32>>(10)),
+            );
+            components.insert(
+                "maximum_age".to_string(),
+                json!(service_row.get::<_, Option<i32>>(11)),
+            );
+
             // Track embedding update times
             if let Ok(emb_updated) = service_row.try_get::<_, Option<DateTime<Utc>>>(14) {
                 components.insert("embedding_v2_updated_at".to_string(), json!(emb_updated));
             }
-            
+
             if let Ok(modified) = service_row.try_get::<_, chrono::NaiveDateTime>(12) {
                 let modified_utc = DateTime::<Utc>::from_naive_utc_and_offset(modified, Utc);
                 last_updated = last_updated.max(modified_utc);
@@ -785,7 +884,10 @@ async fn calculate_single_service_signature(
             });
         }
         None => {
-            return Err(anyhow::anyhow!("Service {} not found in database", service_id.0));
+            return Err(anyhow::anyhow!(
+                "Service {} not found in database",
+                service_id.0
+            ));
         }
     }
 
@@ -798,7 +900,8 @@ async fn calculate_single_service_signature(
     feature_snapshot["languages"] = json!(languages);
 
     // Required documents
-    let doc_query = "SELECT document FROM public.required_document WHERE service_id = $1 ORDER BY document";
+    let doc_query =
+        "SELECT document FROM public.required_document WHERE service_id = $1 ORDER BY document";
     let doc_rows = conn.query(doc_query, &[&service_id.0]).await?;
     let documents: Vec<String> = doc_rows.into_iter().map(|row| row.get(0)).collect();
     components.insert("required_documents".to_string(), json!(documents));
@@ -842,13 +945,15 @@ async fn calculate_single_service_signature(
     let loc_rows = conn.query(location_query, &[&service_id.0]).await?;
     let locations: Vec<serde_json::Value> = loc_rows
         .into_iter()
-        .map(|row| json!({
-            "name": row.get::<_, Option<String>>(0),
-            "latitude": row.get::<_, Option<f64>>(1),
-            "longitude": row.get::<_, Option<f64>>(2),
-            "city": row.get::<_, Option<String>>(3),
-            "state": row.get::<_, Option<String>>(4),
-        }))
+        .map(|row| {
+            json!({
+                "name": row.get::<_, Option<String>>(0),
+                "latitude": row.get::<_, Option<f64>>(1),
+                "longitude": row.get::<_, Option<f64>>(2),
+                "city": row.get::<_, Option<String>>(3),
+                "state": row.get::<_, Option<String>>(4),
+            })
+        })
         .collect();
     components.insert("locations".to_string(), json!(locations));
     feature_snapshot["locations"] = json!(locations);
@@ -858,7 +963,7 @@ async fn calculate_single_service_signature(
     for (key, value) in components {
         hasher.update(format!("{}:{}", key, value.to_string()).as_bytes());
     }
-    
+
     let signature = hex::encode(hasher.finalize());
     Ok((signature, last_updated, feature_snapshot))
 }
@@ -876,26 +981,26 @@ async fn fetch_location_data(
         LEFT JOIN public.address a ON l.id = a.location_id
         WHERE l.id = $1
     "#;
-    
+
     let row = conn
         .query_one(query, &[&location_id])
         .await
         .context("Failed to fetch location data")?;
-    
+
     let mut last_updated = DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    
+
     if let Ok(modified) = row.try_get::<_, chrono::NaiveDateTime>(6) {
         let modified_utc = DateTime::<Utc>::from_naive_utc_and_offset(modified, Utc);
         last_updated = last_updated.max(modified_utc);
     }
-    
+
     if let Ok(modified) = row.try_get::<_, chrono::NaiveDateTime>(13) {
         let modified_utc = DateTime::<Utc>::from_naive_utc_and_offset(modified, Utc);
         last_updated = last_updated.max(modified_utc);
     }
-    
+
     let data = json!({
         "name": row.get::<_, Option<String>>(0),
         "alternate_name": row.get::<_, Option<String>>(1),
@@ -910,7 +1015,7 @@ async fn fetch_location_data(
         "postal_code": row.get::<_, Option<String>>(11),
         "country": row.get::<_, Option<String>>(12),
     });
-    
+
     Ok((data, last_updated))
 }
 
@@ -923,22 +1028,22 @@ async fn fetch_phone_data(
         .query_one(query, &[&phone_id])
         .await
         .context("Failed to fetch phone data")?;
-    
+
     let mut last_updated = DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    
+
     if let Ok(modified) = row.try_get::<_, chrono::NaiveDateTime>(3) {
         let modified_utc = DateTime::<Utc>::from_naive_utc_and_offset(modified, Utc);
         last_updated = last_updated.max(modified_utc);
     }
-    
+
     let data = json!({
         "number": row.get::<_, String>(0),
         "extension": row.get::<_, Option<String>>(1),
         "type": row.get::<_, Option<String>>(2),
     });
-    
+
     Ok((data, last_updated))
 }
 
@@ -946,28 +1051,29 @@ async fn fetch_contact_data(
     conn: &impl tokio_postgres::GenericClient,
     contact_id: &str,
 ) -> Result<(serde_json::Value, DateTime<Utc>)> {
-    let query = "SELECT name, title, department, email, last_modified FROM public.contact WHERE id = $1";
+    let query =
+        "SELECT name, title, department, email, last_modified FROM public.contact WHERE id = $1";
     let row = conn
         .query_one(query, &[&contact_id])
         .await
         .context("Failed to fetch contact data")?;
-    
+
     let mut last_updated = DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    
+
     if let Ok(modified) = row.try_get::<_, chrono::NaiveDateTime>(4) {
         let modified_utc = DateTime::<Utc>::from_naive_utc_and_offset(modified, Utc);
         last_updated = last_updated.max(modified_utc);
     }
-    
+
     let data = json!({
         "name": row.get::<_, Option<String>>(0),
         "title": row.get::<_, Option<String>>(1),
         "department": row.get::<_, Option<String>>(2),
         "email": row.get::<_, Option<String>>(3),
     });
-    
+
     Ok((data, last_updated))
 }
 
@@ -980,18 +1086,18 @@ async fn fetch_service_feature_data_safe(
                last_modified, embedding_v2_updated_at
         FROM public.service WHERE id = $1
     "#;
-    
+
     match conn.query_opt(query, &[&service_id]).await {
         Ok(Some(row)) => {
             let mut last_updated = DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc);
-            
+
             if let Ok(modified) = row.try_get::<_, chrono::NaiveDateTime>(6) {
                 let modified_utc = DateTime::<Utc>::from_naive_utc_and_offset(modified, Utc);
                 last_updated = last_updated.max(modified_utc);
             }
-            
+
             let data = json!({
                 "name": row.get::<_, String>(0),
                 "alternate_name": row.get::<_, Option<String>>(1),
@@ -1001,11 +1107,14 @@ async fn fetch_service_feature_data_safe(
                 "status": row.get::<_, String>(5),
                 "embedding_v2_updated_at": row.get::<_, Option<DateTime<Utc>>>(7),
             });
-            
+
             Ok((data, last_updated))
         }
         Ok(None) => {
-            warn!("Service {} referenced in entity_feature but not found in service table", service_id);
+            warn!(
+                "Service {} referenced in entity_feature but not found in service table",
+                service_id
+            );
             // Return empty data so entity hash can still be calculated
             let empty_data = json!({
                 "error": "service_not_found",
@@ -1016,7 +1125,11 @@ async fn fetch_service_feature_data_safe(
                 .with_timezone(&Utc);
             Ok((empty_data, default_time))
         }
-        Err(e) => Err(anyhow::anyhow!("Database error fetching service {}: {}", service_id, e))
+        Err(e) => Err(anyhow::anyhow!(
+            "Database error fetching service {}: {}",
+            service_id,
+            e
+        )),
     }
 }
 

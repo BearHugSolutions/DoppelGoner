@@ -16,7 +16,8 @@ use crate::models::{
     NewSuggestedAction, SuggestionStatus,
 };
 use crate::reinforcement::entity::feature_cache_service::{
-    FeatureCacheService, SharedFeatureCache, // Assuming FeatureCacheService has get_pair_key
+    FeatureCacheService,
+    SharedFeatureCache, // Assuming FeatureCacheService has get_pair_key
 };
 use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
 use crate::results::{AnyMatchResult, GeospatialMatchResult, MatchMethodStats};
@@ -24,7 +25,9 @@ use serde_json;
 
 // Import pipeline_state_utils
 use crate::pipeline_state_utils::{
-    check_comparison_cache, get_current_signatures_for_pair, store_in_comparison_cache,
+    check_comparison_cache,
+    get_current_signatures_for_pair,
+    store_in_comparison_cache,
     // EntitySignatureData and CachedComparisonResult are implicitly used via the utils
 };
 
@@ -40,7 +43,6 @@ const INSERT_ENTITY_GROUP_SQL: &str = "
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING
 RETURNING id";
-
 
 /// Main function to find geospatial-based matches
 pub async fn find_matches(
@@ -114,7 +116,6 @@ pub async fn find_matches(
     // More importantly, it's used to skip after a cache hit or after processing a cache miss.
     let processed_pairs_this_run_arc = Arc::new(Mutex::new(HashSet::<(EntityId, EntityId)>::new()));
 
-
     // Stats: (new_pairs, entities_set, conf_scores, errors, pairs_processed_db_query,
     //         feature_extractions, feature_failures, cache_hits)
     let stats_mutex = Arc::new(Mutex::new((
@@ -169,7 +170,8 @@ pub async fn find_matches(
             if let Err(e) = result {
                 warn!(
                     "Geospatial: Batch processing task (approx. batch {}) error: {}",
-                    global_batch_num - chunk_of_batches.chunks(BATCH_SIZE).len() + i + 1, e
+                    global_batch_num - chunk_of_batches.chunks(BATCH_SIZE).len() + i + 1,
+                    e
                 );
                 // Potentially increment an error counter in stats_mutex if task-level errors are critical
             }
@@ -210,7 +212,11 @@ pub async fn find_matches(
         groups_created: new_pairs_created_count,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 { 2.0 } else { 0.0 },
+        avg_group_size: if new_pairs_created_count > 0 {
+            2.0
+        } else {
+            0.0
+        },
     };
 
     let elapsed = start_time.elapsed();
@@ -244,14 +250,14 @@ async fn process_batch(
     feature_cache: Option<SharedFeatureCache>, // Used for RL feature caching, not the main comparison cache
     stats_mutex: Arc<
         Mutex<(
-            usize,                // new_pairs_created_count
-            HashSet<EntityId>,    // entities_in_new_pairs
-            Vec<f64>,             // confidence_scores_for_stats
-            usize,                // individual_operation_errors
-            usize,                // pairs_processed_from_db_candidates
-            usize,                // feature_extraction_count
-            usize,                // feature_extraction_failures
-            usize,                // cache_hits_count
+            usize,             // new_pairs_created_count
+            HashSet<EntityId>, // entities_in_new_pairs
+            Vec<f64>,          // confidence_scores_for_stats
+            usize,             // individual_operation_errors
+            usize,             // pairs_processed_from_db_candidates
+            usize,             // feature_extraction_count
+            usize,             // feature_extraction_failures
+            usize,             // cache_hits_count
         )>,
     >,
     processed_pairs_this_run_arc: Arc<Mutex<HashSet<(EntityId, EntityId)>>>,
@@ -279,18 +285,37 @@ async fn process_batch(
     let mut local_feature_extraction_failures = 0;
     let mut local_cache_hits_count = 0;
 
-
     for (e1_id_orig, e2_id_orig, lat1, lon1, lat2, lon2, distance_meters) in batch {
         local_pairs_processed_from_db += 1; // Count each pair from the input batch
 
         // Ensure consistent ordering for cache keys, processed_pairs_this_run, and entity_group
-        let (ordered_e1_id, ordered_e2_id, _ordered_lat1, _ordered_lon1, _ordered_lat2, _ordered_lon2) =
-            if e1_id_orig.0 < e2_id_orig.0 {
-                (e1_id_orig.clone(), e2_id_orig.clone(), lat1, lon1, lat2, lon2)
-            } else {
-                (e2_id_orig.clone(), e1_id_orig.clone(), lat2, lon2, lat1, lon1)
-            };
-        
+        let (
+            ordered_e1_id,
+            ordered_e2_id,
+            _ordered_lat1,
+            _ordered_lon1,
+            _ordered_lat2,
+            _ordered_lon2,
+        ) = if e1_id_orig.0 < e2_id_orig.0 {
+            (
+                e1_id_orig.clone(),
+                e2_id_orig.clone(),
+                lat1,
+                lon1,
+                lat2,
+                lon2,
+            )
+        } else {
+            (
+                e2_id_orig.clone(),
+                e1_id_orig.clone(),
+                lat2,
+                lon2,
+                lat1,
+                lon1,
+            )
+        };
+
         let current_pair_ordered = (ordered_e1_id.clone(), ordered_e2_id.clone());
 
         // Check if this ordered pair has already been processed in this run (e.g., by a previous batch or earlier in this one)
@@ -299,15 +324,23 @@ async fn process_batch(
         {
             let mut processed_set = processed_pairs_this_run_arc.lock().await;
             if processed_set.contains(&current_pair_ordered) {
-                debug!("Geospatial: Pair ({}, {}) already processed in this run. Skipping.", ordered_e1_id.0, ordered_e2_id.0);
+                debug!(
+                    "Geospatial: Pair ({}, {}) already processed in this run. Skipping.",
+                    ordered_e1_id.0, ordered_e2_id.0
+                );
                 continue; // Skip to the next pair in the batch
             }
             // Will add to processed_set later, after cache check/comparison
         }
 
-
         // --- INCREMENTAL PROCESSING LOGIC ---
-        let current_signatures_opt = match get_current_signatures_for_pair(pool, &ordered_e1_id, &ordered_e2_id).await {
+        let current_signatures_opt = match get_current_signatures_for_pair(
+            pool,
+            &ordered_e1_id,
+            &ordered_e2_id,
+        )
+        .await
+        {
             Ok(sigs) => sigs,
             Err(e) => {
                 warn!("Geospatial: Failed to get signatures for pair ({}, {}): {}. Proceeding without cache.", ordered_e1_id.0, ordered_e2_id.0, e);
@@ -316,11 +349,26 @@ async fn process_batch(
         };
 
         if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
-            match check_comparison_cache(pool, &ordered_e1_id, &ordered_e2_id, &sig1_data.signature, &sig2_data.signature, &MatchMethodType::Geospatial).await {
+            match check_comparison_cache(
+                pool,
+                &ordered_e1_id,
+                &ordered_e2_id,
+                &sig1_data.signature,
+                &sig2_data.signature,
+                &MatchMethodType::Geospatial,
+            )
+            .await
+            {
                 Ok(Some(cached_eval)) => {
                     local_cache_hits_count += 1;
-                    debug!("Geospatial: Cache HIT for pair ({}, {}). Result: {}, Score: {:?}", ordered_e1_id.0, ordered_e2_id.0, cached_eval.comparison_result, cached_eval.similarity_score);
-                    
+                    debug!(
+                        "Geospatial: Cache HIT for pair ({}, {}). Result: {}, Score: {:?}",
+                        ordered_e1_id.0,
+                        ordered_e2_id.0,
+                        cached_eval.comparison_result,
+                        cached_eval.similarity_score
+                    );
+
                     // Mark as processed to avoid re-processing if it somehow appears again
                     let mut processed_set = processed_pairs_this_run_arc.lock().await;
                     processed_set.insert(current_pair_ordered.clone());
@@ -343,7 +391,7 @@ async fn process_batch(
 
         // If we've reached here, it's either a cache miss or an error occurred trying to use the cache.
         // Proceed with the actual comparison.
-        
+
         let pre_rl_confidence_score = 0.85; // Default base confidence for geospatial match
         let mut final_confidence_score = pre_rl_confidence_score;
         let mut features_for_rl_snapshot: Option<Vec<f64>> = None; // For RL tuning and snapshotting
@@ -354,9 +402,16 @@ async fn process_batch(
             match if let Some(rl_feat_cache) = feature_cache.as_ref() {
                 let orchestrator_guard = ro_arc.lock().await;
                 // get_pair_features likely uses the rl_feat_cache internally
-                orchestrator_guard.get_pair_features(pool, &ordered_e1_id, &ordered_e2_id).await
+                orchestrator_guard
+                    .get_pair_features(pool, &ordered_e1_id, &ordered_e2_id)
+                    .await
             } else {
-                MatchingOrchestrator::extract_pair_context_features(pool, &ordered_e1_id, &ordered_e2_id).await
+                MatchingOrchestrator::extract_pair_context_features(
+                    pool,
+                    &ordered_e1_id,
+                    &ordered_e2_id,
+                )
+                .await
             } {
                 Ok(features_vec) => {
                     local_feature_extraction_count += 1;
@@ -374,7 +429,7 @@ async fn process_batch(
                             Err(e) => warn!("Geospatial: RL tuning failed for ({}, {}): {}. Using pre-RL score.", ordered_e1_id.0, ordered_e2_id.0, e),
                         }
                     } else {
-                         warn!("Geospatial: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", ordered_e1_id.0, ordered_e2_id.0);
+                        warn!("Geospatial: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", ordered_e1_id.0, ordered_e2_id.0);
                     }
                 }
                 Err(e) => {
@@ -387,27 +442,40 @@ async fn process_batch(
         // Determine outcome for caching and entity_group creation
         // For geospatial, a "MATCH" is simply being within METERS_TO_CHECK.
         // The final_confidence_score (possibly tuned) is what's stored and used for suggestions.
-        let comparison_outcome_for_cache = if distance_meters <= METERS_TO_CHECK { "MATCH" } else { "NON_MATCH" };
+        let comparison_outcome_for_cache = if distance_meters <= METERS_TO_CHECK {
+            "MATCH"
+        } else {
+            "NON_MATCH"
+        };
 
         // Store result in comparison_cache if signatures were available
         if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
             if let Err(e) = store_in_comparison_cache(
-                pool, &ordered_e1_id, &ordered_e2_id,
-                &sig1_data.signature, &sig2_data.signature,
-                &MatchMethodType::Geospatial, pipeline_run_id,
-                comparison_outcome_for_cache, Some(final_confidence_score), // Store the final (possibly tuned) score
+                pool,
+                &ordered_e1_id,
+                &ordered_e2_id,
+                &sig1_data.signature,
+                &sig2_data.signature,
+                &MatchMethodType::Geospatial,
+                pipeline_run_id,
+                comparison_outcome_for_cache,
+                Some(final_confidence_score), // Store the final (possibly tuned) score
                 features_json_for_cache.as_ref(), // Pass Option<&JsonValue>
-            ).await {
-                warn!("Geospatial: Failed to store in comparison_cache for ({}, {}): {}", ordered_e1_id.0, ordered_e2_id.0, e);
+            )
+            .await
+            {
+                warn!(
+                    "Geospatial: Failed to store in comparison_cache for ({}, {}): {}",
+                    ordered_e1_id.0, ordered_e2_id.0, e
+                );
             }
         }
-        
+
         // Mark as processed *after* comparison and cache storage attempt
         {
             let mut processed_set = processed_pairs_this_run_arc.lock().await;
             processed_set.insert(current_pair_ordered);
         }
-
 
         // Only create entity_group if it's a "MATCH" based on distance
         if comparison_outcome_for_cache == "MATCH" {
@@ -415,7 +483,11 @@ async fn process_batch(
             let (_, _, match_values_for_storage) = normalize_pair_for_storage(
                 e1_id_orig.clone(), // Use original IDs for correct lat/lon in match_values
                 e2_id_orig.clone(),
-                lat1, lon1, lat2, lon2, distance_meters
+                lat1,
+                lon1,
+                lat2,
+                lon2,
+                distance_meters,
             );
 
             // Prepare data for batch insertion (this was the role of process_single_pair)
@@ -435,7 +507,12 @@ async fn process_batch(
 
             // Create suggestion if confidence is low
             if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-                let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 };
+                let priority =
+                    if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+                        2
+                    } else {
+                        1
+                    };
                 let details_json = serde_json::json!({
                     "method_type": MatchMethodType::Geospatial.as_str(),
                     "distance_meters": distance_meters,
@@ -463,7 +540,9 @@ async fn process_batch(
             }
 
             // Log decision snapshot if features were generated
-            if let (Some(ro_arc_inner), Some(features_vec)) = (reinforcement_orchestrator_option, features_for_rl_snapshot) {
+            if let (Some(ro_arc_inner), Some(features_vec)) =
+                (reinforcement_orchestrator_option, features_for_rl_snapshot)
+            {
                 let orchestrator_guard = ro_arc_inner.lock().await;
                 let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
                 decision_snapshots_to_create_in_db.push((
@@ -493,12 +572,15 @@ async fn process_batch(
                     "Geospatial: Batch {}/{} - Successfully created {} entity groups in DB.",
                     batch_num, total_batches, created_count_from_db
                 );
-                 // Note: local_new_pairs_count is already incremented when preparing data.
-                 // created_count_from_db is the actual number inserted, could be less due to ON CONFLICT.
-                 // For accurate stats, we might need to reconcile, but local_new_pairs_count reflects attempts.
+                // Note: local_new_pairs_count is already incremented when preparing data.
+                // created_count_from_db is the actual number inserted, could be less due to ON CONFLICT.
+                // For accurate stats, we might need to reconcile, but local_new_pairs_count reflects attempts.
             }
             Err(e) => {
-                warn!("Geospatial: Batch {}/{} - DB creation failed: {}", batch_num, total_batches, e);
+                warn!(
+                    "Geospatial: Batch {}/{} - DB creation failed: {}",
+                    batch_num, total_batches, e
+                );
                 local_individual_operation_errors += 1; // Count as one batch error
             }
         }
@@ -532,7 +614,6 @@ async fn process_batch(
     Ok(())
 }
 
-
 /// Helper function to normalize pair order and create match values.
 /// Ensures entity_id_1 < entity_id_2 for the returned EntityId tuple.
 /// The MatchValues will store coordinates relative to the *original* e1_id, e2_id.
@@ -557,7 +638,7 @@ fn normalize_pair_for_storage(
     // If e1_id (original) is now ordered_e1_id, its coords are (lat1, lon1).
     // If e1_id (original) is now ordered_e2_id, its coords are (lat1, lon1), but they'll be stored as lat2/lon2 in MatchValues.
     // This ensures MatchValues always has coords for (item1, item2) where item1.id < item2.id.
-    
+
     let (mv_lat1, mv_lon1, mv_lat2, mv_lon2) = if e1_id.0 <= e2_id.0 {
         (lat1, lon1, lat2, lon2) // e1_id is item1, e2_id is item2
     } else {
@@ -573,7 +654,6 @@ fn normalize_pair_for_storage(
     });
     (ordered_e1_id, ordered_e2_id, match_values)
 }
-
 
 /// Fetches candidate pairs excluding those already in `public.entity_group` for 'geospatial' method.
 async fn fetch_candidate_pairs_excluding_existing(
@@ -670,7 +750,8 @@ async fn batch_extract_features(
     pool: &PgPool,
     pairs: &[(EntityId, EntityId)], // Expects already ordered pairs if relevant for cache
     _reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>, // Not directly used here, but implies RL context
-) -> Vec<Result<Vec<f64>>> { // Simpler return type based on usage
+) -> Vec<Result<Vec<f64>>> {
+    // Simpler return type based on usage
     let mut results = Vec::with_capacity(pairs.len());
     if pairs.is_empty() {
         return results;
@@ -692,20 +773,27 @@ async fn batch_extract_features(
             let e1_clone = e1_id.clone();
             let e2_clone = e2_id.clone();
             futures.push(tokio::spawn(async move {
-                MatchingOrchestrator::extract_pair_context_features(&pool_clone, &e1_clone, &e2_clone).await
+                MatchingOrchestrator::extract_pair_context_features(
+                    &pool_clone,
+                    &e1_clone,
+                    &e2_clone,
+                )
+                .await
             }));
         }
         let chunk_results = join_all(futures).await;
         for result in chunk_results {
             match result {
                 Ok(inner_result) => results.push(inner_result),
-                Err(e) => results.push(Err(anyhow::anyhow!("Task join error for feature extraction: {}", e))),
+                Err(e) => results.push(Err(anyhow::anyhow!(
+                    "Task join error for feature extraction: {}",
+                    e
+                ))),
             }
         }
     }
     results
 }
-
 
 // process_single_pair is effectively integrated into process_batch's main loop now.
 // The logic for preparing data for batch_create_entity_groups is inside process_batch.
@@ -716,95 +804,151 @@ async fn batch_create_entity_groups(
     pool: &PgPool,
     pairs_data: Vec<(EntityGroupId, EntityId, EntityId, MatchValues, f64, f64)>, // (group_id, e1, e2, match_values, final_conf, pre_rl_conf)
     suggestions_data: Vec<(
-        String,         // pipeline_run_id
-        String,         // action_type
-        String,         // group_id_1 (entity_group_id)
-        f64,            // triggering_confidence
+        String,            // pipeline_run_id
+        String,            // action_type
+        String,            // group_id_1 (entity_group_id)
+        f64,               // triggering_confidence
         serde_json::Value, // details
-        String,         // reason_code
-        String,         // reason_message
-        i32,            // priority
-        String,         // status
+        String,            // reason_code
+        String,            // reason_message
+        i32,               // priority
+        String,            // status
     )>,
     decision_snapshots_data: Vec<(
-        String,         // entity_group_id
-        String,         // pipeline_run_id
-        Vec<f64>,       // snapshotted_features (Vec<f64>)
-        f64,            // pre_rl_confidence_at_decision
-        f64,            // tuned_confidence_at_decision
-        i32,            // confidence_tuner_version_at_decision
+        String,   // entity_group_id
+        String,   // pipeline_run_id
+        Vec<f64>, // snapshotted_features (Vec<f64>)
+        f64,      // pre_rl_confidence_at_decision
+        f64,      // tuned_confidence_at_decision
+        i32,      // confidence_tuner_version_at_decision
     )>,
-) -> Result<usize> { // Returns number of successfully inserted entity groups
+) -> Result<usize> {
+    // Returns number of successfully inserted entity groups
     if pairs_data.is_empty() {
         return Ok(0);
     }
 
-    let mut conn = pool.get().await.context("Geospatial: DB conn for batch create")?;
-    let tx = conn.transaction().await.context("Geospatial: Start TX for batch create")?;
+    let mut conn = pool
+        .get()
+        .await
+        .context("Geospatial: DB conn for batch create")?;
+    let tx = conn
+        .transaction()
+        .await
+        .context("Geospatial: Start TX for batch create")?;
 
     // 1. Insert Entity Groups
-    let entity_group_stmt = tx.prepare(INSERT_ENTITY_GROUP_SQL).await
+    let entity_group_stmt = tx
+        .prepare(INSERT_ENTITY_GROUP_SQL)
+        .await
         .context("Geospatial: Prepare entity_group insert")?;
-    
+
     let mut successfully_inserted_group_ids = HashSet::new();
     for (group_id, e1_id, e2_id, match_values, final_conf, pre_rl_conf) in &pairs_data {
-        let match_values_json = serde_json::to_value(match_values)
-            .with_context(|| format!("Geospatial: Serialize match_values for group {}", group_id.0))?;
-        
-        let rows = tx.query(&entity_group_stmt, &[
-            &group_id.0, &e1_id.0, &e2_id.0, &MatchMethodType::Geospatial.as_str(),
-            &match_values_json, &final_conf, &pre_rl_conf,
-        ]).await.with_context(|| format!("Geospatial: Insert entity_group {}", group_id.0))?;
+        let match_values_json = serde_json::to_value(match_values).with_context(|| {
+            format!(
+                "Geospatial: Serialize match_values for group {}",
+                group_id.0
+            )
+        })?;
 
-        if !rows.is_empty() { // Check if RETURNING id produced a row
+        let rows = tx
+            .query(
+                &entity_group_stmt,
+                &[
+                    &group_id.0,
+                    &e1_id.0,
+                    &e2_id.0,
+                    &MatchMethodType::Geospatial.as_str(),
+                    &match_values_json,
+                    &final_conf,
+                    &pre_rl_conf,
+                ],
+            )
+            .await
+            .with_context(|| format!("Geospatial: Insert entity_group {}", group_id.0))?;
+
+        if !rows.is_empty() {
+            // Check if RETURNING id produced a row
             successfully_inserted_group_ids.insert(group_id.0.clone());
         }
     }
 
     // 2. Insert Suggestions (only for successfully created groups)
     if !suggestions_data.is_empty() {
-        let suggestion_stmt = tx.prepare(
-            "INSERT INTO clustering_metadata.suggested_actions (
+        let suggestion_stmt = tx
+            .prepare(
+                "INSERT INTO clustering_metadata.suggested_actions (
                 pipeline_run_id, action_type, group_id_1, triggering_confidence, details, 
                 reason_code, reason_message, priority, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
-        ).await.context("Geospatial: Prepare suggestion insert")?;
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .await
+            .context("Geospatial: Prepare suggestion insert")?;
 
-        for (pr_id, act_type, grp_id, trig_conf, details, r_code, r_msg, prio, status) in &suggestions_data {
+        for (pr_id, act_type, grp_id, trig_conf, details, r_code, r_msg, prio, status) in
+            &suggestions_data
+        {
             if successfully_inserted_group_ids.contains(grp_id) {
-                tx.execute(&suggestion_stmt, &[
-                    pr_id, act_type, grp_id, trig_conf, details, r_code, r_msg, prio, status,
-                ]).await.with_context(|| format!("Geospatial: Insert suggestion for group {}", grp_id))?;
+                tx.execute(
+                    &suggestion_stmt,
+                    &[
+                        pr_id, act_type, grp_id, trig_conf, details, r_code, r_msg, prio, status,
+                    ],
+                )
+                .await
+                .with_context(|| format!("Geospatial: Insert suggestion for group {}", grp_id))?;
             }
         }
     }
 
     // 3. Insert Decision Snapshots (only for successfully created groups)
     if !decision_snapshots_data.is_empty() {
-        let decision_stmt = tx.prepare(
-            "INSERT INTO clustering_metadata.match_decision_details (
+        let decision_stmt = tx
+            .prepare(
+                "INSERT INTO clustering_metadata.match_decision_details (
                 entity_group_id, pipeline_run_id, snapshotted_features, method_type_at_decision, 
                 pre_rl_confidence_at_decision, tuned_confidence_at_decision, 
                 confidence_tuner_version_at_decision
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)"
-        ).await.context("Geospatial: Prepare decision_details insert")?;
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .await
+            .context("Geospatial: Prepare decision_details insert")?;
 
-        for (grp_id, pr_id, features_vec, pre_rl, tuned_conf, tuner_ver) in &decision_snapshots_data {
+        for (grp_id, pr_id, features_vec, pre_rl, tuned_conf, tuner_ver) in &decision_snapshots_data
+        {
             if successfully_inserted_group_ids.contains(grp_id) {
-                let features_json = serde_json::to_value(features_vec)
-                    .with_context(|| format!("Geospatial: Serialize features for decision snapshot of group {}", grp_id))?;
-                tx.execute(&decision_stmt, &[
-                    grp_id, pr_id, &features_json, &MatchMethodType::Geospatial.as_str(),
-                    pre_rl, tuned_conf, tuner_ver,
-                ]).await.with_context(|| format!("Geospatial: Insert decision_details for group {}", grp_id))?;
+                let features_json = serde_json::to_value(features_vec).with_context(|| {
+                    format!(
+                        "Geospatial: Serialize features for decision snapshot of group {}",
+                        grp_id
+                    )
+                })?;
+                tx.execute(
+                    &decision_stmt,
+                    &[
+                        grp_id,
+                        pr_id,
+                        &features_json,
+                        &MatchMethodType::Geospatial.as_str(),
+                        pre_rl,
+                        tuned_conf,
+                        tuner_ver,
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!("Geospatial: Insert decision_details for group {}", grp_id)
+                })?;
             }
         }
     }
 
-    tx.commit().await.context("Geospatial: Commit batch create transaction")?;
+    tx.commit()
+        .await
+        .context("Geospatial: Commit batch create transaction")?;
     Ok(successfully_inserted_group_ids.len())
 }
-
 
 /// Helper function to fetch a set of valid entity IDs
 async fn fetch_valid_entity_ids(

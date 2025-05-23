@@ -1,6 +1,6 @@
 // src/matching/phone.rs
 use anyhow::{Context, Result};
-use chrono::{NaiveDateTime, Utc}; // Utc might be needed for pipeline_state_utils, NaiveDateTime for suggestions
+use chrono::{NaiveDateTime, Utc};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -143,17 +143,21 @@ pub async fn find_matches(
                             original_ext1,
                         )
                     };
-                
+
                 let current_pair_ordered = (e1_id.clone(), e2_id.clone());
 
-                if existing_entity_groups.contains(&current_pair_ordered) ||
-                   processed_pairs_this_run.contains(&current_pair_ordered) {
+                if existing_entity_groups.contains(&current_pair_ordered)
+                    || processed_pairs_this_run.contains(&current_pair_ordered)
+                {
                     debug!("Phone: Pair ({}, {}) already in entity_group or processed this run. Skipping.", e1_id.0, e2_id.0);
                     continue;
                 }
 
-                // --- INCREMENTAL PROCESSING LOGIC ---
-                let current_signatures_opt = match get_current_signatures_for_pair(pool, e1_id, e2_id).await {
+                let current_signatures_opt = match get_current_signatures_for_pair(
+                    pool, e1_id, e2_id,
+                )
+                .await
+                {
                     Ok(sigs) => sigs,
                     Err(e) => {
                         warn!("Phone: Failed to get signatures for pair ({}, {}): {}. Proceeding without cache.", e1_id.0, e2_id.0, e);
@@ -162,31 +166,49 @@ pub async fn find_matches(
                 };
 
                 if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
-                    match check_comparison_cache(pool, e1_id, e2_id, &sig1_data.signature, &sig2_data.signature, &MatchMethodType::Phone).await {
+                    match check_comparison_cache(
+                        pool,
+                        e1_id,
+                        e2_id,
+                        &sig1_data.signature,
+                        &sig2_data.signature,
+                        &MatchMethodType::Phone,
+                    )
+                    .await
+                    {
                         Ok(Some(cached_eval)) => {
                             cache_hits_count += 1;
-                            debug!("Phone: Cache HIT for pair ({}, {}). Result: {}, Score: {:?}", e1_id.0, e2_id.0, cached_eval.comparison_result, cached_eval.similarity_score);
+                            debug!(
+                                "Phone: Cache HIT for pair ({}, {}). Result: {}, Score: {:?}",
+                                e1_id.0,
+                                e2_id.0,
+                                cached_eval.comparison_result,
+                                cached_eval.similarity_score
+                            );
                             processed_pairs_this_run.insert(current_pair_ordered.clone());
-                            continue; 
+                            continue;
                         }
                         Ok(None) => {
-                             debug!("Phone: Cache MISS for pair ({}, {}). Signatures: ({}..., {}...). Proceeding.", e1_id.0, e2_id.0, &sig1_data.signature[..std::cmp::min(8, sig1_data.signature.len())], &sig2_data.signature[..std::cmp::min(8, sig2_data.signature.len())]);
+                            debug!("Phone: Cache MISS for pair ({}, {}). Signatures: ({}..., {}...). Proceeding.", e1_id.0, e2_id.0, &sig1_data.signature[..std::cmp::min(8, sig1_data.signature.len())], &sig2_data.signature[..std::cmp::min(8, sig2_data.signature.len())]);
                         }
                         Err(e) => {
                             warn!("Phone: Error checking comparison cache for pair ({}, {}): {}. Proceeding.", e1_id.0, e2_id.0, e);
                         }
                     }
                 }
-                // --- END INCREMENTAL PROCESSING LOGIC ---
 
-                let base_confidence = if e1_orig_ext == e2_orig_ext { 0.95 } else { 0.85 };
+                let base_confidence = if e1_orig_ext == e2_orig_ext {
+                    0.95
+                } else {
+                    0.85
+                };
                 let pre_rl_confidence = base_confidence;
                 let mut final_confidence_score = base_confidence;
                 let mut features_for_rl_snapshot: Option<Vec<f64>> = None;
                 let mut features_json_for_cache: Option<serde_json::Value> = None;
 
                 if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
-                    match if let Some(cache_service) = feature_cache.as_ref() {
+                    match if let Some(_cache_service) = feature_cache.as_ref() { // Renamed parameter to _cache_service to mark it as intentionally unused for now
                         // Assuming get_pair_features uses the cache_service internally
                         let orchestrator_guard = ro_arc.lock().await;
                         orchestrator_guard.get_pair_features(pool, e1_id, e2_id).await
@@ -214,23 +236,32 @@ pub async fn find_matches(
                         Err(e) => warn!("Phone: Feature extraction failed for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
                     }
                 }
-                
+
                 // For phone, a "MATCH" is if normalized numbers are the same. Confidence varies.
                 let comparison_outcome_for_cache = "MATCH"; // Since they share a normalized_shared_phone
 
                 if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
                     if let Err(e) = store_in_comparison_cache(
-                        pool, e1_id, e2_id,
-                        &sig1_data.signature, &sig2_data.signature,
-                        &MatchMethodType::Phone, pipeline_run_id,
-                        comparison_outcome_for_cache, Some(final_confidence_score),
+                        pool,
+                        e1_id,
+                        e2_id,
+                        &sig1_data.signature,
+                        &sig2_data.signature,
+                        &MatchMethodType::Phone,
+                        pipeline_run_id,
+                        comparison_outcome_for_cache,
+                        Some(final_confidence_score),
                         features_json_for_cache.as_ref(),
-                    ).await {
-                        warn!("Phone: Failed to store in comparison_cache for ({}, {}): {}", e1_id.0, e2_id.0, e);
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Phone: Failed to store in comparison_cache for ({}, {}): {}",
+                            e1_id.0, e2_id.0, e
+                        );
                     }
                 }
                 processed_pairs_this_run.insert(current_pair_ordered.clone());
-
 
                 // Only create entity_group if confidence is high enough (or whatever criteria for phone)
                 // The original code created an entity_group if they shared a normalized phone.
@@ -256,9 +287,7 @@ pub async fn find_matches(
                     pipeline_run_id,
                     &normalized_shared_phone, // For suggestion details
                     features_for_rl_snapshot, // Pass Option<Vec<f64>>
-                    feature_cache.clone(), 
-                )
-                .await
+                ).await // Removed feature_cache.clone() from here as it's not used
                 {
                     Ok(created) => {
                         if created {
@@ -279,20 +308,29 @@ pub async fn find_matches(
     }
 
     if individual_operation_errors > 0 {
-        warn!("Phone: {} errors during individual pair operations.", individual_operation_errors);
+        warn!(
+            "Phone: {} errors during individual pair operations.",
+            individual_operation_errors
+        );
     }
     info!("Phone: Cache hits during this run: {}", cache_hits_count);
 
     let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
         confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     let method_stats = MatchMethodStats {
         method_type: MatchMethodType::Phone,
         groups_created: new_pairs_created_count,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 { 2.0 } else { 0.0 },
+        avg_group_size: if new_pairs_created_count > 0 {
+            2.0
+        } else {
+            0.0
+        },
     };
 
     info!(
@@ -316,7 +354,7 @@ async fn create_entity_group_entry(
     pool: &PgPool,
     // These are expected to be pre-ordered by the caller (find_matches)
     // but the function will re-verify and adjust MatchValues if necessary.
-    entity_id_1_param: &EntityId, 
+    entity_id_1_param: &EntityId,
     entity_id_2_param: &EntityId,
     match_values_param: &MatchValues, // MatchValues corresponding to (entity_id_1_param, entity_id_2_param)
     final_confidence_score: f64,
@@ -324,18 +362,29 @@ async fn create_entity_group_entry(
     reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>, // Changed to Option<&Arc<Mutex<...>>>
     pipeline_run_id: &str,
     normalized_shared_phone_for_suggestion: &str, // For suggestion details
-    features_for_rl_snapshot: Option<Vec<f64>>, // Option<Vec<f64>>
-    _feature_cache: Option<SharedFeatureCache>, // Mark as unused if not directly used for now
-) -> Result<bool> { // Returns true if a new group was created
-    let mut conn = pool.get().await.context("Phone: DB conn for entity group")?;
-    let tx = conn.transaction().await.context("Phone: Start TX for entity group")?;
+    features_for_rl_snapshot: Option<Vec<f64>>,   // Option<Vec<f64>>
+                                                  // _feature_cache: Option<SharedFeatureCache>, // Removed as it was unused and created a lint warning
+) -> Result<bool> {
+    // Returns true if a new group was created
+    let mut conn = pool
+        .get()
+        .await
+        .context("Phone: DB conn for entity group")?;
+    let tx = conn
+        .transaction()
+        .await
+        .context("Phone: Start TX for entity group")?;
 
     let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
 
     // Ensure entity_id_1 < entity_id_2 for DB insertion
-    let (ordered_id_1, ordered_id_2, final_match_values_for_db) = 
+    let (ordered_id_1, ordered_id_2, final_match_values_for_db) =
         if entity_id_1_param.0 <= entity_id_2_param.0 {
-            (entity_id_1_param, entity_id_2_param, match_values_param.clone())
+            (
+                entity_id_1_param,
+                entity_id_2_param,
+                match_values_param.clone(),
+            )
         } else {
             // Swap IDs
             let temp_id1 = entity_id_2_param;
@@ -354,34 +403,47 @@ async fn create_entity_group_entry(
             };
             (temp_id1, temp_id2, reordered_mv)
         };
-    
+
     let match_values_json = serde_json::to_value(&final_match_values_for_db)
         .context("Phone: Failed to serialize final_match_values_for_db")?;
 
-    let inserted_group_rows = tx.query(
-        INSERT_ENTITY_GROUP_SQL,
-        &[
-            &new_entity_group_id.0,
-            &ordered_id_1.0,
-            &ordered_id_2.0,
-            &MatchMethodType::Phone.as_str(),
-            &match_values_json,
-            &final_confidence_score,
-            &pre_rl_confidence_score,
-        ],
-    ).await.context("Phone: Insert entity_group failed")?;
+    let inserted_group_rows = tx
+        .query(
+            INSERT_ENTITY_GROUP_SQL,
+            &[
+                &new_entity_group_id.0,
+                &ordered_id_1.0,
+                &ordered_id_2.0,
+                &MatchMethodType::Phone.as_str(),
+                &match_values_json,
+                &final_confidence_score,
+                &pre_rl_confidence_score,
+            ],
+        )
+        .await
+        .context("Phone: Insert entity_group failed")?;
 
     if !inserted_group_rows.is_empty() {
         // Successfully inserted a new group
         if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-            let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 };
-            
-            // Extract original phones and extensions from final_match_values_for_db for suggestion
-            let (sugg_orig_phone1, sugg_orig_phone2, sugg_ext1, sugg_ext2) = 
-                if let MatchValues::Phone(ref pv) = final_match_values_for_db {
-                    (pv.original_phone1.clone(), pv.original_phone2.clone(), pv.extension1.clone(), pv.extension2.clone())
-                } else { (String::new(), String::new(), None, None) };
+            let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+                2
+            } else {
+                1
+            };
 
+            // Extract original phones and extensions from final_match_values_for_db for suggestion
+            let (sugg_orig_phone1, sugg_orig_phone2, sugg_ext1, sugg_ext2) =
+                if let MatchValues::Phone(ref pv) = final_match_values_for_db {
+                    (
+                        pv.original_phone1.clone(),
+                        pv.original_phone2.clone(),
+                        pv.extension1.clone(),
+                        pv.extension2.clone(),
+                    )
+                } else {
+                    (String::new(), String::new(), None, None)
+                };
 
             let details_json = serde_json::json!({
                 "method_type": MatchMethodType::Phone.as_str(),
@@ -403,46 +465,69 @@ async fn create_entity_group_entry(
                 action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
                 entity_id: None,
                 group_id_1: Some(new_entity_group_id.0.clone()),
-                group_id_2: None, cluster_id: None,
+                group_id_2: None,
+                cluster_id: None,
                 triggering_confidence: Some(final_confidence_score),
                 details: Some(details_json),
                 reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
                 reason_message: Some(reason_message),
-                priority, status: SuggestionStatus::PendingReview.as_str().to_string(),
-                reviewer_id: None, reviewed_at: None, review_notes: None,
+                priority,
+                status: SuggestionStatus::PendingReview.as_str().to_string(),
+                reviewer_id: None,
+                reviewed_at: None,
+                review_notes: None,
             };
-            // Use crate::db::insert_suggestion or direct SQL within tx
-            crate::db::insert_suggestion(&tx, &suggestion).await.context("Phone: Insert suggestion failed")?;
+            // Pass pool directly to db::insert_suggestion, as it manages its own transaction.
+            crate::db::insert_suggestion(&pool, &suggestion)
+                .await
+                .context("Phone: Insert suggestion failed")?;
         }
 
-        if let (Some(ro_arc), Some(features_vec)) = (reinforcement_orchestrator_option, features_for_rl_snapshot) {
+        if let (Some(ro_arc), Some(features_vec)) =
+            (reinforcement_orchestrator_option, features_for_rl_snapshot)
+        {
             let orchestrator_guard = ro_arc.lock().await; // Correctly lock the Arc<Mutex<...>>
             let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
-            let snapshot_features_json = serde_json::to_value(&features_vec).unwrap_or(serde_json::Value::Null);
+            let snapshot_features_json =
+                serde_json::to_value(&features_vec).unwrap_or(serde_json::Value::Null);
             const INSERT_DECISION_SQL: &str = "
                 INSERT INTO clustering_metadata.match_decision_details (
                     entity_group_id, pipeline_run_id, snapshotted_features,
                     method_type_at_decision, pre_rl_confidence_at_decision,
                     tuned_confidence_at_decision, confidence_tuner_version_at_decision
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)";
-            tx.execute(INSERT_DECISION_SQL, &[
-                &new_entity_group_id.0, &pipeline_run_id, &snapshot_features_json,
-                &MatchMethodType::Phone.as_str(), &pre_rl_confidence_score,
-                &final_confidence_score, &(confidence_tuner_ver as i32),
-            ]).await.context("Phone: Log decision snapshot failed")?;
+            tx.execute(
+                INSERT_DECISION_SQL,
+                &[
+                    &new_entity_group_id.0,
+                    &pipeline_run_id,
+                    &snapshot_features_json,
+                    &MatchMethodType::Phone.as_str(),
+                    &pre_rl_confidence_score,
+                    &final_confidence_score,
+                    &(confidence_tuner_ver as i32),
+                ],
+            )
+            .await
+            .context("Phone: Log decision snapshot failed")?;
         }
-        tx.commit().await.context("Phone: Commit TX for entity group")?;
+        tx.commit()
+            .await
+            .context("Phone: Commit TX for entity group")?;
         Ok(true) // New group was created
     } else {
         // No rows affected, means ON CONFLICT DO NOTHING happened or some other issue.
-        tx.rollback().await.context("Phone: Rollback TX due to no insert")?; // Rollback if no insert
+        tx.rollback()
+            .await
+            .context("Phone: Rollback TX due to no insert")?; // Rollback if no insert
         debug!("Phone: No new entity group created for pair ({}, {}), likely due to existing conflict.", ordered_id_1.0, ordered_id_2.0);
         Ok(false) // No new group was created
     }
 }
 
 /// Fetch existing phone-matched pairs from public.entity_group
-async fn fetch_existing_entity_groups( // Renamed for clarity
+async fn fetch_existing_entity_groups(
+    // Renamed for clarity
     conn: &impl tokio_postgres::GenericClient,
 ) -> Result<HashSet<(EntityId, EntityId)>> {
     let query = "SELECT entity_id_1, entity_id_2 FROM public.entity_group WHERE method_type = $1";
@@ -471,9 +556,13 @@ pub fn normalize_phone(phone: &str) -> String {
     if digits_only.len() == 11 && digits_only.starts_with('1') {
         return digits_only[1..].to_string();
     }
-    if (7..=15).contains(&digits_only.len()) { // More idiomatic range check
+    if (7..=15).contains(&digits_only.len()) {
+        // More idiomatic range check
         return digits_only;
     }
-    debug!("Phone number '{}' normalized to '{}', considered invalid for matching.", phone, digits_only);
+    debug!(
+        "Phone number '{}' normalized to '{}', considered invalid for matching.",
+        phone, digits_only
+    );
     String::new()
 }
