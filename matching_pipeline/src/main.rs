@@ -188,7 +188,7 @@ async fn run_pipeline(
                 e
             ),
         }
-        let max_pairs = 5000;
+        let max_pairs = 100;
         match prewarm_pair_features_cache(pool, &entity_feature_cache, max_pairs).await {
             Ok(pairs_count) => info!(
                 "Successfully pre-warmed pair features cache for {} likely entity pairs.",
@@ -201,38 +201,36 @@ async fn run_pipeline(
         }
     } else {
         info!("Skipping entity context feature extraction and cache pre-warming as no entities were identified.");
-        //
     }
-    let phase2_duration = phase2_start.elapsed(); //
-                                                  // Updated key for clarity
+    let phase2_duration = phase2_start.elapsed();
     phase_times.insert(
         "entity_context_feature_extraction_and_prewarming".to_string(),
         phase2_duration,
     );
-    stats.context_feature_extraction_time = phase2_duration.as_secs_f64(); //
+    stats.context_feature_extraction_time = phase2_duration.as_secs_f64();
     info!(
         "Entity Context Feature Extraction and Cache Pre-warming complete in {:.2?}. Phase 2 complete.",
         phase2_duration
-    ); //
-    info!("Pipeline progress: [2/8] phases (25%)"); //
+    );
+    info!("Pipeline progress: [2/8] phases (25%)");
 
     // Now initialize the ML reinforcement_orchestrator
-    info!("Initializing ML-guided matching reinforcement_orchestrator"); //
-    let reinforcement_orchestrator_instance = MatchingOrchestrator::new(pool) //
+    info!("Initializing ML-guided matching reinforcement_orchestrator");
+    let reinforcement_orchestrator_instance = MatchingOrchestrator::new(pool)
         .await
-        .context("Failed to initialize ML reinforcement_orchestrator")?; //
-    let reinforcement_orchestrator = Arc::new(Mutex::new(reinforcement_orchestrator_instance)); //
+        .context("Failed to initialize ML reinforcement_orchestrator")?;
+    let reinforcement_orchestrator = Arc::new(Mutex::new(reinforcement_orchestrator_instance));
 
     // Set the *pre-warmed* feature cache on the orchestrator
     {
-        let mut orchestrator = reinforcement_orchestrator.lock().await; //
+        let mut orchestrator = reinforcement_orchestrator.lock().await;
         orchestrator.set_feature_cache(entity_feature_cache.clone()); // Use the cache we just pre-warmed
-        info!("Pre-warmed entity feature cache attached to RL orchestrator"); //
+        info!("Pre-warmed entity feature cache attached to RL orchestrator");
     }
 
     // Phase 3: Entity matching
-    info!("Phase 3: Entity matching"); //
-    let phase3_start = Instant::now(); //
+    info!("Phase 3: Entity matching");
+    let phase3_start = Instant::now();
     let (total_groups, method_stats_match) = run_matching_pipeline(
         pool,
         reinforcement_orchestrator.clone(), // This orchestrator instance now holds the pre-warmed cache
@@ -240,15 +238,15 @@ async fn run_pipeline(
         entity_feature_cache.clone(),       // Pass the pre-warmed entity_feature_cache
     )
     .await?;
-    stats.total_groups = total_groups; //
-    stats.method_stats.extend(method_stats_match); //
-    let phase3_duration = phase3_start.elapsed(); //
-    phase_times.insert("entity_matching".to_string(), phase3_duration); //
-    stats.matching_time = phase3_duration.as_secs_f64(); //
+    stats.total_groups = total_groups;
+    stats.method_stats.extend(method_stats_match);
+    let phase3_duration = phase3_start.elapsed();
+    phase_times.insert("entity_matching".to_string(), phase3_duration);
+    stats.matching_time = phase3_duration.as_secs_f64();
     info!(
         "Created {} entity groups in {:.2?}. Phase 3 complete.",
         stats.total_groups, phase3_duration
-    ); //
+    );
     info!("Pipeline progress: [3/8] phases (37.5%)");
 
     // Phase 4: Cluster consolidation
@@ -265,22 +263,33 @@ async fn run_pipeline(
     );
     info!("Pipeline progress: [4/8] phases (50%)");
 
-    // PHASE 5: Visualization edge calculation
-    info!("Phase 5: Calculating entity relationship edges for cluster visualization");
-    let phase5_start = Instant::now();
-    cluster_visualization::ensure_visualization_tables_exist(pool).await?;
-    stats.total_visualization_edges =
-        cluster_visualization::calculate_visualization_edges(pool, &run_id_clone).await?;
-    let phase5_duration = phase5_start.elapsed();
-    phase_times.insert(
-        "visualization_edge_calculation".to_string(),
-        phase5_duration,
-    );
-    stats.visualization_edge_calculation_time = phase5_duration.as_secs_f64();
-    info!(
-        "Calculated {} entity relationship edges for visualization in {:.2?}. Phase 5 complete.",
-        stats.total_visualization_edges, phase5_duration
-    );
+    // Check for cluster changes AND existing visualization data
+    let clusters_changed = stats.total_clusters > 0;
+    let existing_viz_edges =
+        cluster_visualization::visualization_edges_exist(pool, &run_id_clone).await?;
+
+    if clusters_changed || !existing_viz_edges {
+        // PHASE 5: Visualization edge calculation
+        info!("Phase 5: Calculating entity relationship edges for cluster visualization");
+        let phase5_start = Instant::now();
+        cluster_visualization::ensure_visualization_tables_exist(pool).await?;
+        stats.total_visualization_edges =
+            cluster_visualization::calculate_visualization_edges(pool, &run_id_clone).await?;
+        let phase5_duration = phase5_start.elapsed();
+        phase_times.insert(
+            "visualization_edge_calculation".to_string(),
+            phase5_duration,
+        );
+        stats.visualization_edge_calculation_time = phase5_duration.as_secs_f64();
+        info!(
+            "Calculated {} entity relationship edges for visualization in {:.2?}. Phase 5 complete.",
+            stats.total_visualization_edges, phase5_duration
+        );
+    } else {
+        info!("No new clusters formed or existing clusters merged in Phase 4, and visualization edges already exist for this run. Skipping Phase 5 (Visualization Edge Calculation).");
+        stats.total_visualization_edges = 0; // Explicitly set to 0 as it's skipped
+        stats.visualization_edge_calculation_time = 0.0; // Explicitly set to 0
+    }
     info!("Pipeline progress: [5/8] phases (62.5%)");
 
     info!("Initializing service RL orchestrator");
@@ -307,7 +316,7 @@ async fn run_pipeline(
             .await?;
 
     // Pre-warm service pair features cache
-    let max_service_pairs = 5000;
+    let max_service_pairs = 100;
     match prewarm_service_pair_features_cache(pool, &service_feature_cache, max_service_pairs).await {
         Ok(pairs_count) => info!(
             "Successfully pre-warmed service pair features cache for {} likely service pairs.",
@@ -385,21 +394,50 @@ async fn run_pipeline(
     );
     info!("Pipeline progress: [6/8] phases (75%)");
 
-    // Phase 7: Service Clustering - now we can use the same service_orchestrator
     info!("Phase 7: Service cluster consolidation");
     let phase7_start = Instant::now();
-    stats.total_service_clusters = service_consolidate_clusters::process_clusters(
+
+    // Ensure consolidation tables exist before processing
+    service_consolidate_clusters::ensure_consolidation_tables_exist(pool)
+        .await
+        .context("Failed to ensure consolidation tables exist")?;
+
+    // Custom config with performance optimizations
+    let consolidation_config = service_consolidate_clusters::ConsolidationConfig {
+        similarity_threshold: 0.5, // Lower threshold for more broad clustering
+        embedding_batch_size: 200,  // Larger batches if memory allows
+        db_batch_size: 100,         // Larger DB batches for I/O efficiency
+        max_cache_size: 15000,      // Larger cache for better hit rates
+        min_cluster_size: 3,        // Only consolidate clusters with 3+ services
+        embedding_cache_duration_secs: 3600, // Explicitly set or use default (adjust as needed)
+    };
+
+    match service_consolidate_clusters::consolidate_service_clusters(
         pool,
-        Some(&service_orchestrator),
         &run_id_clone,
+        Some(consolidation_config),
     )
-    .await?;
+    .await
+    {
+        Ok(merged_clusters) => {
+            stats.total_service_clusters = merged_clusters;
+            info!(
+                "Successfully consolidated {} service cluster pairs",
+                merged_clusters
+            );
+        }
+        Err(e) => {
+            warn!("Service cluster consolidation encountered an error: {}. Continuing with existing clusters.", e);
+            stats.total_service_clusters = 0; // Or fetch current cluster count
+        }
+    }
+
     let phase7_duration = phase7_start.elapsed();
     phase_times.insert("service_clustering".to_string(), phase7_duration);
     stats.service_clustering_time = phase7_duration.as_secs_f64();
     info!(
-        "Formed {} service clusters in {:.2?}. Phase 7 complete.",
-        stats.total_service_clusters, phase7_duration
+        "Service cluster consolidation phase completed in {:.2?}. Phase 7 complete.",
+        phase7_duration
     );
     info!("Pipeline progress: [7/8] phases (87%)");
 
@@ -777,10 +815,9 @@ async fn consolidate_clusters_helper(
     };
 
     // Call the actual implementation
-    let clusters_created =
-        consolidate_clusters::process_clusters(pool, &run_id)
-            .await
-            .context("Failed to process clusters")?;
+    let clusters_created = consolidate_clusters::process_clusters(pool, &run_id)
+        .await
+        .context("Failed to process clusters")?;
 
     Ok(clusters_created)
 }
@@ -794,18 +831,18 @@ async fn run_service_matching_pipeline(
     info!("Starting cluster-scoped service matching pipeline...");
     let start_time = Instant::now();
 
-    // 1. Get all cluster IDs
+    // 1. Get all cluster IDs - FIXED: Changed from group_cluster to entity_group_cluster
     let conn = pool
         .get()
         .await
         .context("Failed to get DB connection for clusters")?;
     let cluster_rows = conn
         .query(
-            "SELECT id FROM public.group_cluster WHERE id IS NOT NULL",
+            "SELECT id FROM public.entity_group_cluster WHERE id IS NOT NULL",
             &[],
-        ) // Ensure id is not null
+        )
         .await
-        .context("Failed to query group_cluster IDs")?;
+        .context("Failed to query entity_group_cluster IDs")?;
 
     let cluster_ids: Vec<String> = cluster_rows.into_iter().map(|row| row.get("id")).collect();
 
