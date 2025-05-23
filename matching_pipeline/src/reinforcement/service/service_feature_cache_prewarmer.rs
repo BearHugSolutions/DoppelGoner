@@ -21,7 +21,7 @@ use crate::reinforcement::service::service_feature_extraction::{
 };
 
 // Maximum batch size to process at once
-const MAX_BATCH_SIZE: usize = 50;
+const MAX_BATCH_SIZE: usize = 20;
 
 // Calculate number of batches based on CPU cores
 fn calculate_batch_size(pair_count: usize) -> usize {
