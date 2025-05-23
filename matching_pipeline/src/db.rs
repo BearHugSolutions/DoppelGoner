@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use chrono::NaiveDateTime; // For human_feedback table
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use postgres_types::ToSql;
 use std::time::Duration;
 use tokio_postgres::{Config, GenericClient, NoTls, Row as PgRow};
@@ -12,12 +12,10 @@ use uuid::Uuid;
 
 // Assuming these structs are defined in your main models.rs or a shared location.
 // If not, they would need to be defined or imported appropriately.
-use crate::models::{
-    EntityId, // Assuming EntityId is defined in models
-    NewClusterFormationEdge,
-    NewSuggestedAction,
+use crate::{models::{
+    EntityId, MatchValues, NewClusterFormationEdge, NewSuggestedAction, ServiceId
     // Add other necessary model imports here
-};
+}, MatchMethodType};
 // For RL specific data structures that might be passed to/from these DB functions.
 // We'll define simple structs here for clarity if they aren't part of the main models.
 
@@ -40,6 +38,7 @@ pub struct NewHumanFeedback<'a> {
     pub reviewer_id: &'a str,
     pub is_match_correct: bool,
     pub notes: Option<&'a str>,
+    match_decision_id: &'a str,
     // feedback_timestamp is defaulted by DB
 }
 
@@ -176,10 +175,17 @@ pub async fn create_initial_pipeline_run(
     Ok(())
 }
 
-pub async fn insert_suggestion(
-    conn: &impl GenericClient,
-    suggestion: &NewSuggestedAction,
-) -> Result<Uuid> {
+// Modified to take PgPool directly for independent transaction management
+pub async fn insert_suggestion(pool: &PgPool, suggestion: &NewSuggestedAction) -> Result<Uuid> {
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for insert_suggestion")?;
+    let transaction = conn
+        .transaction()
+        .await
+        .context("Failed to start transaction for insert_suggestion")?;
+
     const INSERT_SUGGESTION_SQL: &str = "
         INSERT INTO clustering_metadata.suggested_actions (
             pipeline_run_id, action_type, entity_id, group_id_1, group_id_2, cluster_id,
@@ -187,7 +193,7 @@ pub async fn insert_suggestion(
             reviewer_id, reviewed_at, review_notes
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         RETURNING id";
-    let row = conn
+    let row = transaction
         .query_one(
             INSERT_SUGGESTION_SQL,
             &[
@@ -211,12 +217,13 @@ pub async fn insert_suggestion(
         .await
         .context("Failed to insert suggested_action")?;
 
-    // Get the ID as a string first
     let id_str: String = row.get(0);
-
-    // Parse the string into a Uuid
     let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
 
+    transaction
+        .commit()
+        .await
+        .context("Failed to commit transaction for insert_suggestion")?;
     Ok(id)
 }
 
@@ -247,17 +254,27 @@ pub async fn update_suggestion_review(
     .context("Failed to update suggested_action review")
 }
 
+// Modified to take PgPool directly for independent transaction management
 pub async fn insert_cluster_formation_edge(
-    conn: &impl GenericClient,
+    pool: &PgPool,
     edge: &NewClusterFormationEdge,
 ) -> Result<Uuid> {
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for insert_cluster_formation_edge")?;
+    let transaction = conn
+        .transaction()
+        .await
+        .context("Failed to start transaction for insert_cluster_formation_edge")?;
+
     const INSERT_EDGE_SQL: &str = "
         INSERT INTO clustering_metadata.cluster_formation_edges (
             pipeline_run_id, source_group_id, target_group_id,
             calculated_edge_weight, contributing_shared_entities
         ) VALUES ($1, $2, $3, $4, $5)
         RETURNING id";
-    let row = conn
+    let row = transaction
         .query_one(
             INSERT_EDGE_SQL,
             &[
@@ -271,12 +288,13 @@ pub async fn insert_cluster_formation_edge(
         .await
         .context("Failed to insert cluster_formation_edge")?;
 
-    // Get the ID as a string first
     let id_str: String = row.get(0);
-
-    // Parse the string into a Uuid
     let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
 
+    transaction
+        .commit()
+        .await
+        .context("Failed to commit transaction for insert_cluster_formation_edge")?;
     Ok(id)
 }
 
@@ -348,7 +366,7 @@ pub async fn insert_match_decision_detail(
                 if rows.is_empty() {
                     let _ = tx.rollback().await;
                     return Err(anyhow::anyhow!(
-                    "Failed to verify entity_group_id {} exists: no rows returned from COUNT query", 
+                    "Failed to verify entity_group_id {} exists: no rows returned from COUNT query",
                     entity_group_id
                 ));
                 }
@@ -409,7 +427,7 @@ pub async fn insert_match_decision_detail(
                     // Exhausted all retries
                     let _ = tx.rollback().await;
                     return Err(anyhow::anyhow!(
-                    "Database error while verifying entity_group_id {} exists after {} retries: {}", 
+                    "Database error while verifying entity_group_id {} exists after {} retries: {}",
                     entity_group_id,
                     max_retries,
                     last_error.unwrap()
@@ -581,42 +599,56 @@ pub async fn mark_human_feedback_as_processed(
 }
 
 /// Batch insert cluster formation edges for better performance
+// Modified to take PgPool directly for independent transaction management
 pub async fn insert_cluster_formation_edges_batch(
-    conn: &impl GenericClient,
+    pool: &PgPool,
     edges: &[NewClusterFormationEdge],
 ) -> Result<Vec<Uuid>> {
     if edges.is_empty() {
         return Ok(Vec::new());
     }
 
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for batch insert")?;
+    let transaction = conn
+        .transaction()
+        .await
+        .context("Failed to start transaction for batch insert")?;
+
     let mut query = String::from(
         "INSERT INTO clustering_metadata.cluster_formation_edges (
             pipeline_run_id, source_group_id, target_group_id,
             calculated_edge_weight, contributing_shared_entities
-        ) VALUES "
+        ) VALUES ",
     );
 
     let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
     let mut param_groups = Vec::new();
-    
+
     for (i, edge) in edges.iter().enumerate() {
         let base_idx = i * 5;
         param_groups.push(format!(
             "(${}, ${}, ${}, ${}, ${})",
-            base_idx + 1, base_idx + 2, base_idx + 3, base_idx + 4, base_idx + 5
+            base_idx + 1,
+            base_idx + 2,
+            base_idx + 3,
+            base_idx + 4,
+            base_idx + 5
         ));
-        
+
         params.push(&edge.pipeline_run_id);
         params.push(&edge.source_group_id);
         params.push(&edge.target_group_id);
         params.push(&edge.calculated_edge_weight);
         params.push(&edge.contributing_shared_entities);
     }
-    
+
     query.push_str(&param_groups.join(", "));
     query.push_str(" RETURNING id");
 
-    let rows = conn
+    let rows = transaction
         .query(&query, &params[..])
         .await
         .context("Failed to batch insert cluster_formation_edges")?;
@@ -624,43 +656,68 @@ pub async fn insert_cluster_formation_edges_batch(
     let mut ids = Vec::with_capacity(rows.len());
     for row in rows {
         let id_str: String = row.get(0);
-        let id = Uuid::parse_str(&id_str)
-            .context("Failed to parse returned ID string as UUID")?;
+        let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
         ids.push(id);
     }
+    transaction
+        .commit()
+        .await
+        .context("Failed to commit transaction for batch insert")?;
 
     Ok(ids)
 }
 
 /// Batch insert suggestions for better performance
+// Modified to take PgPool directly for independent transaction management
 pub async fn insert_suggestions_batch(
-    conn: &impl GenericClient,
+    pool: &PgPool,
     suggestions: &[NewSuggestedAction],
 ) -> Result<Vec<Uuid>> {
     if suggestions.is_empty() {
         return Ok(Vec::new());
     }
 
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for batch insert suggestions")?;
+    let transaction = conn
+        .transaction()
+        .await
+        .context("Failed to start transaction for batch insert suggestions")?;
+
     let mut query = String::from(
         "INSERT INTO clustering_metadata.suggested_actions (
             pipeline_run_id, action_type, entity_id, group_id_1, group_id_2, cluster_id,
             triggering_confidence, details, reason_code, reason_message, priority, status,
             reviewer_id, reviewed_at, review_notes
-        ) VALUES "
+        ) VALUES ",
     );
 
     let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
     let mut param_groups = Vec::new();
-    
+
     for (i, suggestion) in suggestions.iter().enumerate() {
         let base_idx = i * 15;
         param_groups.push(format!(
             "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-            base_idx + 1, base_idx + 2, base_idx + 3, base_idx + 4, base_idx + 5,
-            base_idx + 6, base_idx + 7, base_idx + 8, base_idx + 9, base_idx + 10,
-            base_idx + 11, base_idx + 12, base_idx + 13, base_idx + 14, base_idx + 15
+            base_idx + 1,
+            base_idx + 2,
+            base_idx + 3,
+            base_idx + 4,
+            base_idx + 5,
+            base_idx + 6,
+            base_idx + 7,
+            base_idx + 8,
+            base_idx + 9,
+            base_idx + 10,
+            base_idx + 11,
+            base_idx + 12,
+            base_idx + 13,
+            base_idx + 14,
+            base_idx + 15
         ));
-        
+
         params.push(&suggestion.pipeline_run_id);
         params.push(&suggestion.action_type);
         params.push(&suggestion.entity_id);
@@ -677,11 +734,11 @@ pub async fn insert_suggestions_batch(
         params.push(&suggestion.reviewed_at);
         params.push(&suggestion.review_notes);
     }
-    
+
     query.push_str(&param_groups.join(", "));
     query.push_str(" RETURNING id");
 
-    let rows = conn
+    let rows = transaction
         .query(&query, &params[..])
         .await
         .context("Failed to batch insert suggested_actions")?;
@@ -689,15 +746,131 @@ pub async fn insert_suggestions_batch(
     let mut ids = Vec::with_capacity(rows.len());
     for row in rows {
         let id_str: String = row.get(0);
-        let id = Uuid::parse_str(&id_str)
-            .context("Failed to parse returned ID string as UUID")?;
+        let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
         ids.push(id);
     }
+    transaction
+        .commit()
+        .await
+        .context("Failed to commit transaction for batch insert suggestions")?;
 
     Ok(ids)
 }
 
-// The old `fetch_recent_feedback_items` that used `FeedbackItem` and `view_rl_feedback_items`
-// is now replaced by `fetch_unprocessed_human_feedback` which uses the new tables and a simpler struct.
+// Make this function visible within the service_matching module
+pub async fn insert_service_group(
+    pool: &PgPool,
+    id: &str,
+    service_id_1: &ServiceId,
+    service_id_2: &ServiceId,
+    confidence_score: f64,
+    pre_rl_confidence_score: f64,
+    method_type: MatchMethodType,
+    match_values: MatchValues,
+) -> Result<()> {
+    let conn = pool
+        .get()
+        .await
+        .context("Failed to get database connection for insert_service_group")?;
+    
+    let (s1, s2) = if service_id_1.0 < service_id_2.0 {
+        (service_id_1, service_id_2)
+    } else {
+        (service_id_2, service_id_1)
+    };
+    
+    let match_values_json =
+        serde_json::to_value(match_values).context("Failed to serialize match values")?;
+
+    // Ensure UUIDs are properly formatted (36 characters)
+    let s1_formatted = format!("{}", s1.0.trim());
+    let s2_formatted = format!("{}", s2.0.trim());
+    
+    // Validate UUID format
+    if s1_formatted.len() != 36 || s2_formatted.len() != 36 {
+        return Err(anyhow::anyhow!(
+            "Invalid service ID format: s1='{}' (len={}), s2='{}' (len={})", 
+            s1_formatted, s1_formatted.len(), s2_formatted, s2_formatted.len()
+        ));
+    }
+
+    // First, check if a group already exists for this service pair and method
+    let existing_row = conn.query_opt(
+        "SELECT id, confirmed_status FROM public.service_group 
+         WHERE service_id_1 = $1 AND service_id_2 = $2 AND method_type = $3",
+        &[&s1_formatted, &s2_formatted, &method_type.as_str()],
+    ).await.context("Failed to check existing service_group")?;
+
+    if let Some(row) = existing_row {
+        // Update existing record
+        let existing_id: String = row.get("id");
+        let existing_status: String = row.get("confirmed_status");
+        
+        // Don't override CONFIRMED or REJECTED status
+        let new_status = match existing_status.as_str() {
+            "CONFIRMED" | "REJECTED" => existing_status,
+            _ => "PENDING_REVIEW".to_string(),
+        };
+
+        let update_result = conn.execute(
+            "UPDATE public.service_group 
+             SET confidence_score = $1, 
+                 match_values = $2, 
+                 pre_rl_confidence_score = $3,
+                 confirmed_status = $4,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $5",
+            &[
+                &confidence_score,
+                &match_values_json,
+                &pre_rl_confidence_score,
+                &new_status,
+                &existing_id,
+            ],
+        ).await;
+
+        match update_result {
+            Ok(rows_affected) => {
+                debug!("Successfully updated service_group id {}. Rows affected: {}", existing_id, rows_affected);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to update service_group record: {}", e);
+                Err(anyhow::anyhow!("Database update failed: {}", e))
+            }
+        }
+    } else {
+        // Insert new record
+        let insert_result = conn.execute(
+            "INSERT INTO public.service_group
+             (id, service_id_1, service_id_2, confidence_score, method_type, match_values, 
+              pre_rl_confidence_score, confirmed_status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING_REVIEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            &[
+                &id,
+                &s1_formatted,
+                &s2_formatted,
+                &confidence_score,
+                &method_type.as_str(),
+                &match_values_json,
+                &pre_rl_confidence_score,
+            ],
+        ).await;
+
+        match insert_result {
+            Ok(rows_affected) => {
+                debug!("Successfully inserted service_group id {}. Rows affected: {}", id, rows_affected);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to insert service_group record: {}", e);
+                Err(anyhow::anyhow!("Database insertion failed: {}", e))
+            }
+        }
+    }
+}
+
+// The old `Workspace_recent_feedback_items` that used `FeedbackItem` and `view_rl_feedback_items`
+// is now replaced by `Workspace_unprocessed_human_feedback` which uses the new tables and a simpler struct.
 // If `FeedbackItem` from `reinforcement::types` is still needed elsewhere, it should be adjusted or
 // the new `HumanFeedbackDataForTuner` should be used.
