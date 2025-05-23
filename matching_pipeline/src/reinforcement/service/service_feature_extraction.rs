@@ -1056,10 +1056,10 @@ async fn check_same_organization(
 ) -> Result<f64> {
     let row = conn.query_one(
         "SELECT
-            CASE
+            (CASE
                 WHEN s1.organization_id = s2.organization_id AND s1.organization_id IS NOT NULL THEN 1.0
                 ELSE 0.0
-            END as same_organization
+            END)::DOUBLE PRECISION as same_organization
          FROM public.service s1, public.service s2
          WHERE s1.id = $1 AND s2.id = $2",
         &[&service1_id.0, &service2_id.0],
@@ -1076,10 +1076,10 @@ async fn check_email_exact_match(
     let row = conn
         .query_one(
             "SELECT
-            CASE
+            (CASE
                 WHEN s1.email = s2.email AND s1.email IS NOT NULL AND s1.email <> '' THEN 1.0
                 ELSE 0.0
-            END as email_match
+            END)::DOUBLE PRECISION as email_match
          FROM public.service s1, public.service s2
          WHERE s1.id = $1 AND s2.id = $2",
             &[&service1_id.0, &service2_id.0],
@@ -1106,11 +1106,11 @@ async fn check_url_domain_match(
             AND s2.url IS NOT NULL AND s2.url <> ''
         )
         SELECT
-            CASE
+            (CASE
                 WHEN (SELECT domain1 FROM domain_extract) = (SELECT domain2 FROM domain_extract) 
                 AND (SELECT domain1 FROM domain_extract) <> '' THEN 1.0
                 ELSE 0.0
-            END as domain_match",
+            END)::DOUBLE PRECISION as domain_match",
             &[&service1_id.0, &service2_id.0],
         )
         .await
