@@ -66,6 +66,8 @@ regex = "1.7.0"
 
 lru = "0.9"  # For feature caching
 num_cpus = "1.15"  # For detecting available CPU cores
+sysinfo = "0.30"  # For memory monitoring
+indicatif = "0.17"
 
 # Hashing calculations
 sha2 = "0.10"
@@ -75,6 +77,14 @@ hex = "0.4"
 [[bin]]
 name = "dedupe"
 path = "src/main.rs"
+
+[[bin]]
+name = "from_phase4"
+path = "src/bin/from_phase4.rs"
+
+[[bin]]
+name = "from_phase5_5"
+path = "src/bin/from_phase5_5.rs"
 
 [[bin]]
 name = "identify_entities"
