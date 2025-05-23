@@ -544,7 +544,7 @@ async fn run_matching_pipeline(
         info!("Starting phone matching task...");
         let result = matching::phone::find_matches(
             &pool_clone_phone,
-            Some(&orchestrator_clone_phone), // Note: some find_matches take Option<&Arc<Mutex<...>>
+            Some(orchestrator_clone_phone),
             &run_id_clone_phone,
             Some(feature_cache_clone_phone), // Pass feature cache explicitly
         )

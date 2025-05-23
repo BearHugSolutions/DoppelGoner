@@ -1,4 +1,4 @@
-// src/matching/name.rs - Refactored for single-transaction pattern
+// src/matching/name.rs - Refactored for hashing, caching, and single-transaction pattern
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use log::{debug, info, trace, warn};
@@ -27,20 +27,26 @@ use crate::{
 };
 use serde_json;
 
+// Import pipeline_state_utils for caching and signature handling
+use crate::pipeline_state_utils::{
+    check_comparison_cache, get_current_signatures_for_pair, store_in_comparison_cache,
+    // EntitySignatureData and CachedComparisonResult are implicitly used via the utils
+};
+
 // Updated configuration for stricter name matching
-const MIN_FUZZY_SIMILARITY_THRESHOLD: f32 = 0.92; // Increased from 0.85
-const MIN_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.94; // Increased from 0.88
-const COMBINED_SIMILARITY_THRESHOLD: f32 = 0.93; // Increased from 0.86
-const FUZZY_WEIGHT: f32 = 0.3; // Decreased from 0.4
-const SEMANTIC_WEIGHT: f32 = 0.7; // Increased from 0.6
-const INTERNAL_WORKERS_NAME_STRATEGY: usize = 2; // Number of concurrent tasks for pair processing
+const MIN_FUZZY_SIMILARITY_THRESHOLD: f32 = 0.92;
+const MIN_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.94;
+const COMBINED_SIMILARITY_THRESHOLD: f32 = 0.93;
+const FUZZY_WEIGHT: f32 = 0.3;
+const SEMANTIC_WEIGHT: f32 = 0.7;
+// const INTERNAL_WORKERS_NAME_STRATEGY: usize = 2; // Not directly used with current semaphore approach
 
 /// Number of discriminative tokens to use per entity
 const TOP_TOKENS_PER_ENTITY: usize = 10;
 /// Minimum token overlap required for candidate pair consideration
 const MIN_TOKEN_OVERLAP: usize = 2;
-const MAX_CANDIDATES_PER_ENTITY: usize = 500; // Safety limit to prevent excessive comparisons
-const MIN_TOKEN_LENGTH: usize = 2; // Ignore tokens shorter than this length
+// const MAX_CANDIDATES_PER_ENTITY: usize = 500; // Not directly used in current candidate generation
+pub const MIN_TOKEN_LENGTH: usize = 2; // Ignore tokens shorter than this length
 
 // Organizational types that should never match even with high similarity
 const INCOMPATIBLE_ORG_TYPES: [(&str, &str); 10] = [
@@ -65,145 +71,31 @@ const LOCATION_PREFIXES: [&str; 8] = [
 ];
 
 // Expanded stopwords with more domain-specific irrelevant words
-const STOPWORDS: [&str; 132] = [
+pub const STOPWORDS: [&str; 131] = [
     // Common English articles, conjunctions, and prepositions
-    "a",
-    "an",
-    "the",
-    "and",
-    "or",
-    "but",
-    "nor",
-    "for",
-    "yet",
-    "so",
-    "in",
-    "on",
-    "at",
-    "by",
-    "to",
-    "with",
-    "from",
-    "of",
-    "as",
-    "into",
-    "about",
-    "before",
-    "after",
-    "during",
-    "until",
-    "since",
-    "unless",
+    "a", "an", "the", "and", "or", "but", "nor", "for", "yet", "so", "in", "on", "at", "by",
+    "to", "with", "from", "of", "as", "into", "about", "before", "after", "during", "until",
+    "since", "unless",
     // Common business terms with little discriminative value
-    "inc",
-    "incorporated",
-    "corp",
-    "corporation",
-    "llc",
-    "ltd",
-    "limited",
-    "company",
-    "co",
-    "group",
-    "holdings",
-    "enterprises",
-    "international",
-    "global",
-    "worldwide",
-    "national",
-    "american",
-    "usa",
-    "us",
-    "service",
-    "services",
-    "solutions",
-    "systems",
-    "associates",
-    "partners",
-    "partnership",
+    "inc", "incorporated", "corp", "corporation", "llc", "ltd", "limited", "company", "co",
+    "group", "holdings", "enterprises", "international", "global", "worldwide", "national",
+    "american", "usa", "us", "service", "services", "solutions", "systems", "associates",
+    "partners", "partnership",
     // Generic organizational terms
-    "organization",
-    "organisation",
-    "foundation",
-    "institute",
-    "association",
-    "society",
-    "council",
-    "committee",
-    "center",
-    "centre",
-    "department",
-    "division",
-    "unit",
-    "office",
-    "bureau",
-    "agency",
-    "authority",
-    "board",
+    "organization", "organisation", "foundation", "institute", "association", "society",
+    "council", "committee", "center", "centre", "department", "division", "unit", "office",
+    "bureau", "agency", "authority", "board",
     // Common descriptive terms
-    "new",
-    "old",
-    "great",
-    "greater",
-    "best",
-    "better",
-    "first",
-    "second",
-    "third",
-    "primary",
-    "main",
-    "central",
-    "local",
-    "regional",
-    "official",
+    "new", "old", "great", "greater", "best", "better", "first", "second", "third", "primary",
+    "main", "central", "local", "regional", "official",
     // Additional stopwords
-    "this",
-    "that",
-    "these",
-    "those",
-    "it",
-    "they",
-    "them",
-    "their",
-    "our",
-    "your",
-    "all",
-    "any",
-    "each",
-    "every",
-    "some",
-    "such",
-    "no",
-    "not",
-    "only",
-    "very",
+    "this", "that", "these", "those", "it", "they", "them", "their", "our", "your", "all",
+    "any", "each", "every", "some", "such", "no", "not", "only", "very",
     // Specific to your dataset
-    "program",
-    "community",
-    "resource",
-    "resources",
-    "support",
-    "help",
-    "health",
-    "care",
-    "management",
-    "professional",
-    "public",
-    "private",
-    "general",
-    "federal",
-    "state",
-    "county",
-    "regional",
-    "district",
-    "area",
-    "branch",
-    "program",
-    "provider",
-    "member",
-    "directory",
-    "guide",
-    "network",
+    "program", "community", "resource", "resources", "support", "help", "health", "care",
+    "management", "professional", "public", "private", "general", "federal", "state", "county",
+    "regional", "district", "area", "branch", // "program" is repeated, kept one
+    "provider", "member", "directory", "guide", "network",
 ];
 
 // SQL query for inserting into entity_group
@@ -214,6 +106,7 @@ const INSERT_ENTITY_GROUP_SQL: &str = "
 VALUES ($1, $2, $3, $4, $5, $6, $7)";
 
 /// Enhanced data structure to hold entity information with organization type detection
+#[derive(Clone)] // Added Clone derive
 struct EntityNameData {
     entity: Entity,
     normalized_name: String,
@@ -227,10 +120,10 @@ pub async fn find_matches(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    feature_cache: Option<SharedFeatureCache>, // Added feature_cache parameter
+    feature_cache: Option<SharedFeatureCache>,
 ) -> Result<AnyMatchResult> {
     info!(
-        "Starting V1 high-performance name matching (run ID: {}){}...",
+        "Starting V1 high-performance name matching (run ID: {}){} with INCREMENTAL CHECKS...",
         pipeline_run_id,
         if reinforcement_orchestrator_option.is_some() {
             " with RL confidence tuning"
@@ -240,13 +133,11 @@ pub async fn find_matches(
     );
     let start_time = Instant::now();
 
-    // Initial data loading
     let mut initial_conn = pool
         .get()
         .await
         .context("Name: Failed to get DB connection for initial reads")?;
 
-    // 1. Fetch entities with names
     let all_entities_with_names_vec = get_all_entities_with_names(&*initial_conn).await?;
     let total_entities = all_entities_with_names_vec.len();
     info!(
@@ -268,258 +159,334 @@ pub async fn find_matches(
         return Ok(AnyMatchResult::Name(name_result));
     }
 
-    // 2. Fetch existing pairs to avoid duplicates
-    let existing_processed_pairs_set =
-        fetch_existing_pairs(&*initial_conn, MatchMethodType::Name).await?;
+    // Fetch existing entity_group pairs to avoid re-creating them
+    // This is a broader check than the comparison cache.
+    let existing_entity_group_pairs_set =
+        fetch_existing_entity_group_pairs(&*initial_conn, MatchMethodType::Name).await?;
     info!(
-        "Name: Found {} existing name-matched pairs to skip.",
-        existing_processed_pairs_set.len()
+        "Name: Found {} existing name-matched entity_group pairs to skip direct re-creation.",
+        existing_entity_group_pairs_set.len()
     );
 
-    // 3. Get organization embeddings for semantic comparison
     let org_embeddings_map =
         get_organization_embeddings(&*initial_conn, &all_entities_with_names_vec).await?;
-
-    // Release initial connection
     drop(initial_conn);
 
-    // 4. Prepare entity data and generate candidate pairs
     let stopwords: HashSet<String> = STOPWORDS.iter().map(|&s| s.to_string()).collect();
     let (entity_data, token_to_entities, _token_stats) =
         prepare_entity_data_and_index(&all_entities_with_names_vec, &stopwords).await;
 
-    let candidate_pairs = generate_candidate_pairs(&entity_data, &token_to_entities).await;
+    let candidate_pairs_indices = generate_candidate_pairs_indices(&entity_data, &token_to_entities).await;
     info!(
-        "Name: Generated {} candidate pairs for comparison.",
-        candidate_pairs.len()
+        "Name: Generated {} candidate pairs (by index) for comparison.",
+        candidate_pairs_indices.len()
     );
 
-    // 5. Stats tracking
-    let mut new_pairs_created_count = 0;
-    let mut entities_in_new_pairs: HashSet<EntityId> = HashSet::new();
-    let mut confidence_scores_for_stats: Vec<f64> = Vec::new();
-    let mut individual_operation_errors = 0;
+    // Shared set to track pairs processed in this run to avoid redundant work after a cache miss.
+    let processed_pairs_this_run_arc = Arc::new(Mutex::new(HashSet::<(EntityId, EntityId)>::new()));
 
-    // 6. Process candidate pairs using a connection pool with limited concurrency
+    // Stats tracking: new_pairs, entities_set, conf_scores, errors, cache_hits
+    let stats_mutex = Arc::new(Mutex::new((
+        0,              // new_pairs_created_count
+        HashSet::new(), // entities_in_new_pairs
+        Vec::new(),     // confidence_scores_for_stats
+        0,              // individual_operation_errors
+        0,              // cache_hits_count
+        0,              // feature_extraction_count
+        0,              // feature_extraction_failures
+    )));
+
+
     let semaphore = Arc::new(tokio::sync::Semaphore::new(15)); // Limit concurrent DB operations
+    let candidate_pairs_len = candidate_pairs_indices.len();
+    let mut tasks = Vec::new();
 
-    let candidate_pairs_len = candidate_pairs.len();
-    for (i, j) in candidate_pairs {
-        // Extract entity data
-        let entity1_data = &entity_data[i];
-        let entity2_data = &entity_data[j];
-        let e1_id = &entity1_data.entity.id;
-        let e2_id = &entity2_data.entity.id;
+    for (i, j) in candidate_pairs_indices {
+        let entity1_data = entity_data[i].clone(); // Clone for async task
+        let entity2_data = entity_data[j].clone(); // Clone for async task
+        
+        let pool_clone = pool.clone();
+        let ro_option_clone = reinforcement_orchestrator_option.clone();
+        let run_id_clone = pipeline_run_id.to_string();
+        let feature_cache_clone = feature_cache.clone();
+        let stats_arc_clone = stats_mutex.clone();
+        let processed_pairs_arc_clone = processed_pairs_this_run_arc.clone();
+        let existing_entity_group_pairs_clone = existing_entity_group_pairs_set.clone();
+        let org_embeddings_map_clone = org_embeddings_map.clone();
+        let semaphore_clone = semaphore.clone();
 
-        // Normalize the order of e1_id and e2_id for the check
-        let (id_to_check_1, id_to_check_2) = if e1_id.0 < e2_id.0 {
-            (e1_id.clone(), e2_id.clone())
-        } else {
-            (e2_id.clone(), e1_id.clone())
-        };
-
-        // Skip if already processed (using the normalized pair)
-        if existing_processed_pairs_set.contains(&(id_to_check_1, id_to_check_2)) {
-            //
-            trace!(
-                "Name: Pair ({}, {}) already processed. Skipping.",
-                e1_id.0,
-                e2_id.0
-            ); //
-            continue;
-        }
-
-        // Skip pairs with empty names
-        let original_name1 = entity1_data
-            .entity
-            .name
-            .as_ref()
-            .cloned()
-            .unwrap_or_default();
-        let original_name2 = entity2_data
-            .entity
-            .name
-            .as_ref()
-            .cloned()
-            .unwrap_or_default();
-        let normalized_name1 = entity1_data.normalized_name.clone();
-        let normalized_name2 = entity2_data.normalized_name.clone();
-
-        if normalized_name1.is_empty() || normalized_name2.is_empty() {
-            continue;
-        }
-
-        // Skip pairs with incompatible entity types
-        if let (Some(t1), Some(t2)) = (entity1_data.entity_type, entity2_data.entity_type) {
-            if t1 != t2
-                && INCOMPATIBLE_ORG_TYPES
-                    .iter()
-                    .any(|(it1, it2)| (t1 == *it1 && t2 == *it2) || (t1 == *it2 && t2 == *it1))
-            {
-                continue;
-            }
-        }
-
-        // Calculate fuzzy score using Jaro-Winkler similarity
-        let fuzzy_score = jaro_winkler(&normalized_name1, &normalized_name2) as f32;
-        if fuzzy_score < (MIN_FUZZY_SIMILARITY_THRESHOLD * 0.9) {
-            continue;
-        }
-
-        // Calculate semantic score using embeddings
-        let embedding1_opt = org_embeddings_map
-            .get(e1_id)
-            .and_then(|opt_emb| opt_emb.as_ref());
-        let embedding2_opt = org_embeddings_map
-            .get(e2_id)
-            .and_then(|opt_emb| opt_emb.as_ref());
-        let semantic_score = match (embedding1_opt, embedding2_opt) {
-            (Some(emb1), Some(emb2)) => match cosine_similarity_candle(emb1, emb2) {
-                Ok(sim) => sim as f32,
+        tasks.push(tokio::spawn(async move {
+            let permit = match semaphore_clone.acquire().await {
+                Ok(permit) => permit,
                 Err(e) => {
-                    warn!("Name: Cosine similarity calculation failed for pair ({}, {}): {}. Defaulting to 0.0.", e1_id.0, e2_id.0, e);
-                    0.0
+                    warn!("Name: Failed to acquire semaphore permit: {}", e);
+                    return; // Skip this pair if semaphore fails
                 }
-            },
-            _ => 0.0,
-        };
+            };
 
-        // Calculate combined score and determine match type
-        let (pre_rl_score, pre_rl_match_type) =
-            if semantic_score >= MIN_SEMANTIC_SIMILARITY_THRESHOLD {
-                (
-                    (fuzzy_score * FUZZY_WEIGHT) + (semantic_score * SEMANTIC_WEIGHT),
-                    "combined".to_string(),
-                )
+            let e1_id = &entity1_data.entity.id;
+            let e2_id = &entity2_data.entity.id;
+
+            let (ordered_e1_id, ordered_e2_id) = if e1_id.0 < e2_id.0 {
+                (e1_id.clone(), e2_id.clone())
+            } else {
+                (e2_id.clone(), e1_id.clone())
+            };
+            let current_pair_ordered = (ordered_e1_id.clone(), ordered_e2_id.clone());
+
+            // 1. Check if entity_group already exists for this pair and method
+            if existing_entity_group_pairs_clone.contains(&current_pair_ordered) {
+                trace!("Name: Pair ({}, {}) already in entity_group. Skipping.", ordered_e1_id.0, ordered_e2_id.0);
+                drop(permit);
+                return;
+            }
+            
+            // 2. Check if already processed in this run (e.g. after a cache miss)
+            {
+                let processed_set = processed_pairs_arc_clone.lock().await;
+                if processed_set.contains(&current_pair_ordered) {
+                    trace!("Name: Pair ({}, {}) already processed in this run. Skipping.", ordered_e1_id.0, ordered_e2_id.0);
+                    drop(permit); // Release permit before returning
+                    return;
+                }
+            } // Mutex guard dropped here
+
+
+            // 3. --- INCREMENTAL PROCESSING LOGIC (Signatures & Cache) ---
+            let current_signatures_opt = match get_current_signatures_for_pair(&pool_clone, &ordered_e1_id, &ordered_e2_id).await {
+                Ok(sigs) => sigs,
+                Err(e) => {
+                    warn!("Name: Failed to get signatures for pair ({}, {}): {}. Proceeding without cache.", ordered_e1_id.0, ordered_e2_id.0, e);
+                    None
+                }
+            };
+
+            if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
+                match check_comparison_cache(&pool_clone, &ordered_e1_id, &ordered_e2_id, &sig1_data.signature, &sig2_data.signature, &MatchMethodType::Name).await {
+                    Ok(Some(cached_eval)) => {
+                        let mut stats_guard = stats_arc_clone.lock().await;
+                        stats_guard.4 += 1; // cache_hits_count
+                        drop(stats_guard);
+
+                        debug!("Name: Cache HIT for pair ({}, {}). Result: {}, Score: {:?}", ordered_e1_id.0, ordered_e2_id.0, cached_eval.comparison_result, cached_eval.similarity_score);
+                        
+                        // Mark as processed to avoid re-processing
+                        let mut processed_set = processed_pairs_arc_clone.lock().await;
+                        processed_set.insert(current_pair_ordered.clone());
+                        drop(processed_set);
+                        drop(permit);
+                        return; 
+                    }
+                    Ok(None) => {
+                        debug!("Name: Cache MISS for pair ({}, {}). Signatures: ({}..., {}...). Proceeding with comparison.", ordered_e1_id.0, ordered_e2_id.0, &sig1_data.signature[..std::cmp::min(8, sig1_data.signature.len())], &sig2_data.signature[..std::cmp::min(8, sig2_data.signature.len())]);
+                    }
+                    Err(e) => {
+                        warn!("Name: Error checking comparison cache for pair ({}, {}): {}. Proceeding with comparison.", ordered_e1_id.0, ordered_e2_id.0, e);
+                    }
+                }
+            }
+            // --- END INCREMENTAL PROCESSING LOGIC ---
+
+            // If we reach here, it's a cache miss or signatures weren't available. Proceed with comparison.
+            let original_name1 = entity1_data.entity.name.as_ref().cloned().unwrap_or_default();
+            let original_name2 = entity2_data.entity.name.as_ref().cloned().unwrap_or_default();
+            let normalized_name1 = entity1_data.normalized_name.clone();
+            let normalized_name2 = entity2_data.normalized_name.clone();
+
+            if normalized_name1.is_empty() || normalized_name2.is_empty() {
+                drop(permit);
+                return;
+            }
+
+            if let (Some(t1), Some(t2)) = (entity1_data.entity_type, entity2_data.entity_type) {
+                if t1 != t2 && INCOMPATIBLE_ORG_TYPES.iter().any(|(it1, it2)| (t1 == *it1 && t2 == *it2) || (t1 == *it2 && t2 == *it1)) {
+                    drop(permit);
+                    return;
+                }
+            }
+
+            let fuzzy_score = jaro_winkler(&normalized_name1, &normalized_name2) as f32;
+            if fuzzy_score < (MIN_FUZZY_SIMILARITY_THRESHOLD * 0.9) { // Early exit if very low fuzzy
+                // Store non-match in cache if signatures were available
+                if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
+                    if let Err(e) = store_in_comparison_cache(
+                        &pool_clone, &ordered_e1_id, &ordered_e2_id,
+                        &sig1_data.signature, &sig2_data.signature,
+                        &MatchMethodType::Name, &run_id_clone,
+                        "NON_MATCH", Some(fuzzy_score as f64), // Store fuzzy score for context
+                        None, // No features for early exit
+                    ).await {
+                        warn!("Name: Failed to store NON_MATCH (low fuzzy) in comparison_cache for ({}, {}): {}", ordered_e1_id.0, ordered_e2_id.0, e);
+                    }
+                }
+                let mut processed_set = processed_pairs_arc_clone.lock().await;
+                processed_set.insert(current_pair_ordered);
+                drop(processed_set);
+                drop(permit);
+                return;
+            }
+
+            let embedding1_opt = org_embeddings_map_clone.get(e1_id).and_then(|opt_emb| opt_emb.as_ref());
+            let embedding2_opt = org_embeddings_map_clone.get(e2_id).and_then(|opt_emb| opt_emb.as_ref());
+            let semantic_score = match (embedding1_opt, embedding2_opt) {
+                (Some(emb1), Some(emb2)) => match cosine_similarity_candle(emb1, emb2) {
+                    Ok(sim) => sim as f32,
+                    Err(e) => { warn!("Name: Cosine similarity failed for ({}, {}): {}. Defaulting to 0.0.", e1_id.0, e2_id.0, e); 0.0 }
+                },
+                _ => 0.0,
+            };
+
+            let (pre_rl_score, pre_rl_match_type) = if semantic_score >= MIN_SEMANTIC_SIMILARITY_THRESHOLD {
+                ((fuzzy_score * FUZZY_WEIGHT) + (semantic_score * SEMANTIC_WEIGHT), "combined".to_string())
             } else if fuzzy_score >= MIN_FUZZY_SIMILARITY_THRESHOLD {
                 (fuzzy_score, "fuzzy".to_string())
             } else {
-                continue;
+                // Store non-match in cache if signatures were available
+                if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
+                     if let Err(e) = store_in_comparison_cache(
+                        &pool_clone, &ordered_e1_id, &ordered_e2_id,
+                        &sig1_data.signature, &sig2_data.signature,
+                        &MatchMethodType::Name, &run_id_clone,
+                        "NON_MATCH", Some(fuzzy_score.max(semantic_score) as f64), // Store max of scores
+                        None, 
+                    ).await {
+                        warn!("Name: Failed to store NON_MATCH (low combined) in comparison_cache for ({}, {}): {}", ordered_e1_id.0, ordered_e2_id.0, e);
+                    }
+                }
+                let mut processed_set = processed_pairs_arc_clone.lock().await;
+                processed_set.insert(current_pair_ordered);
+                drop(processed_set);
+                drop(permit);
+                return;
             };
 
-        // Apply domain rules
-        let adjusted_pre_rl_score = apply_domain_rules(
-            &normalized_name1,
-            &normalized_name2,
-            pre_rl_score,
-            entity1_data.entity_type,
-            entity2_data.entity_type,
-        );
+            let adjusted_pre_rl_score = apply_domain_rules(&normalized_name1, &normalized_name2, pre_rl_score, entity1_data.entity_type, entity2_data.entity_type);
+            let comparison_outcome_for_cache = if adjusted_pre_rl_score >= COMBINED_SIMILARITY_THRESHOLD { "MATCH" } else { "NON_MATCH" };
+            
+            let mut final_confidence = adjusted_pre_rl_score as f64;
+            let mut features_for_snapshot_vec: Option<Vec<f64>> = None;
+            let mut features_json_for_cache: Option<serde_json::Value> = None;
 
-        if adjusted_pre_rl_score < COMBINED_SIMILARITY_THRESHOLD {
-            continue;
-        }
-
-        // Acquire a permit to limit concurrent DB operations
-        let permit = match semaphore.acquire().await {
-            Ok(permit) => permit,
-            Err(e) => {
-                warn!("Name: Failed to acquire semaphore permit: {}", e);
-                continue;
-            }
-        };
-
-        // Create match values
-        let match_values = MatchValues::Name(NameMatchValue {
-            original_name1: original_name1.clone(),
-            original_name2: original_name2.clone(),
-            normalized_name1: normalized_name1.clone(),
-            normalized_name2: normalized_name2.clone(),
-            pre_rl_match_type: Some(pre_rl_match_type.clone()),
-        });
-
-        // Extract features and apply RL tuning if available
-        let mut final_confidence = adjusted_pre_rl_score as f64;
-        let mut features_for_snapshot: Option<Vec<f64>> = None;
-
-        if let Some(orchestrator) = reinforcement_orchestrator_option.as_ref() {
-            // Use the feature cache if available
-            match if let Some(cache) = feature_cache.as_ref() {
-                // Use the cache through the orchestrator
-                let orchestrator_guard = orchestrator.lock().await;
-                orchestrator_guard
-                    .get_pair_features(pool, e1_id, e2_id)
-                    .await
-            } else {
-                // Fall back to direct extraction if no cache
-                MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await
-            } {
-                Ok(features) => {
-                    if !features.is_empty() {
-                        features_for_snapshot = Some(features.clone());
-                        let orchestrator_guard = orchestrator.lock().await;
-                        match orchestrator_guard.get_tuned_confidence(
-                            &MatchMethodType::Name,
-                            adjusted_pre_rl_score as f64,
-                            &features,
-                        ) {
-                            Ok(tuned_score) => final_confidence = tuned_score,
-                            Err(e) => {
-                                warn!("Name: Failed to get tuned confidence for pair ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e);
+            if let Some(orchestrator_arc) = ro_option_clone.as_ref() {
+                let mut stats_g = stats_arc_clone.lock().await;
+                match if let Some(cache) = feature_cache_clone.as_ref() {
+                    let orchestrator_guard = orchestrator_arc.lock().await;
+                    orchestrator_guard.get_pair_features(&pool_clone, e1_id, e2_id).await // Use original e1_id, e2_id for feature extraction if order matters there
+                } else {
+                    MatchingOrchestrator::extract_pair_context_features(&pool_clone, e1_id, e2_id).await
+                } {
+                    Ok(features) => {
+                        stats_g.5 += 1; // feature_extraction_count
+                        if !features.is_empty() {
+                            features_for_snapshot_vec = Some(features.clone());
+                            features_json_for_cache = serde_json::to_value(features.clone()).ok();
+                            let orchestrator_guard = orchestrator_arc.lock().await;
+                            match orchestrator_guard.get_tuned_confidence(&MatchMethodType::Name, adjusted_pre_rl_score as f64, &features) {
+                                Ok(tuned_score) => final_confidence = tuned_score,
+                                Err(e) => warn!("Name: Failed to get tuned confidence for pair ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
                             }
+                        } else {
+                            warn!("Name: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", e1_id.0, e2_id.0);
                         }
-                    } else {
-                        warn!("Name: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", e1_id.0, e2_id.0);
+                    }
+                    Err(e) => {
+                        stats_g.6 += 1; // feature_extraction_failures
+                        warn!("Name: Failed to extract features for pair ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e);
                     }
                 }
-                Err(e) => {
-                    warn!("Name: Failed to extract features for pair ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e);
+            } // RL feature extraction and tuning done
+
+            // Store result in comparison_cache if signatures were available
+            if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
+                if let Err(e) = store_in_comparison_cache(
+                    &pool_clone, &ordered_e1_id, &ordered_e2_id,
+                    &sig1_data.signature, &sig2_data.signature,
+                    &MatchMethodType::Name, &run_id_clone,
+                    comparison_outcome_for_cache, Some(final_confidence),
+                    features_json_for_cache.as_ref(),
+                ).await {
+                    warn!("Name: Failed to store {} in comparison_cache for ({}, {}): {}", comparison_outcome_for_cache, ordered_e1_id.0, ordered_e2_id.0, e);
                 }
             }
-        }
+            
+            // Mark as processed in this run
+            {
+                let mut processed_set = processed_pairs_arc_clone.lock().await;
+                processed_set.insert(current_pair_ordered.clone());
+            }
 
-        // Create entity group with unified approach
-        match create_entity_group(
-            pool,
-            e1_id,
-            e2_id,
-            &match_values,
-            final_confidence,
-            adjusted_pre_rl_score as f64, // Pre-RL score
-            reinforcement_orchestrator_option.as_ref(),
-            pipeline_run_id,
-            feature_cache.clone(), // Pass the feature cache
+
+            if comparison_outcome_for_cache == "MATCH" {
+                 let match_values = MatchValues::Name(NameMatchValue {
+                    original_name1: original_name1.clone(),
+                    original_name2: original_name2.clone(),
+                    normalized_name1: normalized_name1.clone(),
+                    normalized_name2: normalized_name2.clone(),
+                    pre_rl_match_type: Some(pre_rl_match_type.clone()),
+                });
+
+                match create_entity_group( // This function uses ordered_e1_id, ordered_e2_id internally for the DB insert
+                    &pool_clone,
+                    e1_id, // Pass original IDs, create_entity_group will order them
+                    e2_id,
+                    &match_values,
+                    final_confidence,
+                    adjusted_pre_rl_score as f64,
+                    ro_option_clone.as_ref(),
+                    &run_id_clone,
+                    features_for_snapshot_vec, // Pass the Vec<f64> directly
+                    feature_cache_clone, // Pass the feature cache for RL within create_entity_group if needed (though features already extracted)
+                ).await {
+                    Ok(created) => {
+                        if created {
+                            let mut stats_guard = stats_arc_clone.lock().await;
+                            stats_guard.0 += 1; // new_pairs_created_count
+                            stats_guard.1.insert(e1_id.clone());
+                            stats_guard.1.insert(e2_id.clone());
+                            stats_guard.2.push(final_confidence);
+                        }
+                    }
+                    Err(e) => {
+                        let mut stats_guard = stats_arc_clone.lock().await;
+                        stats_guard.3 += 1; // individual_operation_errors
+                        warn!("Name: Failed to process pair ({}, {}): {}", e1_id.0, e2_id.0, e);
+                    }
+                }
+            }
+            drop(permit); // Release semaphore permit
+        }));
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!("Name: Task join error: {}", e);
+             let mut stats_guard = stats_mutex.lock().await;
+             stats_guard.3 += 1; // individual_operation_errors for task failure
+        }
+    }
+    
+    let (
+        new_pairs_created_count,
+        entities_in_new_pairs,
+        confidence_scores_for_stats,
+        individual_operation_errors,
+        cache_hits_count,
+        feature_extraction_count,
+        feature_extraction_failures,
+    ) = {
+        let stats_guard = stats_mutex.lock().await;
+        (
+            stats_guard.0,
+            stats_guard.1.clone(),
+            stats_guard.2.clone(),
+            stats_guard.3,
+            stats_guard.4,
+            stats_guard.5,
+            stats_guard.6,
         )
-        .await
-        {
-            Ok(created) => {
-                if created {
-                    new_pairs_created_count += 1;
-                    entities_in_new_pairs.insert(e1_id.clone());
-                    entities_in_new_pairs.insert(e2_id.clone());
-                    confidence_scores_for_stats.push(final_confidence);
+    };
 
-                    if new_pairs_created_count % 100 == 0 {
-                        info!(
-                            "Name: Created {} pairs so far ({:.2}% complete)",
-                            new_pairs_created_count,
-                            (new_pairs_created_count as f32 / candidate_pairs_len as f32) * 100.0
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                individual_operation_errors += 1;
-                warn!(
-                    "Name: Failed to process pair ({}, {}): {}",
-                    e1_id.0, e2_id.0, e
-                );
-            }
-        }
 
-        // Release the permit
-        drop(permit);
-    }
-
-    // Report errors if any
-    if individual_operation_errors > 0 {
-        warn!(
-            "Name: Encountered {} errors during pair processing.",
-            individual_operation_errors
-        );
-    }
-
-    // Calculate stats
     let avg_confidence = if !confidence_scores_for_stats.is_empty() {
         confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
     } else {
@@ -531,19 +498,23 @@ pub async fn find_matches(
         groups_created: new_pairs_created_count,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 {
-            2.0
-        } else {
-            0.0
-        },
+        avg_group_size: if new_pairs_created_count > 0 { 2.0 } else { 0.0 },
     };
 
     info!(
-        "Name matching complete in {:.2?}: {} new pairs, {} unique entities.",
+        "Name matching complete in {:.2?}: {} candidate pairs processed. Cache hits: {}. Created {} new pairs ({} errors), involving {} unique entities.",
         start_time.elapsed(),
+        candidate_pairs_len, // Total candidates considered
+        cache_hits_count,
         method_stats.groups_created,
+        individual_operation_errors,
         method_stats.entities_matched
     );
+    info!(
+        "Name feature extraction stats: {} successful, {} failed.",
+        feature_extraction_count, feature_extraction_failures
+    );
+
 
     Ok(AnyMatchResult::Name(NameMatchResult {
         groups_created: method_stats.groups_created,
@@ -551,167 +522,105 @@ pub async fn find_matches(
     }))
 }
 
-/// Create entity group record in a single transaction, along with decision logging and suggestions
+/// Create entity group record, decision logging, and suggestions.
+/// Takes original entity_id_1, entity_id_2 and orders them internally.
+/// `features_for_snapshot` is now passed directly as Option<Vec<f64>>.
 async fn create_entity_group(
     pool: &PgPool,
-    entity_id_1: &EntityId,
-    entity_id_2: &EntityId,
+    original_entity_id_1: &EntityId, // Renamed for clarity
+    original_entity_id_2: &EntityId, // Renamed for clarity
     match_values: &MatchValues,
     final_confidence_score: f64,
     pre_rl_confidence_score: f64,
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    feature_cache: Option<SharedFeatureCache>, // Added feature_cache parameter
+    features_for_snapshot: Option<Vec<f64>>, // Changed parameter type
+    _feature_cache: Option<SharedFeatureCache>, // Keep for signature consistency, though features might be pre-extracted
 ) -> Result<bool> {
-    // Get a single connection for all operations
     let mut conn = pool
         .get()
         .await
         .context("Name: Failed to get DB connection for entity group creation")?;
-
-    // Start a transaction that will include all operations
     let tx = conn
         .transaction()
         .await
         .context("Name: Failed to start transaction for entity group creation")?;
 
-    // Generate entity group ID
     let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
 
-    // Ensure entity_id_1 < entity_id_2 to satisfy the check_entity_order constraint
-    let (ordered_id_1, ordered_id_2);
-    let ordered_match_values;
-
-    if entity_id_1.0 <= entity_id_2.0 {
-        ordered_id_1 = entity_id_1;
-        ordered_id_2 = entity_id_2;
-        ordered_match_values = match_values.clone(); // Clone the original match values
-    } else {
-        // Need to swap the entity IDs to satisfy the constraint
-        ordered_id_1 = entity_id_2;
-        ordered_id_2 = entity_id_1;
-
-        // Create new match values with swapped fields for NameMatchValue
-        if let MatchValues::Name(name_match) = match_values {
-            ordered_match_values = MatchValues::Name(NameMatchValue {
-                original_name1: name_match.original_name2.clone(),
-                original_name2: name_match.original_name1.clone(),
-                normalized_name1: name_match.normalized_name2.clone(),
-                normalized_name2: name_match.normalized_name1.clone(),
-                pre_rl_match_type: name_match.pre_rl_match_type.clone(),
-            });
+    // Ensure entity_id_1 < entity_id_2 for the DB insert
+    let (ordered_id_1, ordered_id_2, ordered_match_values) = 
+        if original_entity_id_1.0 <= original_entity_id_2.0 {
+            (original_entity_id_1, original_entity_id_2, match_values.clone())
         } else {
-            // This shouldn't happen for name matching
-            ordered_match_values = match_values.clone();
-        }
-    }
+            // Swap IDs and adjust MatchValues if it's NameMatchValue
+            let new_mv = if let MatchValues::Name(name_match) = match_values {
+                MatchValues::Name(NameMatchValue {
+                    original_name1: name_match.original_name2.clone(),
+                    original_name2: name_match.original_name1.clone(),
+                    normalized_name1: name_match.normalized_name2.clone(),
+                    normalized_name2: name_match.normalized_name1.clone(),
+                    pre_rl_match_type: name_match.pre_rl_match_type.clone(),
+                })
+            } else {
+                match_values.clone()
+            };
+            (original_entity_id_2, original_entity_id_1, new_mv)
+        };
 
-    // Serialize match values
     let match_values_json = serde_json::to_value(&ordered_match_values)
         .context("Name: Failed to serialize match values")?;
 
-    let empty_string = "".to_string();
-    // Extract name-specific data (using ordered match values)
-    let (original_name1, original_name2, normalized_name1, normalized_name2, pre_rl_match_type) =
-        match &ordered_match_values {
-            MatchValues::Name(n) => (
-                &n.original_name1,
-                &n.original_name2,
-                &n.normalized_name1,
-                &n.normalized_name2,
-                n.pre_rl_match_type.as_ref().unwrap_or(&empty_string),
-            ),
-            _ => (
-                &String::new(),
-                &String::new(),
-                &String::new(),
-                &String::new(),
-                &String::new(),
-            ),
-        };
-
-    // Try to get tuned confidence score (RL-based) before inserting
-    // IMPORTANT: Use ordered_id_1 and ordered_id_2 here to maintain consistency
-    let mut tuned_confidence = final_confidence_score;
-    let mut features_for_snapshot: Option<Vec<f64>> = None;
-
-    if let Some(ro_arc) = reinforcement_orchestrator {
-        // Use the feature cache if available
-        match if let Some(cache) = feature_cache.as_ref() {
-            // Use the cache through the orchestrator
-            let orchestrator_guard = ro_arc.lock().await;
-            orchestrator_guard
-                .get_pair_features(pool, ordered_id_1, ordered_id_2)
-                .await
+    // Extract name-specific data from ordered_match_values for suggestion details
+    let (sugg_orig_name1, sugg_orig_name2, sugg_norm_name1, sugg_norm_name2, sugg_pre_rl_match_type) =
+        if let MatchValues::Name(n) = &ordered_match_values {
+            (
+                n.original_name1.clone(),
+                n.original_name2.clone(),
+                n.normalized_name1.clone(),
+                n.normalized_name2.clone(),
+                n.pre_rl_match_type.clone().unwrap_or_default(),
+            )
         } else {
-            // Fall back to direct extraction if no cache
-            MatchingOrchestrator::extract_pair_context_features(pool, ordered_id_1, ordered_id_2)
-                .await
-        } {
-            Ok(features_vec) => {
-                if !features_vec.is_empty() {
-                    features_for_snapshot = Some(features_vec.clone());
-                    let orchestrator_guard = ro_arc.lock().await;
-                    match orchestrator_guard.get_tuned_confidence(
-                        &MatchMethodType::Name,
-                        pre_rl_confidence_score,
-                        &features_vec,
-                    ) {
-                        Ok(tuned_score) => tuned_confidence = tuned_score,
-                        Err(e) => warn!("Name: Failed to get tuned confidence for ({}, {}): {}. Using pre-RL score.", 
-                                       ordered_id_1.0, ordered_id_2.0, e),
-                    }
-                }
-            }
-            Err(e) => warn!(
-                "Name: Failed to extract features for ({}, {}): {}. Using pre-RL score.",
-                ordered_id_1.0, ordered_id_2.0, e
-            ),
-        }
-    }
+            (String::new(), String::new(), String::new(), String::new(), String::new())
+        };
+    
+    // Note: RL tuning and feature extraction for `final_confidence_score` and `features_for_snapshot`
+    // are now expected to happen *before* calling `create_entity_group`.
+    // `final_confidence_score` is passed in directly.
 
-    // Insert entity group using ordered IDs
     let rows_affected = tx
         .execute(
             INSERT_ENTITY_GROUP_SQL,
             &[
                 &new_entity_group_id.0,
-                &ordered_id_1.0, // Using the ordered entity ID
-                &ordered_id_2.0, // Using the ordered entity ID
+                &ordered_id_1.0,
+                &ordered_id_2.0,
                 &MatchMethodType::Name.as_str(),
                 &match_values_json,
-                &tuned_confidence, // Now using tuned value
+                &final_confidence_score, // Use the passed-in final_confidence_score
                 &pre_rl_confidence_score,
             ],
         )
         .await?;
 
     if rows_affected > 0 {
-        // Create suggestion for low confidence matches if needed
-        if tuned_confidence < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-            let priority = if tuned_confidence < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
-                2
-            } else {
-                1
-            };
-
+        if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
+            let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 };
             let details_json = serde_json::json!({
                 "method_type": MatchMethodType::Name.as_str(),
-                "original_name1": original_name1,
-                "original_name2": original_name2,
-                "normalized_name1": normalized_name1,
-                "normalized_name2": normalized_name2,
+                "original_name1": sugg_orig_name1, // Use extracted suggestion names
+                "original_name2": sugg_orig_name2,
+                "normalized_name1": sugg_norm_name1,
+                "normalized_name2": sugg_norm_name2,
                 "pre_rl_score": pre_rl_confidence_score,
-                "pre_rl_match_type": pre_rl_match_type,
+                "pre_rl_match_type": sugg_pre_rl_match_type,
                 "entity_group_id": &new_entity_group_id.0,
             });
-
             let reason_message = format!(
                 "Pair ({}, {}) matched by Name with low tuned confidence ({:.4}). Pre-RL: {:.2} ({}).",
-                ordered_id_1.0, ordered_id_2.0, tuned_confidence, pre_rl_confidence_score, pre_rl_match_type
+                ordered_id_1.0, ordered_id_2.0, final_confidence_score, pre_rl_confidence_score, sugg_pre_rl_match_type
             );
-
-            // Insert suggestion directly in this transaction
             const INSERT_SUGGESTION_SQL: &str = "
                 INSERT INTO clustering_metadata.suggested_actions (
                     pipeline_run_id, action_type, entity_id, group_id_1, group_id_2, cluster_id,
@@ -719,79 +628,37 @@ async fn create_entity_group(
                     reviewer_id, reviewed_at, review_notes
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 RETURNING id";
-
-            if let Err(e) = tx
-                .query_one(
-                    INSERT_SUGGESTION_SQL,
-                    &[
-                        &Some(pipeline_run_id.to_string()),
-                        &ActionType::ReviewEntityInGroup.as_str(),
-                        &None::<String>,
-                        &Some(new_entity_group_id.0.clone()),
-                        &None::<String>,
-                        &None::<String>,
-                        &Some(tuned_confidence),
-                        &Some(details_json),
-                        &Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
-                        &Some(reason_message),
-                        &(priority as i32),
-                        &SuggestionStatus::PendingReview.as_str(),
-                        &None::<String>,
-                        &None::<NaiveDateTime>,
-                        &None::<String>,
-                    ],
-                )
-                .await
-            {
-                warn!("Name: Failed to create suggestion: {}", e);
-            }
+            if let Err(e) = tx.query_one(INSERT_SUGGESTION_SQL, &[
+                &Some(pipeline_run_id.to_string()), &ActionType::ReviewEntityInGroup.as_str(),
+                &None::<String>, &Some(new_entity_group_id.0.clone()), &None::<String>, &None::<String>,
+                &Some(final_confidence_score), &Some(details_json),
+                &Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()), &Some(reason_message),
+                &(priority as i32), &SuggestionStatus::PendingReview.as_str(),
+                &None::<String>, &None::<NaiveDateTime>, &None::<String>,
+            ]).await { warn!("Name: Failed to create suggestion: {}", e); }
         }
 
-        // Log decision snapshot if features were extracted
-        if let (Some(ro_arc), Some(features_vec)) =
-            (reinforcement_orchestrator, features_for_snapshot.as_ref())
-        {
+        if let (Some(ro_arc), Some(features_vec)) = (reinforcement_orchestrator, features_for_snapshot.as_ref()) {
             let orchestrator_guard = ro_arc.lock().await;
             let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
-
-            let snapshot_features_json =
-                serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
-
-            // Insert decision directly with SQL to avoid verification
+            let snapshot_features_json = serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
             const INSERT_DECISION_SQL: &str = "
                 INSERT INTO clustering_metadata.match_decision_details (
                     entity_group_id, pipeline_run_id, snapshotted_features,
                     method_type_at_decision, pre_rl_confidence_at_decision,
                     tuned_confidence_at_decision, confidence_tuner_version_at_decision
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id";
-
-            if let Err(e) = tx
-                .query_one(
-                    INSERT_DECISION_SQL,
-                    &[
-                        &new_entity_group_id.0,
-                        &pipeline_run_id,
-                        &snapshot_features_json,
-                        &MatchMethodType::Name.as_str(),
-                        &pre_rl_confidence_score,
-                        &tuned_confidence,
-                        &(confidence_tuner_ver as i32),
-                    ],
-                )
-                .await
-            {
-                warn!("Name: Failed to log decision snapshot: {}", e);
-            }
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id";
+            if let Err(e) = tx.query_one(INSERT_DECISION_SQL, &[
+                &new_entity_group_id.0, &pipeline_run_id, &snapshot_features_json,
+                &MatchMethodType::Name.as_str(), &pre_rl_confidence_score,
+                &final_confidence_score, &(confidence_tuner_ver as i32),
+            ]).await { warn!("Name: Failed to log decision snapshot: {}", e); }
         }
-
-        // Commit the transaction with all operations
         tx.commit().await?;
         Ok(true)
     } else {
-        // No rows affected, possibly already exists due to concurrent operations
-        tx.commit().await?;
-        debug!("Name: No rows affected when inserting entity group, pair may already exist");
+        tx.commit().await?; // Commit even if no rows affected to release connection
+        debug!("Name: No rows affected when inserting entity group for ({}, {}), pair may already exist or conflict occurred.", ordered_id_1.0, ordered_id_2.0);
         Ok(false)
     }
 }
@@ -849,50 +716,29 @@ async fn get_organization_embeddings(
         return Ok(embeddings);
     }
     let org_ids_vec: Vec<String> = org_ids.into_iter().collect();
-
-    let batch_size = 100; // Or a configurable value
+    let batch_size = 100;
     debug!(
         "Fetching embeddings for {} unique organizations in batches of {}...",
         org_ids_vec.len(),
         batch_size
     );
 
-    // Chunk processing for fetching embeddings
     for batch_org_ids_str_slice in org_ids_vec.chunks(batch_size) {
-        // Convert slice of String to slice of &str for the query parameter
         let batch_org_ids_refs: Vec<&str> =
             batch_org_ids_str_slice.iter().map(AsRef::as_ref).collect();
-
         let query = "SELECT id, embedding FROM public.organization WHERE id = ANY($1::TEXT[]) AND embedding IS NOT NULL";
-
-        let rows = conn
-            .query(query, &[&batch_org_ids_refs]) // Pass as slice of &str
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to query org embeddings for batch: {:?}",
-                    batch_org_ids_refs
-                )
-            })?;
-
+        let rows = conn.query(query, &[&batch_org_ids_refs]).await
+            .with_context(|| format!("Failed to query org embeddings for batch: {:?}", batch_org_ids_refs))?;
         for row in rows {
-            let org_id_str: String = row
-                .try_get("id")
-                .context("Failed to get 'id' for organization embedding row")?;
-            let embedding_vec_opt: Option<Vec<f32>> = row.try_get("embedding").ok(); // .ok() converts Result to Option
-
+            let org_id_str: String = row.try_get("id").context("Failed to get 'id' for organization embedding row")?;
+            let embedding_vec_opt: Option<Vec<f32>> = row.try_get("embedding").ok();
             if let Some(embedding_vec) = embedding_vec_opt {
-                // Find all entities associated with this org_id and store the embedding
-                for entity in entities
-                    .iter()
-                    .filter(|e| e.organization_id.0 == org_id_str)
-                {
+                for entity in entities.iter().filter(|e| e.organization_id.0 == org_id_str) {
                     embeddings.insert(entity.id.clone(), Some(embedding_vec.clone()));
                 }
             }
         }
     }
-    // Ensure all entities from the input list have an entry in the map, even if None
     for entity in entities {
         embeddings.entry(entity.id.clone()).or_insert(None);
     }
@@ -904,8 +750,9 @@ async fn get_organization_embeddings(
     Ok(embeddings)
 }
 
-/// Helper to fetch existing pairs
-async fn fetch_existing_pairs(
+/// Helper to fetch existing entity_group pairs to avoid re-creating them.
+/// This is distinct from the comparison_cache.
+async fn fetch_existing_entity_group_pairs(
     conn: &impl tokio_postgres::GenericClient,
     method_type: MatchMethodType,
 ) -> Result<HashSet<(EntityId, EntityId)>> {
@@ -913,12 +760,13 @@ async fn fetch_existing_pairs(
     let rows = conn
         .query(query, &[&method_type.as_str()])
         .await
-        .with_context(|| format!("Failed to query existing {:?}-matched pairs", method_type))?;
+        .with_context(|| format!("Failed to query existing {:?}-matched entity_group pairs", method_type))?;
 
     let mut existing_pairs = HashSet::new();
     for row in rows {
         let id1_str: String = row.get("entity_id_1");
         let id2_str: String = row.get("entity_id_2");
+        // Ensure consistent order for the set
         if id1_str < id2_str {
             existing_pairs.insert((EntityId(id1_str), EntityId(id2_str)));
         } else {
@@ -928,160 +776,76 @@ async fn fetch_existing_pairs(
     Ok(existing_pairs)
 }
 
-/// Enhanced normalize_name function with entity type detection
-fn normalize_name(name: &str) -> (String, Option<&'static str>) {
-    let mut normalized = name.to_lowercase();
 
-    // Clean noise prefixes
+/// Enhanced normalize_name function with entity type detection
+pub fn normalize_name(name: &str) -> (String, Option<&'static str>) {
+    let mut normalized = name.to_lowercase();
     for prefix in &NOISE_PREFIXES {
         if normalized.starts_with(prefix) {
             normalized = normalized[prefix.len()..].trim().to_string();
         }
     }
-
-    // Handle special character substitutions
     let char_substitutions = [
-        ("&", " and "),
-        ("+", " plus "),
-        ("/", " "),
-        ("-", " "),
-        (".", " "),
-        ("'", ""),
-        ("(", " "),
-        (")", " "),
-        (",", " "),
+        ("&", " and "), ("+", " plus "), ("/", " "), ("-", " "),
+        (".", " "), ("'", ""), ("(", " "), (")", " "), (",", " "),
     ];
-
     for (pattern, replacement) in &char_substitutions {
         normalized = normalized.replace(pattern, replacement);
     }
-
-    // Detect organization type early for specialized handling
     let entity_type = detect_entity_type(&normalized);
-
-    // Apply specialized normalization based on entity type
     if let Some(etype) = entity_type {
         match etype {
             "city" => {
-                // For cities, preserve the city name part carefully
                 if let Some(stripped) = normalized.strip_prefix("city of ") {
                     let city_name = stripped.trim();
-                    // Don't remove suffixes from city names
                     return (format!("city of {}", city_name), Some(etype));
                 }
             }
             "police" => {
-                // Standardize police department names
                 normalized = normalized.replace("pd", "police department");
                 normalized = normalized.replace("police dept", "police department");
             }
             "fire" => {
-                // Standardize fire department names
                 normalized = normalized.replace("fd", "fire department");
                 normalized = normalized.replace("fire dept", "fire department");
             }
             "hospital" => {
-                // Standardize medical facility terms
                 normalized = normalized.replace("medical center", "hospital");
                 normalized = normalized.replace("med ctr", "hospital");
                 normalized = normalized.replace("med center", "hospital");
             }
             "education" => {
-                // Standardize educational institution terms
                 normalized = normalized.replace("school dist", "school district");
                 normalized = normalized.replace("sd", "school district");
             }
             _ => {}
         }
     }
-
-    // Common prefixes to handle specially
     let prefixes = ["the ", "a ", "an "];
-
     for prefix in prefixes {
         if normalized.starts_with(prefix) {
             normalized = normalized[prefix.len()..].to_string();
         }
     }
-
-    // Common suffixes to remove (ensure spaces for whole word, or handle carefully)
     let suffixes = [
-        " incorporated",
-        " inc.",
-        " inc",
-        " corporation",
-        " corp.",
-        " corp",
-        " limited liability company",
-        " llc.",
-        " llc",
-        " limited",
-        " ltd.",
-        " ltd",
-        " limited partnership",
-        " lp.",
-        " lp",
-        " limited liability partnership",
-        " llp.",
-        " llp",
-        " foundation",
-        " trust",
-        " charitable trust",
-        " company",
-        " co.",
-        " co",
-        " non-profit",
-        " nonprofit",
-        " nfp",
-        " association",
-        " assn.",
-        " assn",
-        " coop",
-        " co-op",
-        " cooperative",
-        " npo",
-        " organisation",
-        " organization",
-        " org.",
-        " org",
-        " coalition",
-        " fund",
-        " partnership",
-        " academy",
-        " consortium",
-        " institute",
-        " services",
-        " group",
-        " society",
-        " network",
-        " federation",
-        " international",
-        " global",
-        " national",
-        " alliance",
-        " gmbh",
-        " ag",
-        " sarl",
-        " bv",
-        " spa",
-        " pty",
-        " plc",
-        " p.c.",
-        " pc",
+        " incorporated", " inc.", " inc", " corporation", " corp.", " corp",
+        " limited liability company", " llc.", " llc", " limited", " ltd.", " ltd",
+        " limited partnership", " lp.", " lp", " limited liability partnership", " llp.", " llp",
+        " foundation", " trust", " charitable trust", " company", " co.", " co",
+        " non-profit", " nonprofit", " nfp", " association", " assn.", " assn",
+        " coop", " co-op", " cooperative", " npo", " organisation", " organization",
+        " org.", " org", " coalition", " fund", " partnership", " academy", " consortium",
+        " institute", " services", " group", " society", " network", " federation",
+        " international", " global", " national", " alliance", " gmbh", " ag", " sarl",
+        " bv", " spa", " pty", " plc", " p.c.", " pc",
     ];
-
-    // Skip suffix removal for city names
     if entity_type != Some("city") {
         for suffix in suffixes {
             if normalized.ends_with(suffix) {
-                normalized = normalized[..normalized.len() - suffix.len()]
-                    .trim_end()
-                    .to_string();
+                normalized = normalized[..normalized.len() - suffix.len()].trim_end().to_string();
             }
         }
     }
-
-    // Extract location in parentheses for special handling (e.g., "YWCA (Seattle)")
     let mut location_suffix = None;
     let paren_regex = Regex::new(r"\s*\((.*?)\)\s*$").unwrap_or_else(|_| Regex::new(r"").unwrap());
     if let Some(captures) = paren_regex.captures(&normalized) {
@@ -1090,92 +854,46 @@ fn normalize_name(name: &str) -> (String, Option<&'static str>) {
             normalized = paren_regex.replace(&normalized, "").to_string();
         }
     }
-
-    // Regex-based replacements for common abbreviations within the name
     let replacements = [
-        (r"\b(ctr|cntr|cent|cen)\b", "center"),
-        (r"\b(assoc|assn)\b", "association"),
-        (r"\b(dept|dpt)\b", "department"),
-        (r"\b(intl|int'l)\b", "international"),
-        (r"\b(nat'l|natl)\b", "national"),
-        (r"\b(comm|cmty)\b", "community"),
-        (r"\b(srv|svcs|serv|svc)\b", "service"),
-        (r"\b(univ)\b", "university"),
-        (r"\b(coll)\b", "college"),
-        (r"\b(inst)\b", "institute"),
-        (r"\b(mfg)\b", "manufacturing"),
-        (r"\b(tech)\b", "technology"),
-        (r"\b(st)\b", "saint"),
-        (r"\bwa\b", "washington"),
-        // Specific organization types for better matching
-        (r"\b(fd)\b", "fire department"),
-        (r"\b(pd)\b", "police department"),
-        // Remove standalone legal terms
-        (r"\binc\b", ""),
-        (r"\bcorp\b", ""),
-        (r"\bllc\b", ""),
-        (r"\bltd\b", ""),
+        (r"\b(ctr|cntr|cent|cen)\b", "center"), (r"\b(assoc|assn)\b", "association"),
+        (r"\b(dept|dpt)\b", "department"), (r"\b(intl|int'l)\b", "international"),
+        (r"\b(nat'l|natl)\b", "national"), (r"\b(comm|cmty)\b", "community"),
+        (r"\b(srv|svcs|serv|svc)\b", "service"), (r"\b(univ)\b", "university"),
+        (r"\b(coll)\b", "college"), (r"\b(inst)\b", "institute"),
+        (r"\b(mfg)\b", "manufacturing"), (r"\b(tech)\b", "technology"),
+        (r"\b(st)\b", "saint"), (r"\bwa\b", "washington"),
+        (r"\b(fd)\b", "fire department"), (r"\b(pd)\b", "police department"),
+        (r"\binc\b", ""), (r"\bcorp\b", ""), (r"\bllc\b", ""), (r"\bltd\b", ""),
     ];
-
     for (pattern, replacement) in &replacements {
         match Regex::new(pattern) {
-            Ok(re) => {
-                normalized = re.replace_all(&normalized, *replacement).into_owned();
-            }
-            Err(e) => {
-                warn!("Invalid regex pattern: '{}'. Error: {}", pattern, e);
-            }
+            Ok(re) => normalized = re.replace_all(&normalized, *replacement).into_owned(),
+            Err(e) => warn!("Invalid regex pattern: '{}'. Error: {}", pattern, e),
         }
     }
-
-    // Remove all non-alphanumeric characters except spaces
-    normalized = normalized
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect();
-
-    // Normalize whitespace
+    normalized = normalized.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
     normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    // Reattach location suffix for branch/location awareness
     if let Some(location) = location_suffix {
         if !location.is_empty() {
-            // Only reattach if not empty after normalization
             normalized = format!("{} {}", normalized.trim(), location.trim());
         }
     }
-
     (normalized.trim().to_string(), entity_type)
 }
 
 /// Detect organization type based on name patterns
 fn detect_entity_type(normalized_name: &str) -> Option<&'static str> {
     let type_indicators = [
-        ("city of", "city"),
-        ("county", "county"),
-        ("police department", "police"),
-        ("fire department", "fire"),
-        ("hospital", "hospital"),
-        ("medical center", "hospital"),
-        ("health", "health"),
-        ("school district", "education"),
-        ("school", "education"),
-        ("college", "education"),
-        ("university", "education"),
-        ("church", "religious"),
-        ("food bank", "food"),
-        ("library", "library"),
-        ("senior center", "senior"),
-        ("ymca", "recreation"),
-        ("community center", "community"),
+        ("city of", "city"), ("county", "county"), ("police department", "police"),
+        ("fire department", "fire"), ("hospital", "hospital"), ("medical center", "hospital"),
+        ("health", "health"), ("school district", "education"), ("school", "education"),
+        ("college", "education"), ("university", "education"), ("church", "religious"),
+        ("food bank", "food"), ("library", "library"), ("senior center", "senior"),
+        ("ymca", "recreation"), ("community center", "community"),
     ];
-
     for (indicator, entity_type) in &type_indicators {
-        if normalized_name.contains(indicator) {
-            return Some(entity_type);
-        }
+        if normalized_name.contains(indicator) { return Some(entity_type); }
     }
-
     None
 }
 
@@ -1187,115 +905,56 @@ fn tokenize_name(
 ) -> (HashSet<String>, Vec<(String, f32)>) {
     let mut tokens = HashSet::new();
     let mut weighted_tokens = Vec::new();
-
-    // Process words
     let words: Vec<&str> = normalized_name.split_whitespace().collect();
-
-    // First pass: process individual words
     for word in &words {
         let token = word.to_lowercase();
-
-        // Skip stopwords and very short tokens
         if !stopwords.contains(&token) && token.len() >= MIN_TOKEN_LENGTH {
             tokens.insert(token.clone());
-
-            // Get context-aware weight for this token
             let weight = get_token_weight(&token, entity_type);
             weighted_tokens.push((token, weight));
         }
     }
-
-    // Second pass: add bigrams for better phrase matching
     for i in 0..words.len().saturating_sub(1) {
         let bigram = format!("{} {}", words[i], words[i + 1]).to_lowercase();
-        if bigram.len() >= 2 * MIN_TOKEN_LENGTH {
+        if bigram.len() >= 2 * MIN_TOKEN_LENGTH { // Ensure bigram is reasonably long
             tokens.insert(bigram.clone());
-
-            // Bigrams get higher weight because they're more specific
-            let weight = 1.5;
-            weighted_tokens.push((bigram, weight));
+            weighted_tokens.push((bigram, 1.5)); // Bigrams get higher weight
         }
     }
-
-    // Special case for cities - make the city name extremely important
     if entity_type == Some("city") && normalized_name.starts_with("city of ") {
         if let Some(city_name) = normalized_name.strip_prefix("city of ") {
             let city = city_name.trim().to_string();
-            // Add the full city name as a special token with very high weight
             if !city.is_empty() {
                 tokens.insert(city.clone());
                 weighted_tokens.push((city, 3.0)); // Very high weight for city name
             }
         }
     }
-
     (tokens, weighted_tokens)
 }
 
-/// Calculate context-aware token weight based on token importance
+/// Calculate context-aware token weight
 fn get_token_weight(token: &str, entity_type: Option<&str>) -> f32 {
-    // Common words get lower weight
     let common_words = [
-        "the",
-        "and",
-        "of",
-        "in",
-        "for",
-        "at",
-        "with",
-        "by",
-        "on",
-        "to",
-        "service",
-        "services",
-        "center",
-        "association",
-        "organization",
+        "the", "and", "of", "in", "for", "at", "with", "by", "on", "to",
+        "service", "services", "center", "association", "organization",
     ];
-
-    if common_words.contains(&token) {
-        return 0.5; // Lower weight for common words
-    }
-
-    // Location names get medium weight
-    if LOCATION_PREFIXES.contains(&token) {
-        return 0.8; // Medium weight for location prefixes
-    }
-
-    // Entity type indicators get high weight
+    if common_words.contains(&token) { return 0.5; }
+    if LOCATION_PREFIXES.contains(&token) { return 0.8; }
     let type_indicators = [
         "police", "fire", "hospital", "school", "college", "church", "bank", "library",
     ];
-
-    if type_indicators.contains(&token) {
-        return 2.0; // Higher weight for entity type indicators
-    }
-
-    // Adjust weight based on entity type if available
+    if type_indicators.contains(&token) { return 2.0; }
     if let Some(etype) = entity_type {
         match etype {
-            "city" => {
-                if token == "city" {
-                    0.5
-                } else {
-                    1.5
-                }
-            } // City name more important than "city"
-            "education" => {
-                if token == "school" || token == "college" {
-                    1.5
-                } else {
-                    1.2
-                }
-            }
+            "city" => if token == "city" { 0.5 } else { 1.5 },
+            "education" => if token == "school" || token == "college" { 1.5 } else { 1.2 },
             _ => 1.0,
         }
-    } else {
-        1.0 // Default weight
-    }
+    } else { 1.0 }
 }
 
-/// Domain-specific rule application for name matching
+/// Domain-specific rule application
 fn apply_domain_rules(
     normalized_name1: &str,
     normalized_name2: &str,
@@ -1303,194 +962,90 @@ fn apply_domain_rules(
     entity_type1: Option<&'static str>,
     entity_type2: Option<&'static str>,
 ) -> f32 {
-    // Rule 1: Special handling for city matching
     let is_city1 = normalized_name1.starts_with("city of ");
     let is_city2 = normalized_name2.starts_with("city of ");
-
     if is_city1 && is_city2 {
-        let city_name1 = normalized_name1
-            .strip_prefix("city of ")
-            .unwrap_or(normalized_name1)
-            .trim();
-        let city_name2 = normalized_name2
-            .strip_prefix("city of ")
-            .unwrap_or(normalized_name2)
-            .trim();
-
-        // If city names differ at all, apply severe penalty based on how different they are
+        let city_name1 = normalized_name1.strip_prefix("city of ").unwrap_or(normalized_name1).trim();
+        let city_name2 = normalized_name2.strip_prefix("city of ").unwrap_or(normalized_name2).trim();
         if city_name1 != city_name2 {
-            // Calculate edit distance between city names
             let edit_distance = levenshtein_distance(city_name1, city_name2);
-
-            // If edit distance is more than 3 characters or >30% of length, severely penalize
             let max_length = std::cmp::max(city_name1.len(), city_name2.len());
-            if edit_distance > 3
-                || (max_length > 0 && edit_distance as f32 / max_length as f32 > 0.3)
-            {
-                return pre_rl_score * 0.6; // 40% penalty
-            } else {
-                // Less penalty for very similar city names
-                return pre_rl_score * 0.8; // 20% penalty
-            }
+            if edit_distance > 3 || (max_length > 0 && edit_distance as f32 / max_length as f32 > 0.3) {
+                return pre_rl_score * 0.6;
+            } else { return pre_rl_score * 0.8; }
         }
     }
-
-    // Rule 2: Organization type compatibility
     if let (Some(t1), Some(t2)) = (entity_type1, entity_type2) {
-        if t1 != t2 {
-            // Already checked for incompatible types in the main function
-            // Here we just apply a penalty for different but not explicitly incompatible types
-            return pre_rl_score * 0.85; // 15% penalty
-        }
+        if t1 != t2 { return pre_rl_score * 0.85; }
     }
-
-    // Rule 3: Special handling for department names
     if normalized_name1.contains("department") || normalized_name2.contains("department") {
-        // If only one contains "department" or they contain different department types
-        let dept_types = [
-            "police",
-            "fire",
-            "health",
-            "public",
-            "revenue",
-            "transportation",
-        ];
-
+        let dept_types = ["police", "fire", "health", "public", "revenue", "transportation"];
         for dept_type in &dept_types {
-            let type1_present = normalized_name1.contains(dept_type);
-            let type2_present = normalized_name2.contains(dept_type);
-
-            if type1_present != type2_present {
-                // Different department types
-                return pre_rl_score * 0.75; // 25% penalty
+            if normalized_name1.contains(dept_type) != normalized_name2.contains(dept_type) {
+                return pre_rl_score * 0.75;
             }
         }
     }
-
-    // Rule 4: Names that share only common words/location prefixes
     let words1: Vec<&str> = normalized_name1.split_whitespace().collect();
     let words2: Vec<&str> = normalized_name2.split_whitespace().collect();
-
-    // Find common prefix words
     let mut common_prefix_len = 0;
     for i in 0..std::cmp::min(words1.len(), words2.len()) {
-        if words1[i] == words2[i] {
-            common_prefix_len += 1;
-        } else {
-            break;
-        }
+        if words1[i] == words2[i] { common_prefix_len += 1; } else { break; }
     }
-
-    // If names only share common prefix but are otherwise different
-    if common_prefix_len > 0 && common_prefix_len < words1.len() && common_prefix_len < words2.len()
-    {
-        // Calculate what percentage of words are in the common prefix
+    if common_prefix_len > 0 && common_prefix_len < words1.len() && common_prefix_len < words2.len() {
         let total_words = words1.len() + words2.len();
         let common_prefix_percentage = (2 * common_prefix_len) as f32 / total_words as f32;
-
-        // If common prefix is a significant portion of the names
         if common_prefix_percentage > 0.3 {
-            // Check if the remaining words are distinctly different
-            let remaining_similarity = jaro_winkler(
-                &words1[common_prefix_len..].join(" "),
-                &words2[common_prefix_len..].join(" "),
-            );
-
-            // If the remaining parts are significantly different
-            if remaining_similarity < 0.7 {
-                return pre_rl_score * (0.9 - (common_prefix_percentage * 0.2)); // Penalty based on prefix ratio
-            }
+            let remaining_similarity = jaro_winkler(&words1[common_prefix_len..].join(" "), &words2[common_prefix_len..].join(" "));
+            if remaining_similarity < 0.7 { return pre_rl_score * (0.9 - (common_prefix_percentage * 0.2)); }
         }
     }
-
-    // Rule 5: Handle common location prefixes
     for prefix in &LOCATION_PREFIXES {
         if normalized_name1.starts_with(prefix) && normalized_name2.starts_with(prefix) {
             let suffix1 = normalized_name1[prefix.len()..].trim();
             let suffix2 = normalized_name2[prefix.len()..].trim();
-
             if !suffix1.is_empty() && !suffix2.is_empty() && jaro_winkler(suffix1, suffix2) < 0.8 {
-                return pre_rl_score * 0.8; // 20% penalty for different suffixes after common prefix
+                return pre_rl_score * 0.8;
             }
         }
     }
-
-    // Rule 6: Special handling for branches/locations in parentheses
     let location_regex = Regex::new(r"\b([a-z]+)$").unwrap_or_else(|_| Regex::new(r"").unwrap());
-    if let (Some(loc1_match), Some(loc2_match)) = (
-        location_regex.find(normalized_name1),
-        location_regex.find(normalized_name2),
-    ) {
+     if let (Some(loc1_match), Some(loc2_match)) = (location_regex.find(normalized_name1), location_regex.find(normalized_name2)) {
         let loc1 = loc1_match.as_str();
         let loc2 = loc2_match.as_str();
-
-        // Check if names differ only by location suffix
         let name1_without_loc = &normalized_name1[0..loc1_match.start()].trim();
         let name2_without_loc = &normalized_name2[0..loc2_match.start()].trim();
-
-        if name1_without_loc == name2_without_loc && loc1 != loc2 {
-            // Same organization but different locations
-            return pre_rl_score * 0.7; // 30% penalty
-        }
+        if name1_without_loc == name2_without_loc && loc1 != loc2 { return pre_rl_score * 0.7; }
     }
-
-    // If no rules triggered, return the original score
     pre_rl_score
 }
 
-/// Calculate Levenshtein edit distance for better city name comparison
+/// Calculate Levenshtein edit distance
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     let s1_chars: Vec<char> = s1.chars().collect();
     let s2_chars: Vec<char> = s2.chars().collect();
-
-    let len1 = s1_chars.len();
-    let len2 = s2_chars.len();
-
-    if len1 == 0 {
-        return len2;
-    }
-    if len2 == 0 {
-        return len1;
-    }
-
+    let (len1, len2) = (s1_chars.len(), s2_chars.len());
+    if len1 == 0 { return len2; } if len2 == 0 { return len1; }
     let mut matrix = vec![vec![0; len2 + 1]; len1 + 1];
-
-    for i in 0..=len1 {
-        matrix[i][0] = i;
-    }
-
-    for j in 0..=len2 {
-        matrix[0][j] = j;
-    }
-
+    for i in 0..=len1 { matrix[i][0] = i; }
+    for j in 0..=len2 { matrix[0][j] = j; }
     for i in 1..=len1 {
         for j in 1..=len2 {
-            let cost = if s1_chars[i - 1] == s2_chars[j - 1] {
-                0
-            } else {
-                1
-            };
-
-            matrix[i][j] = std::cmp::min(
-                std::cmp::min(
-                    matrix[i - 1][j] + 1, // deletion
-                    matrix[i][j - 1] + 1, // insertion
-                ),
-                matrix[i - 1][j - 1] + cost, // substitution
-            );
+            let cost = if s1_chars[i - 1] == s2_chars[j - 1] { 0 } else { 1 };
+            matrix[i][j] = std::cmp::min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1).min(matrix[i - 1][j - 1] + cost);
         }
     }
-
     matrix[len1][len2]
 }
 
+/// Prepare entity data and create token inverted index.
 async fn prepare_entity_data_and_index(
     all_entities: &[Entity],
     stopwords: &HashSet<String>,
 ) -> (
-    Vec<EntityNameData>,
-    HashMap<String, Vec<usize>>,
-    HashMap<String, TokenStats>,
+    Vec<EntityNameData>, // Stores processed entity data
+    HashMap<String, Vec<usize>>, // Token -> List of entity indices
+    HashMap<String, TokenStats>, // Token -> TokenStats (freq, idf)
 ) {
     let mut entity_data_vec = Vec::with_capacity(all_entities.len());
     let mut token_frequency: HashMap<String, usize> = HashMap::new();
@@ -1499,8 +1054,7 @@ async fn prepare_entity_data_and_index(
         if let Some(name) = &entity.name {
             let (normalized_name, entity_type) = normalize_name(name);
             if !normalized_name.is_empty() {
-                let (tokens, weighted_tokens) =
-                    tokenize_name(&normalized_name, stopwords, entity_type);
+                let (tokens, weighted_tokens) = tokenize_name(&normalized_name, stopwords, entity_type);
                 for token in &tokens {
                     *token_frequency.entry(token.clone()).or_insert(0) += 1;
                 }
@@ -1518,34 +1072,26 @@ async fn prepare_entity_data_and_index(
     let total_docs = entity_data_vec.len() as f32;
     let mut token_stats_map = HashMap::new();
     for (token, freq) in token_frequency {
-        let idf = (total_docs / (freq as f32 + 1.0)).ln(); // Add 1 to avoid ln(0) if freq is total_docs
-        token_stats_map.insert(
-            token.clone(),
-            TokenStats {
-                token,
-                frequency: freq,
-                idf,
-            },
-        );
+        let idf = (total_docs / (freq as f32 + 1.0)).ln_1p().max(0.0); // ln_1p for stability, ensure non-negative
+        token_stats_map.insert(token.clone(), TokenStats { token, frequency: freq, idf });
     }
 
-    let max_common_token_freq = (entity_data_vec.len() as f32 * 0.05).max(10.0) as usize; // Heuristic
+    // Heuristic: ignore tokens present in more than 5% of entities or fewer than 2 entities, or very common tokens.
+    let max_common_token_freq = (entity_data_vec.len() as f32 * 0.05).max(10.0) as usize;
     let mut token_to_entities_map: HashMap<String, Vec<usize>> = HashMap::new();
 
     for (idx, data) in entity_data_vec.iter().enumerate() {
-        let mut scored_tokens: Vec<(String, f32)> = data
-            .tokens
-            .iter()
+        let mut scored_tokens: Vec<(String, f32)> = data.tokens.iter()
             .filter_map(|token| {
                 token_stats_map.get(token).and_then(|stats| {
-                    if stats.frequency <= max_common_token_freq && token.len() >= MIN_TOKEN_LENGTH {
-                        Some((token.clone(), stats.idf)) // Using IDF as score for simplicity here
-                    } else {
-                        None
-                    }
+                    // Filter out very common tokens or tokens not meeting min length
+                    if stats.frequency <= max_common_token_freq && stats.frequency > 1 && token.len() >= MIN_TOKEN_LENGTH {
+                        Some((token.clone(), stats.idf)) // Use IDF as score for selecting top tokens
+                    } else { None }
                 })
             })
             .collect();
+        // Sort by IDF (higher IDF means more discriminative)
         scored_tokens.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         for (token, _) in scored_tokens.into_iter().take(TOP_TOKENS_PER_ENTITY) {
             token_to_entities_map.entry(token).or_default().push(idx);
@@ -1554,23 +1100,33 @@ async fn prepare_entity_data_and_index(
     (entity_data_vec, token_to_entities_map, token_stats_map)
 }
 
-async fn generate_candidate_pairs(
+/// Generate candidate pairs based on token overlap from the inverted index.
+/// Returns pairs of indices into the `entity_data` vector.
+async fn generate_candidate_pairs_indices(
     entity_data: &[EntityNameData],
     token_to_entities: &HashMap<String, Vec<usize>>,
 ) -> Vec<(usize, usize)> {
-    let mut candidate_pairs_set = HashSet::new();
+    let mut candidate_pairs_set = HashSet::new(); // Stores (idx1, idx2) where idx1 < idx2
+
+    // Iterate through each entity's selected tokens to find potential matches
     for (i, data_i) in entity_data.iter().enumerate() {
         let mut potential_matches_for_i: HashMap<usize, usize> = HashMap::new(); // entity_idx -> overlap_count
-        for token in &data_i.tokens {
+        
+        // Use only the TOP_TOKENS_PER_ENTITY for candidate generation for entity_i
+        // This requires re-calculating or storing the top tokens per entity if not already done in prepare_entity_data_and_index
+        // For simplicity here, we'll iterate through all tokens of data_i, assuming they are already somewhat filtered.
+        // A more optimized approach would use the pre-selected TOP_TOKENS_PER_ENTITY for data_i.
+        for token in &data_i.tokens { // Ideally, this would be the top N tokens for data_i
             if let Some(posting_list) = token_to_entities.get(token) {
                 for &j_idx in posting_list {
-                    if i < j_idx {
-                        // Avoid self-match and duplicate pairs (i,j) vs (j,i)
+                    if i < j_idx { // Ensure i < j_idx to avoid duplicate pairs (i,j) vs (j,i) and self-matches
                         *potential_matches_for_i.entry(j_idx).or_insert(0) += 1;
                     }
                 }
             }
         }
+
+        // Add pairs to set if they meet the minimum token overlap
         for (j_idx, overlap) in potential_matches_for_i {
             if overlap >= MIN_TOKEN_OVERLAP {
                 candidate_pairs_set.insert((i, j_idx));
@@ -1580,8 +1136,8 @@ async fn generate_candidate_pairs(
     candidate_pairs_set.into_iter().collect()
 }
 
-/// Token statistics for efficient filtering
-#[derive(Debug)]
+/// Token statistics for efficient filtering and weighting.
+#[derive(Debug, Clone)] // Added Clone
 struct TokenStats {
     token: String,
     frequency: usize, // Number of entities containing this token

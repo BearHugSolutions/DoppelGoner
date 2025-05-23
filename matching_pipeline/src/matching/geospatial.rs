@@ -1,7 +1,7 @@
-// src/matching/geospatial.rs - Fixed version with better duplicate detection
+// src/matching/geospatial.rs
 use anyhow::{Context, Result};
-use chrono::NaiveDateTime;
-use futures::future::{join_all, try_join_all};
+// Removed NaiveDateTime as it wasn't used
+use futures::future::join_all; // Removed try_join_all as it wasn't strictly necessary with individual error handling
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -16,20 +16,31 @@ use crate::models::{
     NewSuggestedAction, SuggestionStatus,
 };
 use crate::reinforcement::entity::feature_cache_service::{
-    FeatureCacheService, SharedFeatureCache,
+    FeatureCacheService, SharedFeatureCache, // Assuming FeatureCacheService has get_pair_key
 };
 use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
 use crate::results::{AnyMatchResult, GeospatialMatchResult, MatchMethodStats};
 use serde_json;
 
-const METERS_TO_CHECK: f64 = 100.0; // 0.062 miles
+// Import pipeline_state_utils
+use crate::pipeline_state_utils::{
+    check_comparison_cache, get_current_signatures_for_pair, store_in_comparison_cache,
+    // EntitySignatureData and CachedComparisonResult are implicitly used via the utils
+};
 
-// Increased batch size for better efficiency
+pub const METERS_TO_CHECK: f64 = 100.0; // 0.062 miles
 const BATCH_SIZE: usize = 250;
-
-// Number of batches to process in parallel
-// This controls the maximum number of concurrent database connections used
 const MAX_PARALLEL_BATCHES: usize = 4;
+
+// SQL query for inserting into entity_group (assuming it might be needed directly or is good to have defined)
+const INSERT_ENTITY_GROUP_SQL: &str = "
+    INSERT INTO public.entity_group
+(id, entity_id_1, entity_id_2, method_type, match_values, confidence_score,
+ pre_rl_confidence_score)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING
+RETURNING id";
+
 
 /// Main function to find geospatial-based matches
 pub async fn find_matches(
@@ -39,7 +50,7 @@ pub async fn find_matches(
     feature_cache: Option<SharedFeatureCache>,
 ) -> Result<AnyMatchResult> {
     info!(
-        "Starting pairwise geospatial matching (run ID: {}){}...",
+        "Starting pairwise geospatial matching (run ID: {}){} with INCREMENTAL CHECKS...", // Log update
         pipeline_run_id,
         if reinforcement_orchestrator_option.is_some() {
             " with RL confidence tuning"
@@ -49,13 +60,11 @@ pub async fn find_matches(
     );
     let start_time = Instant::now();
 
-    // Initial database operations
     let init_conn = pool
         .get()
         .await
         .context("Geospatial: Failed to get DB connection for initial queries")?;
 
-    // Verify that entities exist in the database
     info!("Geospatial: First verifying entity existence in database...");
     let valid_entities = fetch_valid_entity_ids(&*init_conn).await?;
     info!(
@@ -63,19 +72,16 @@ pub async fn find_matches(
         valid_entities.len()
     );
 
-    // Fetch all candidate pairs in a single query with ANTI-JOIN to exclude existing pairs
+    // Fetch candidate pairs, already excluding those in entity_group for 'geospatial'
     let candidate_pairs = fetch_candidate_pairs_excluding_existing(&*init_conn).await?;
-
-    // Done with initial connection
     drop(init_conn);
 
     let total_candidate_count = candidate_pairs.len();
     info!(
-        "Geospatial: Found {} new geospatial pairs from DB query (excluding already processed).",
+        "Geospatial: Found {} new geospatial pairs from DB query (excluding already in entity_group).",
         total_candidate_count
     );
 
-    // Filter candidates to only include valid entities
     let filtered_candidates: Vec<_> = candidate_pairs
         .into_iter()
         .filter(|(e1, e2, ..)| valid_entities.contains(&e1.0) && valid_entities.contains(&e2.0))
@@ -87,9 +93,9 @@ pub async fn find_matches(
         filtered_candidates.len()
     );
 
-    // If no pairs to process, return early
     if filtered_candidates.is_empty() {
         info!("Geospatial: No new pairs to process.");
+        // Return empty stats
         let method_stats = MatchMethodStats {
             method_type: MatchMethodType::Geospatial,
             groups_created: 0,
@@ -97,102 +103,102 @@ pub async fn find_matches(
             avg_confidence: 0.0,
             avg_group_size: 0.0,
         };
-
-        let geospatial_specific_result = GeospatialMatchResult {
+        return Ok(AnyMatchResult::Geospatial(GeospatialMatchResult {
             groups_created: 0,
             stats: method_stats,
-        };
-
-        return Ok(AnyMatchResult::Geospatial(geospatial_specific_result));
+        }));
     }
 
-    // Track stats
+    // Shared set to track pairs processed in this run to avoid redundant work if a pair appears multiple times
+    // (e.g. due to complex upstream logic, though fetch_candidate_pairs should make them unique)
+    // More importantly, it's used to skip after a cache hit or after processing a cache miss.
+    let processed_pairs_this_run_arc = Arc::new(Mutex::new(HashSet::<(EntityId, EntityId)>::new()));
+
+
+    // Stats: (new_pairs, entities_set, conf_scores, errors, pairs_processed_db_query,
+    //         feature_extractions, feature_failures, cache_hits)
     let stats_mutex = Arc::new(Mutex::new((
         0,              // new_pairs_created_count
         HashSet::new(), // entities_in_new_pairs
         Vec::new(),     // confidence_scores_for_stats
         0,              // individual_operation_errors
-        0,              // pairs_processed_count
+        0,              // pairs_processed_from_db_candidates (renamed for clarity)
         0,              // feature_extraction_count
         0,              // feature_extraction_failures
-        0,              // skipped_existing_pairs (should be 0 now due to pre-filtering)
+        0,              // cache_hits_count (new)
     )));
 
-    // Process batches in parallel with controlled concurrency
     let total_batches = (filtered_candidates.len() + BATCH_SIZE - 1) / BATCH_SIZE;
-
     info!(
         "Geospatial: Processing {} batches of size {} with max {} parallel batches",
         total_batches, BATCH_SIZE, MAX_PARALLEL_BATCHES
     );
 
-    // Process all batches with controlled parallelism
     let mut global_batch_num = 0;
-
     for chunk_of_batches in filtered_candidates.chunks(BATCH_SIZE * MAX_PARALLEL_BATCHES) {
         let mut batch_futures = Vec::new();
-
-        for batch in chunk_of_batches.chunks(BATCH_SIZE) {
+        for batch_data in chunk_of_batches.chunks(BATCH_SIZE) {
             global_batch_num += 1;
-            let batch_to_process = batch.to_vec();
+            let batch_to_process = batch_data.to_vec(); // Clone batch data for the async task
             let pool_clone = pool.clone();
             let ro_option_clone = reinforcement_orchestrator_option.clone();
-            let run_id = pipeline_run_id.to_string();
+            let run_id_clone = pipeline_run_id.to_string();
             let feature_cache_clone = feature_cache.clone();
-            let stats_arc = stats_mutex.clone();
+            let stats_arc_clone = stats_mutex.clone();
+            let processed_pairs_arc_clone = processed_pairs_this_run_arc.clone();
             let current_batch_num = global_batch_num;
 
-            let batch_future = tokio::spawn(async move {
+            batch_futures.push(tokio::spawn(async move {
                 process_batch(
                     batch_to_process,
                     &pool_clone,
                     ro_option_clone.as_ref(),
-                    &run_id,
+                    &run_id_clone,
                     feature_cache_clone,
-                    stats_arc,
+                    stats_arc_clone,
+                    processed_pairs_arc_clone, // Pass the Arc<Mutex<HashSet>>
                     current_batch_num,
                     total_batches,
                 )
                 .await
-            });
-
-            batch_futures.push(batch_future);
+            }));
         }
 
         let results = join_all(batch_futures).await;
-
         for (i, result) in results.iter().enumerate() {
             if let Err(e) = result {
-                warn!("Geospatial: Batch processing task {} error: {}", i, e);
+                warn!(
+                    "Geospatial: Batch processing task (approx. batch {}) error: {}",
+                    global_batch_num - chunk_of_batches.chunks(BATCH_SIZE).len() + i + 1, e
+                );
+                // Potentially increment an error counter in stats_mutex if task-level errors are critical
             }
         }
     }
 
-    // Extract final stats
     let (
         new_pairs_created_count,
         entities_in_new_pairs,
         confidence_scores_for_stats,
         individual_operation_errors,
-        pairs_processed_count,
+        pairs_processed_from_db_candidates,
         feature_extraction_count,
         feature_extraction_failures,
-        skipped_existing_pairs,
+        cache_hits_count,
     ) = {
-        let stats = stats_mutex.lock().await;
+        let stats_guard = stats_mutex.lock().await;
         (
-            stats.0,
-            stats.1.clone(),
-            stats.2.clone(),
-            stats.3,
-            stats.4,
-            stats.5,
-            stats.6,
-            stats.7,
+            stats_guard.0,
+            stats_guard.1.clone(),
+            stats_guard.2.clone(),
+            stats_guard.3,
+            stats_guard.4,
+            stats_guard.5,
+            stats_guard.6,
+            stats_guard.7,
         )
     };
 
-    // Report statistics
     let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
         confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
     } else {
@@ -204,57 +210,51 @@ pub async fn find_matches(
         groups_created: new_pairs_created_count,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 {
-            2.0
-        } else {
-            0.0
-        },
+        avg_group_size: if new_pairs_created_count > 0 { 2.0 } else { 0.0 },
     };
 
     let elapsed = start_time.elapsed();
     info!(
-        "Geospatial matching complete in {:.2?}: processed {} pairs, skipped {} existing pairs, created {} new pairs ({} errors), involving {} unique entities.",
+        "Geospatial matching complete in {:.2?}: processed {} candidate pairs from DB, cache hits: {}, created {} new pairs ({} errors), involving {} unique entities.",
         elapsed,
-        pairs_processed_count,
-        skipped_existing_pairs,
+        pairs_processed_from_db_candidates, // This counts pairs attempted from the initial DB query
+        cache_hits_count,
         method_stats.groups_created,
         individual_operation_errors,
         method_stats.entities_matched
     );
-
     info!(
         "Geospatial feature extraction stats: {} successful, {} failed",
         feature_extraction_count, feature_extraction_failures
     );
 
-    let geospatial_specific_result = GeospatialMatchResult {
+    Ok(AnyMatchResult::Geospatial(GeospatialMatchResult {
         groups_created: method_stats.groups_created,
         stats: method_stats,
-    };
-
-    Ok(AnyMatchResult::Geospatial(geospatial_specific_result))
+    }))
 }
 
-/// Process a batch of candidate pairs with batch database operations
-/// Note: existing pairs are now pre-filtered, so no need to check again
+/// Process a batch of candidate pairs.
+#[allow(clippy::too_many_arguments)] // Existing function signature
 async fn process_batch(
-    batch: Vec<(EntityId, EntityId, f64, f64, f64, f64, f64)>,
+    batch: Vec<(EntityId, EntityId, f64, f64, f64, f64, f64)>, // (e1, e2, lat1, lon1, lat2, lon2, dist)
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    feature_cache: Option<SharedFeatureCache>,
+    feature_cache: Option<SharedFeatureCache>, // Used for RL feature caching, not the main comparison cache
     stats_mutex: Arc<
         Mutex<(
-            usize,
-            HashSet<EntityId>,
-            Vec<f64>,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
+            usize,                // new_pairs_created_count
+            HashSet<EntityId>,    // entities_in_new_pairs
+            Vec<f64>,             // confidence_scores_for_stats
+            usize,                // individual_operation_errors
+            usize,                // pairs_processed_from_db_candidates
+            usize,                // feature_extraction_count
+            usize,                // feature_extraction_failures
+            usize,                // cache_hits_count
         )>,
     >,
+    processed_pairs_this_run_arc: Arc<Mutex<HashSet<(EntityId, EntityId)>>>,
     batch_num: usize,
     total_batches: usize,
 ) -> Result<()> {
@@ -265,312 +265,266 @@ async fn process_batch(
         batch.len()
     );
 
-    // Prepare data structures for batch operations
-    let mut pairs_to_create = Vec::new();
-    let mut suggestions_to_create = Vec::new();
-    let mut decision_snapshots_to_create = Vec::new();
+    let mut pairs_to_create_in_db = Vec::new();
+    let mut suggestions_to_create_in_db = Vec::new();
+    let mut decision_snapshots_to_create_in_db = Vec::new();
 
-    // Local stats for this batch
-    let mut local_new_pairs = 0;
-    let mut local_entities = HashSet::new();
+    // Local batch stats to minimize lock contention on global stats_mutex
+    let mut local_new_pairs_count = 0;
+    let mut local_entities_in_new_pairs = HashSet::new();
     let mut local_confidence_scores = Vec::new();
-    let mut local_errors = 0;
-    let mut local_pairs_processed = 0;
-    let mut local_feature_extractions = 0;
-    let mut local_feature_failures = 0;
-    let mut local_skipped_pairs = 0; // Should be 0 since pairs are pre-filtered
+    let mut local_individual_operation_errors = 0;
+    let mut local_pairs_processed_from_db = 0;
+    let mut local_feature_extraction_count = 0;
+    let mut local_feature_extraction_failures = 0;
+    let mut local_cache_hits_count = 0;
 
-    // Collect pairs that need feature extraction due to cache misses
-    let mut cache_miss_pairs: Vec<(
-        EntityId,
-        EntityId,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        EntityGroupId,
-        EntityId,
-        EntityId,
-        MatchValues,
-    )> = Vec::new();
 
-    // First pass: Process pairs with cache hits immediately, collect cache misses for batch processing
-    for (e1_id, e2_id, lat1, lon1, lat2, lon2, distance_meters) in batch {
-        // Since pairs are pre-filtered, we don't need to check existing pairs again
-        // But we still need to ensure proper ordering for consistency
-        let (ordered_id_1, ordered_id_2, ordered_match_values) = 
-            normalize_pair_for_storage(e1_id, e2_id, lat1, lon1, lat2, lon2, distance_meters);
+    for (e1_id_orig, e2_id_orig, lat1, lon1, lat2, lon2, distance_meters) in batch {
+        local_pairs_processed_from_db += 1; // Count each pair from the input batch
 
-        local_pairs_processed += 1;
+        // Ensure consistent ordering for cache keys, processed_pairs_this_run, and entity_group
+        let (ordered_e1_id, ordered_e2_id, _ordered_lat1, _ordered_lon1, _ordered_lat2, _ordered_lon2) =
+            if e1_id_orig.0 < e2_id_orig.0 {
+                (e1_id_orig.clone(), e2_id_orig.clone(), lat1, lon1, lat2, lon2)
+            } else {
+                (e2_id_orig.clone(), e1_id_orig.clone(), lat2, lon2, lat1, lon1)
+            };
+        
+        let current_pair_ordered = (ordered_e1_id.clone(), ordered_e2_id.clone());
 
-        // Calculate pre-RL confidence score
-        let pre_rl_confidence_score = 0.85; // Default confidence
+        // Check if this ordered pair has already been processed in this run (e.g., by a previous batch or earlier in this one)
+        // This check is crucial if the input `filtered_candidates` could somehow contain duplicates despite earlier filtering.
+        // It also handles the case where a pair is processed after a cache miss.
+        {
+            let mut processed_set = processed_pairs_this_run_arc.lock().await;
+            if processed_set.contains(&current_pair_ordered) {
+                debug!("Geospatial: Pair ({}, {}) already processed in this run. Skipping.", ordered_e1_id.0, ordered_e2_id.0);
+                continue; // Skip to the next pair in the batch
+            }
+            // Will add to processed_set later, after cache check/comparison
+        }
 
-        // Generate entity group ID
-        let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
 
-        // Check if we need to do feature extraction and if so, is it in cache?
-        let should_check_cache =
-            reinforcement_orchestrator_option.is_some() && feature_cache.is_some();
-        let mut cache_hit = false;
+        // --- INCREMENTAL PROCESSING LOGIC ---
+        let current_signatures_opt = match get_current_signatures_for_pair(pool, &ordered_e1_id, &ordered_e2_id).await {
+            Ok(sigs) => sigs,
+            Err(e) => {
+                warn!("Geospatial: Failed to get signatures for pair ({}, {}): {}. Proceeding without cache.", ordered_e1_id.0, ordered_e2_id.0, e);
+                None
+            }
+        };
 
-        if should_check_cache {
-            if let Some(cache) = &feature_cache {
-                let key = FeatureCacheService::get_pair_key(&ordered_id_1, &ordered_id_2);
-                let cache_guard = cache.lock().await;
-                if cache_guard.pair_cache.contains(&key) {
-                    cache_hit = true;
+        if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
+            match check_comparison_cache(pool, &ordered_e1_id, &ordered_e2_id, &sig1_data.signature, &sig2_data.signature, &MatchMethodType::Geospatial).await {
+                Ok(Some(cached_eval)) => {
+                    local_cache_hits_count += 1;
+                    debug!("Geospatial: Cache HIT for pair ({}, {}). Result: {}, Score: {:?}", ordered_e1_id.0, ordered_e2_id.0, cached_eval.comparison_result, cached_eval.similarity_score);
+                    
+                    // Mark as processed to avoid re-processing if it somehow appears again
+                    let mut processed_set = processed_pairs_this_run_arc.lock().await;
+                    processed_set.insert(current_pair_ordered.clone());
+                    drop(processed_set);
+
+                    // If the cached result was a "MATCH", it should have been caught by fetch_candidate_pairs_excluding_existing
+                    // if it led to an entity_group. If it was a "NON_MATCH", we correctly skip.
+                    // No further action needed for a cache hit here, as we're skipping the comparison.
+                    continue; // Skip to the next pair
                 }
-                drop(cache_guard);
+                Ok(None) => {
+                    debug!("Geospatial: Cache MISS for pair ({}, {}). Signatures: ({}..., {}...). Proceeding with comparison.", ordered_e1_id.0, ordered_e2_id.0, &sig1_data.signature[..std::cmp::min(8, sig1_data.signature.len())], &sig2_data.signature[..std::cmp::min(8, sig2_data.signature.len())]);
+                }
+                Err(e) => {
+                    warn!("Geospatial: Error checking comparison cache for pair ({}, {}): {}. Proceeding with comparison.", ordered_e1_id.0, ordered_e2_id.0, e);
+                }
             }
         }
+        // --- END INCREMENTAL PROCESSING LOGIC ---
 
-        if should_check_cache && !cache_hit {
-            // This pair has a cache miss - add it to our collection for batch processing
-            cache_miss_pairs.push((
-                ordered_id_1.clone(),
-                ordered_id_2.clone(),
-                lat1,
-                lon1,
-                lat2,
-                lon2,
-                distance_meters,
-                pre_rl_confidence_score,
-                new_entity_group_id,
-                ordered_id_1,
-                ordered_id_2,
-                ordered_match_values,
-            ));
-            continue;
-        }
-
-        // Process pairs with cache hit or those not needing RL scoring immediately
+        // If we've reached here, it's either a cache miss or an error occurred trying to use the cache.
+        // Proceed with the actual comparison.
+        
+        let pre_rl_confidence_score = 0.85; // Default base confidence for geospatial match
         let mut final_confidence_score = pre_rl_confidence_score;
-        let mut features_for_snapshot: Option<Vec<f64>> = None;
+        let mut features_for_rl_snapshot: Option<Vec<f64>> = None; // For RL tuning and snapshotting
+        let mut features_json_for_cache: Option<serde_json::Value> = None; // For comparison_cache
 
-        // Apply RL tuning if available (and we have a cache hit)
         if let Some(ro_arc) = reinforcement_orchestrator_option {
-            match if let Some(cache) = feature_cache.as_ref() {
+            // Use the existing feature_cache (for RL features) if available
+            match if let Some(rl_feat_cache) = feature_cache.as_ref() {
                 let orchestrator_guard = ro_arc.lock().await;
-                orchestrator_guard
-                    .get_pair_features(pool, &ordered_id_1, &ordered_id_2)
-                    .await
+                // get_pair_features likely uses the rl_feat_cache internally
+                orchestrator_guard.get_pair_features(pool, &ordered_e1_id, &ordered_e2_id).await
             } else {
-                MatchingOrchestrator::extract_pair_context_features(
-                    pool,
-                    &ordered_id_1,
-                    &ordered_id_2,
-                )
-                .await
+                MatchingOrchestrator::extract_pair_context_features(pool, &ordered_e1_id, &ordered_e2_id).await
             } {
                 Ok(features_vec) => {
-                    local_feature_extractions += 1;
+                    local_feature_extraction_count += 1;
                     if !features_vec.is_empty() {
-                        features_for_snapshot = Some(features_vec.clone());
+                        features_for_rl_snapshot = Some(features_vec.clone());
+                        features_json_for_cache = serde_json::to_value(features_vec.clone()).ok(); // For comparison_cache
+
                         let orchestrator_guard = ro_arc.lock().await;
                         match orchestrator_guard.get_tuned_confidence(
                             &MatchMethodType::Geospatial,
                             pre_rl_confidence_score,
-                            &features_vec,
+                            &features_vec, // Pass the Vec<f64>
                         ) {
                             Ok(tuned_score) => final_confidence_score = tuned_score,
-                            Err(e) => warn!("Geospatial: Failed to get tuned confidence for ({}, {}): {}. Using pre-RL score.", ordered_id_1.0, ordered_id_2.0, e),
+                            Err(e) => warn!("Geospatial: RL tuning failed for ({}, {}): {}. Using pre-RL score.", ordered_e1_id.0, ordered_e2_id.0, e),
                         }
+                    } else {
+                         warn!("Geospatial: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", ordered_e1_id.0, ordered_e2_id.0);
                     }
                 }
                 Err(e) => {
-                    local_feature_failures += 1;
-                    warn!("Geospatial: Failed to extract features for ({}, {}): {}. Using pre-RL score.", ordered_id_1.0, ordered_id_2.0, e);
+                    local_feature_extraction_failures += 1;
+                    warn!("Geospatial: Feature extraction failed for ({}, {}): {}. Using pre-RL score.", ordered_e1_id.0, ordered_e2_id.0, e);
                 }
             }
         }
 
-        // Add this pair to the ones we'll create
-        process_single_pair(
-            &mut pairs_to_create,
-            &mut suggestions_to_create,
-            &mut decision_snapshots_to_create,
-            &new_entity_group_id,
-            &ordered_id_1,
-            &ordered_id_2,
-            &ordered_match_values,
-            final_confidence_score,
-            pre_rl_confidence_score,
-            features_for_snapshot,
-            reinforcement_orchestrator_option,
-            pipeline_run_id,
-            distance_meters,
-            lat1,
-            lon1,
-            lat2,
-            lon2,
-        );
+        // Determine outcome for caching and entity_group creation
+        // For geospatial, a "MATCH" is simply being within METERS_TO_CHECK.
+        // The final_confidence_score (possibly tuned) is what's stored and used for suggestions.
+        let comparison_outcome_for_cache = if distance_meters <= METERS_TO_CHECK { "MATCH" } else { "NON_MATCH" };
 
-        // Update local stats
-        local_new_pairs += 1;
-        local_entities.insert(ordered_id_1);
-        local_entities.insert(ordered_id_2);
-        local_confidence_scores.push(final_confidence_score);
-    }
-
-    // Process all cache misses in a batch
-    if !cache_miss_pairs.is_empty() {
-        info!(
-            "Geospatial: Processing {} cache misses in batch",
-            cache_miss_pairs.len()
-        );
-
-        let feature_cache_ref = feature_cache.as_ref();
-
-        let results = batch_extract_features(
-            pool,
-            &cache_miss_pairs
-                .iter()
-                .map(|(e1, e2, ..)| (e1.clone(), e2.clone()))
-                .collect::<Vec<_>>(),
-            reinforcement_orchestrator_option,
-        )
-        .await;
-
-        // Process each pair with its extracted features
-        for (
-            i,
-            (
-                e1_id,
-                e2_id,
-                lat1,
-                lon1,
-                lat2,
-                lon2,
-                distance_meters,
-                pre_rl_confidence_score,
-                new_entity_group_id,
-                ordered_id_1,
-                ordered_id_2,
-                ordered_match_values,
-            ),
-        ) in cache_miss_pairs.iter().enumerate()
+        // Store result in comparison_cache if signatures were available
+        if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
+            if let Err(e) = store_in_comparison_cache(
+                pool, &ordered_e1_id, &ordered_e2_id,
+                &sig1_data.signature, &sig2_data.signature,
+                &MatchMethodType::Geospatial, pipeline_run_id,
+                comparison_outcome_for_cache, Some(final_confidence_score), // Store the final (possibly tuned) score
+                features_json_for_cache.as_ref(), // Pass Option<&JsonValue>
+            ).await {
+                warn!("Geospatial: Failed to store in comparison_cache for ({}, {}): {}", ordered_e1_id.0, ordered_e2_id.0, e);
+            }
+        }
+        
+        // Mark as processed *after* comparison and cache storage attempt
         {
-            if i >= results.len() {
-                warn!("Geospatial: Index mismatch in results array for cache miss processing");
-                continue;
-            }
+            let mut processed_set = processed_pairs_this_run_arc.lock().await;
+            processed_set.insert(current_pair_ordered);
+        }
 
-            let features_result = &results[i];
-            let mut final_confidence_score = *pre_rl_confidence_score;
-            let mut features_for_snapshot: Option<Vec<f64>> = None;
 
-            match features_result {
-                Ok(features_vec) => {
-                    local_feature_extractions += 1;
-
-                    // Update the cache
-                    if let Some(cache) = feature_cache_ref {
-                        let mut cache_guard = cache.lock().await;
-                        let key = FeatureCacheService::get_pair_key(&ordered_id_1, &ordered_id_2);
-                        cache_guard.pair_cache.put(key, features_vec.clone());
-                    }
-
-                    if !features_vec.is_empty() {
-                        features_for_snapshot = Some(features_vec.clone());
-
-                        // Get tuned confidence score
-                        if let Some(ro_arc) = reinforcement_orchestrator_option {
-                            let orchestrator_guard = ro_arc.lock().await;
-                            match orchestrator_guard.get_tuned_confidence(
-                                &MatchMethodType::Geospatial,
-                                *pre_rl_confidence_score,
-                                &features_vec
-                            ) {
-                                Ok(tuned_score) => final_confidence_score = tuned_score,
-                                Err(e) => warn!("Geospatial: Failed to get tuned confidence for ({}, {}): {}. Using pre-RL score.", 
-                                              ordered_id_1.0, ordered_id_2.0, e),
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    local_feature_failures += 1;
-                    warn!("Geospatial: Batch feature extraction failed for ({}, {}): {}. Using pre-RL score.", 
-                        ordered_id_1.0, ordered_id_2.0, e);
-                }
-            }
-
-            // Process this pair
-            process_single_pair(
-                &mut pairs_to_create,
-                &mut suggestions_to_create,
-                &mut decision_snapshots_to_create,
-                new_entity_group_id,
-                ordered_id_1,
-                ordered_id_2,
-                ordered_match_values,
-                final_confidence_score,
-                *pre_rl_confidence_score,
-                features_for_snapshot,
-                reinforcement_orchestrator_option,
-                pipeline_run_id,
-                *distance_meters,
-                *lat1,
-                *lon1,
-                *lat2,
-                *lon2,
+        // Only create entity_group if it's a "MATCH" based on distance
+        if comparison_outcome_for_cache == "MATCH" {
+            let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
+            let (_, _, match_values_for_storage) = normalize_pair_for_storage(
+                e1_id_orig.clone(), // Use original IDs for correct lat/lon in match_values
+                e2_id_orig.clone(),
+                lat1, lon1, lat2, lon2, distance_meters
             );
 
-            // Update local stats
-            local_new_pairs += 1;
-            local_entities.insert(ordered_id_1.clone());
-            local_entities.insert(ordered_id_2.clone());
-            local_confidence_scores.push(final_confidence_score);
-        }
-    }
+            // Prepare data for batch insertion (this was the role of process_single_pair)
+            pairs_to_create_in_db.push((
+                new_entity_group_id.clone(),
+                ordered_e1_id.clone(), // Use ordered IDs for entity_group table
+                ordered_e2_id.clone(),
+                match_values_for_storage, // Contains original lat/lon relative to e1_id_orig, e2_id_orig
+                final_confidence_score,
+                pre_rl_confidence_score,
+            ));
 
-    // Execute batch operations if there are pairs to create
-    if !pairs_to_create.is_empty() {
+            local_new_pairs_count += 1;
+            local_entities_in_new_pairs.insert(ordered_e1_id.clone());
+            local_entities_in_new_pairs.insert(ordered_e2_id.clone());
+            local_confidence_scores.push(final_confidence_score);
+
+            // Create suggestion if confidence is low
+            if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
+                let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 };
+                let details_json = serde_json::json!({
+                    "method_type": MatchMethodType::Geospatial.as_str(),
+                    "distance_meters": distance_meters,
+                    "latitude1": lat1, "longitude1": lon1, // original orientation for context
+                    "latitude2": lat2, "longitude2": lon2,
+                    "entity_group_id": &new_entity_group_id.0,
+                    "pre_rl_confidence": pre_rl_confidence_score,
+                    "final_confidence": final_confidence_score,
+                });
+                let reason_message = format!(
+                    "Pair ({}, {}) matched by Geospatial (distance: {:.2}m) with tuned confidence ({:.4}). Pre-RL: {:.2}",
+                    ordered_e1_id.0, ordered_e2_id.0, distance_meters, final_confidence_score, pre_rl_confidence_score
+                );
+                suggestions_to_create_in_db.push((
+                    pipeline_run_id.to_string(),
+                    ActionType::ReviewEntityInGroup.as_str().to_string(),
+                    new_entity_group_id.0.clone(),
+                    final_confidence_score,
+                    details_json,
+                    "LOW_TUNED_CONFIDENCE_PAIR".to_string(),
+                    reason_message,
+                    priority as i32,
+                    SuggestionStatus::PendingReview.as_str().to_string(),
+                ));
+            }
+
+            // Log decision snapshot if features were generated
+            if let (Some(ro_arc_inner), Some(features_vec)) = (reinforcement_orchestrator_option, features_for_rl_snapshot) {
+                let orchestrator_guard = ro_arc_inner.lock().await;
+                let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
+                decision_snapshots_to_create_in_db.push((
+                    new_entity_group_id.0.clone(),
+                    pipeline_run_id.to_string(),
+                    features_vec, // This is Vec<f64>
+                    pre_rl_confidence_score,
+                    final_confidence_score,
+                    confidence_tuner_ver as i32,
+                ));
+            }
+        }
+    } // End of loop over batch pairs
+
+    // Execute batch DB operations if there's anything to create
+    if !pairs_to_create_in_db.is_empty() {
         match batch_create_entity_groups(
             pool,
-            pairs_to_create,
-            suggestions_to_create,
-            decision_snapshots_to_create,
+            pairs_to_create_in_db,
+            suggestions_to_create_in_db,
+            decision_snapshots_to_create_in_db,
         )
         .await
         {
-            Ok(created_count) => {
+            Ok(created_count_from_db) => {
                 debug!(
-                    "Geospatial: Successfully created {} pairs in batch",
-                    created_count
+                    "Geospatial: Batch {}/{} - Successfully created {} entity groups in DB.",
+                    batch_num, total_batches, created_count_from_db
                 );
+                 // Note: local_new_pairs_count is already incremented when preparing data.
+                 // created_count_from_db is the actual number inserted, could be less due to ON CONFLICT.
+                 // For accurate stats, we might need to reconcile, but local_new_pairs_count reflects attempts.
             }
             Err(e) => {
-                warn!("Geospatial: Batch creation failed: {}", e);
-                local_errors += 1;
+                warn!("Geospatial: Batch {}/{} - DB creation failed: {}", batch_num, total_batches, e);
+                local_individual_operation_errors += 1; // Count as one batch error
             }
         }
     }
 
-    // Update global stats
+    // Update global stats from local batch stats
     {
-        let mut stats = stats_mutex.lock().await;
-        stats.0 += local_new_pairs;
-        stats.1.extend(local_entities);
-        stats.2.extend(local_confidence_scores);
-        stats.3 += local_errors;
-        stats.4 += local_pairs_processed;
-        stats.5 += local_feature_extractions;
-        stats.6 += local_feature_failures;
-        stats.7 += local_skipped_pairs;
+        let mut stats_guard = stats_mutex.lock().await;
+        stats_guard.0 += local_new_pairs_count;
+        stats_guard.1.extend(local_entities_in_new_pairs);
+        stats_guard.2.extend(local_confidence_scores);
+        stats_guard.3 += local_individual_operation_errors;
+        stats_guard.4 += local_pairs_processed_from_db;
+        stats_guard.5 += local_feature_extraction_count;
+        stats_guard.6 += local_feature_extraction_failures;
+        stats_guard.7 += local_cache_hits_count;
 
-        if local_new_pairs > 0 {
+        if local_new_pairs_count > 0 || local_cache_hits_count > 0 {
             info!(
-                "Geospatial: Batch {}/{} complete - created {} new pairs (total: {})",
-                batch_num, total_batches, local_new_pairs, stats.0
+                "Geospatial: Batch {}/{} complete - created {} new pairs, {} cache hits (total created: {}, total hits: {}). Processed {} candidates from DB.",
+                batch_num, total_batches, local_new_pairs_count, local_cache_hits_count, stats_guard.0, stats_guard.7, local_pairs_processed_from_db
             );
         } else {
             debug!(
-                "Geospatial: Batch {}/{} complete - all pairs skipped (total created so far: {})",
-                batch_num, total_batches, stats.0
+                "Geospatial: Batch {}/{} complete - no new pairs or cache hits. Processed {} candidates from DB.",
+                batch_num, total_batches, local_pairs_processed_from_db
             );
         }
     }
@@ -578,7 +532,10 @@ async fn process_batch(
     Ok(())
 }
 
-/// Helper function to normalize pair order and create match values
+
+/// Helper function to normalize pair order and create match values.
+/// Ensures entity_id_1 < entity_id_2 for the returned EntityId tuple.
+/// The MatchValues will store coordinates relative to the *original* e1_id, e2_id.
 fn normalize_pair_for_storage(
     e1_id: EntityId,
     e2_id: EntityId,
@@ -588,30 +545,37 @@ fn normalize_pair_for_storage(
     lon2: f64,
     distance_meters: f64,
 ) -> (EntityId, EntityId, MatchValues) {
-    // Ensure entity_id_1 < entity_id_2 to satisfy database ordering constraints
-    if e1_id.0 <= e2_id.0 {
-        let match_values = MatchValues::Geospatial(GeospatialMatchValue {
-            latitude1: lat1,
-            longitude1: lon1,
-            latitude2: lat2,
-            longitude2: lon2,
-            distance: distance_meters,
-        });
-        (e1_id, e2_id, match_values)
+    // Determine ordered IDs for storage in entity_group or cache keys
+    let (ordered_e1_id, ordered_e2_id) = if e1_id.0 <= e2_id.0 {
+        (e1_id.clone(), e2_id.clone())
     } else {
-        // Swap entity IDs and corresponding coordinates
-        let match_values = MatchValues::Geospatial(GeospatialMatchValue {
-            latitude1: lat2,
-            longitude1: lon2,
-            latitude2: lat1,
-            longitude2: lon1,
-            distance: distance_meters,
-        });
-        (e2_id, e1_id, match_values)
-    }
+        (e2_id.clone(), e1_id.clone())
+    };
+
+    // MatchValues should reflect the actual entities being compared,
+    // so use original lat/lon associated with e1_id and e2_id.
+    // If e1_id (original) is now ordered_e1_id, its coords are (lat1, lon1).
+    // If e1_id (original) is now ordered_e2_id, its coords are (lat1, lon1), but they'll be stored as lat2/lon2 in MatchValues.
+    // This ensures MatchValues always has coords for (item1, item2) where item1.id < item2.id.
+    
+    let (mv_lat1, mv_lon1, mv_lat2, mv_lon2) = if e1_id.0 <= e2_id.0 {
+        (lat1, lon1, lat2, lon2) // e1_id is item1, e2_id is item2
+    } else {
+        (lat2, lon2, lat1, lon1) // e2_id is item1, e1_id is item2
+    };
+
+    let match_values = MatchValues::Geospatial(GeospatialMatchValue {
+        latitude1: mv_lat1,
+        longitude1: mv_lon1,
+        latitude2: mv_lat2,
+        longitude2: mv_lon2,
+        distance: distance_meters,
+    });
+    (ordered_e1_id, ordered_e2_id, match_values)
 }
 
-/// Modified candidate pairs query that excludes already existing pairs using ANTI-JOIN
+
+/// Fetches candidate pairs excluding those already in `public.entity_group` for 'geospatial' method.
 async fn fetch_candidate_pairs_excluding_existing(
     conn: &impl tokio_postgres::GenericClient,
 ) -> Result<Vec<(EntityId, EntityId, f64, f64, f64, f64, f64)>> {
@@ -619,15 +583,23 @@ async fn fetch_candidate_pairs_excluding_existing(
         WITH EntityLocations AS (
             SELECT
                 e.id AS entity_id,
-                l.geom,
+                l.geom, /* Assuming PostGIS geometry column */
                 l.latitude,
                 l.longitude
             FROM
                 public.entity e
+            /* This join implies one location per organization, which might be a simplification.
+               If an entity can be linked to multiple locations, or if locations are directly
+               linked to entities via entity_feature, this query would need adjustment.
+               For now, assuming public.location.organization_id links to public.entity.organization_id
+               and that this is the basis for an entity's location.
+            */
             JOIN
-                public.location l ON e.organization_id = l.organization_id
+                public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'location'
+            JOIN
+                public.location l ON ef.table_id = l.id
             WHERE
-                l.geom IS NOT NULL AND e.id IS NOT NULL
+                l.geom IS NOT NULL AND e.id IS NOT NULL AND l.latitude IS NOT NULL AND l.longitude IS NOT NULL
         ),
         CandidatePairs AS (
             SELECT
@@ -642,7 +614,7 @@ async fn fetch_candidate_pairs_excluding_existing(
                 EntityLocations el1
             JOIN
                 EntityLocations el2 ON el1.entity_id < el2.entity_id -- Ensures order & avoids self-match
-                AND ST_DWithin(el1.geom, el2.geom, $1)
+                AND ST_DWithin(el1.geom, el2.geom, $1) -- $1 is METERS_TO_CHECK
         )
         SELECT
             cp.entity_id_1_str,
@@ -660,7 +632,7 @@ async fn fetch_candidate_pairs_excluding_existing(
                 AND cp.entity_id_2_str = eg.entity_id_2 
                 AND eg.method_type = 'geospatial'
         WHERE
-            eg.id IS NULL  -- Only include pairs that don't already exist
+            eg.id IS NULL  -- Only include pairs that don't already exist in entity_group for this method
     ";
 
     debug!("Geospatial: Executing geospatial candidate query with existing pair exclusion...");
@@ -689,375 +661,150 @@ async fn fetch_candidate_pairs_excluding_existing(
             distance_meters,
         ));
     }
-
     Ok(result)
 }
 
-// New function to batch extract features for multiple pairs
+// Batch feature extraction remains largely the same, called by process_batch if needed.
+// No direct changes needed for caching strategy here, as it's about RL features.
 async fn batch_extract_features(
     pool: &PgPool,
-    pairs: &[(EntityId, EntityId)],
-    reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
-) -> Vec<Result<Vec<f64>, anyhow::Error>> {
+    pairs: &[(EntityId, EntityId)], // Expects already ordered pairs if relevant for cache
+    _reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>, // Not directly used here, but implies RL context
+) -> Vec<Result<Vec<f64>>> { // Simpler return type based on usage
     let mut results = Vec::with_capacity(pairs.len());
+    if pairs.is_empty() {
+        return results;
+    }
 
-    // Calculate optimal batch size based on available CPUs
-    let num_cpus = num_cpus::get();
-    let batch_size = (pairs.len() / num_cpus.max(1)).max(1).min(50); // Max 50 pairs per batch, min 1
+    let num_cpus = num_cpus::get_physical(); // Use physical cores
+    let batch_size = (pairs.len() / num_cpus.max(1)).max(1).min(50);
 
     info!(
-        "Geospatial: Batch extracting features for {} pairs (batch size: {})",
+        "Geospatial (RL Features): Batch extracting features for {} pairs (batch size: {})",
         pairs.len(),
         batch_size
     );
 
-    // Process in smaller batches for better parallelism
     for chunk in pairs.chunks(batch_size) {
         let mut futures = Vec::with_capacity(chunk.len());
-
         for (e1_id, e2_id) in chunk {
-            // Clone for the async block
             let pool_clone = pool.clone();
             let e1_clone = e1_id.clone();
             let e2_clone = e2_id.clone();
-
-            // Spawn a task for feature extraction
-            let future = tokio::spawn(async move {
-                MatchingOrchestrator::extract_pair_context_features(
-                    &pool_clone,
-                    &e1_clone,
-                    &e2_clone,
-                )
-                .await
-            });
-
-            futures.push(future);
+            futures.push(tokio::spawn(async move {
+                MatchingOrchestrator::extract_pair_context_features(&pool_clone, &e1_clone, &e2_clone).await
+            }));
         }
-
-        // Wait for all futures in this chunk
-        let chunk_results = futures::future::join_all(futures).await;
-
-        // Process results
+        let chunk_results = join_all(futures).await;
         for result in chunk_results {
             match result {
                 Ok(inner_result) => results.push(inner_result),
-                Err(e) => results.push(Err(anyhow::anyhow!("Task join error: {}", e))),
+                Err(e) => results.push(Err(anyhow::anyhow!("Task join error for feature extraction: {}", e))),
             }
         }
     }
-
     results
 }
 
-// Helper function to process a single pair - refactored from duplicated code
-async fn process_single_pair(
-    pairs_to_create: &mut Vec<(EntityGroupId, EntityId, EntityId, MatchValues, f64, f64)>,
-    suggestions_to_create: &mut Vec<(
-        String,
-        String,
-        String,
-        f64,
-        serde_json::Value,
-        String,
-        String,
-        i32,
-        String,
-    )>,
-    decision_snapshots_to_create: &mut Vec<(String, String, Vec<f64>, f64, f64, i32)>,
-    new_entity_group_id: &EntityGroupId,
-    ordered_id_1: &EntityId,
-    ordered_id_2: &EntityId,
-    ordered_match_values: &MatchValues,
-    final_confidence_score: f64,
-    pre_rl_confidence_score: f64,
-    features_for_snapshot: Option<Vec<f64>>,
-    reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
-    pipeline_run_id: &str,
-    distance_meters: f64,
-    lat1: f64,
-    lon1: f64,
-    lat2: f64,
-    lon2: f64,
-) {
-    // Add to pairs to create
-    pairs_to_create.push((
-        new_entity_group_id.clone(),
-        ordered_id_1.clone(),
-        ordered_id_2.clone(),
-        ordered_match_values.clone(),
-        final_confidence_score,
-        pre_rl_confidence_score,
-    ));
 
-    // Create suggestion for low confidence matches if needed
-    if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-        let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
-            2
-        } else {
-            1
-        };
+// process_single_pair is effectively integrated into process_batch's main loop now.
+// The logic for preparing data for batch_create_entity_groups is inside process_batch.
 
-        let details_json = serde_json::json!({
-            "method_type": MatchMethodType::Geospatial.as_str(),
-            "distance_meters": distance_meters,
-            "latitude1": lat1, "longitude1": lon1,
-            "latitude2": lat2, "longitude2": lon2,
-            "entity_group_id": &new_entity_group_id.0,
-            "pre_rl_confidence": pre_rl_confidence_score,
-        });
-
-        let reason_message = format!(
-            "Pair ({}, {}) matched by Geospatial (distance: {:.2}m) with tuned confidence ({:.4}).",
-            ordered_id_1.0, ordered_id_2.0, distance_meters, final_confidence_score
-        );
-
-        suggestions_to_create.push((
-            pipeline_run_id.to_string(),
-            ActionType::ReviewEntityInGroup.as_str().to_string(),
-            new_entity_group_id.0.clone(),
-            final_confidence_score,
-            details_json,
-            "LOW_TUNED_CONFIDENCE_PAIR".to_string(),
-            reason_message,
-            priority as i32,
-            SuggestionStatus::PendingReview.as_str().to_string(),
-        ));
-    }
-
-    // Log decision snapshot if features are available
-    if let (Some(orch), Some(features_vec)) =
-        (reinforcement_orchestrator_option, features_for_snapshot)
-    {
-        let orchestrator_guard = orch.lock().await;
-        let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
-
-        decision_snapshots_to_create.push((
-            new_entity_group_id.0.clone(),
-            pipeline_run_id.to_string(),
-            features_vec,
-            pre_rl_confidence_score,
-            final_confidence_score,
-            confidence_tuner_ver as i32,
-        ));
-    }
-}
-
-/// Create multiple entity groups in a single batch transaction
-/// Create multiple entity groups in a single batch transaction
+/// Batch creates entity groups, suggestions, and decision snapshots in a transaction.
+#[allow(clippy::too_many_arguments)] // Existing function signature
 async fn batch_create_entity_groups(
     pool: &PgPool,
-    pairs: Vec<(EntityGroupId, EntityId, EntityId, MatchValues, f64, f64)>,
-    suggestions: Vec<(
-        String,
-        String,
-        String,
-        f64,
-        serde_json::Value,
-        String,
-        String,
-        i32,
-        String,
+    pairs_data: Vec<(EntityGroupId, EntityId, EntityId, MatchValues, f64, f64)>, // (group_id, e1, e2, match_values, final_conf, pre_rl_conf)
+    suggestions_data: Vec<(
+        String,         // pipeline_run_id
+        String,         // action_type
+        String,         // group_id_1 (entity_group_id)
+        f64,            // triggering_confidence
+        serde_json::Value, // details
+        String,         // reason_code
+        String,         // reason_message
+        i32,            // priority
+        String,         // status
     )>,
-    decision_snapshots: Vec<(String, String, Vec<f64>, f64, f64, i32)>,
-) -> Result<usize> {
-    if pairs.is_empty() {
+    decision_snapshots_data: Vec<(
+        String,         // entity_group_id
+        String,         // pipeline_run_id
+        Vec<f64>,       // snapshotted_features (Vec<f64>)
+        f64,            // pre_rl_confidence_at_decision
+        f64,            // tuned_confidence_at_decision
+        i32,            // confidence_tuner_version_at_decision
+    )>,
+) -> Result<usize> { // Returns number of successfully inserted entity groups
+    if pairs_data.is_empty() {
         return Ok(0);
     }
 
-    // Get a connection for all operations
-    let mut conn = pool
-        .get()
-        .await
-        .context("Geospatial: Failed to get DB connection for batch entity group creation")?;
+    let mut conn = pool.get().await.context("Geospatial: DB conn for batch create")?;
+    let tx = conn.transaction().await.context("Geospatial: Start TX for batch create")?;
 
-    // Start a transaction that will include all operations
-    let tx = conn
-        .transaction()
-        .await
-        .context("Geospatial: Failed to start transaction for batch entity group creation")?;
+    // 1. Insert Entity Groups
+    let entity_group_stmt = tx.prepare(INSERT_ENTITY_GROUP_SQL).await
+        .context("Geospatial: Prepare entity_group insert")?;
+    
+    let mut successfully_inserted_group_ids = HashSet::new();
+    for (group_id, e1_id, e2_id, match_values, final_conf, pre_rl_conf) in &pairs_data {
+        let match_values_json = serde_json::to_value(match_values)
+            .with_context(|| format!("Geospatial: Serialize match_values for group {}", group_id.0))?;
+        
+        let rows = tx.query(&entity_group_stmt, &[
+            &group_id.0, &e1_id.0, &e2_id.0, &MatchMethodType::Geospatial.as_str(),
+            &match_values_json, &final_conf, &pre_rl_conf,
+        ]).await.with_context(|| format!("Geospatial: Insert entity_group {}", group_id.0))?;
 
-    // Prepare statement for entity_group insertion
-    let stmt = tx
-        .prepare(
-            "INSERT INTO public.entity_group
-        (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, 
-        pre_rl_confidence_score)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING
-        RETURNING id", // Add RETURNING to know which inserts succeeded
-        )
-        .await
-        .context("Failed to prepare entity_group insert statement")?;
-
-    // Insert all entity groups and track which ones were successfully inserted
-    let mut created_count = 0;
-    let mut successful_group_ids = HashSet::new();
-
-    // Create a map from group_id to its index in the suggestions and decision_snapshots arrays
-    let mut suggestion_map: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut decision_map: HashMap<String, Vec<usize>> = HashMap::new();
-
-    // Populate the maps
-    for (i, (_, _, group_id, _, _, _, _, _, _)) in suggestions.iter().enumerate() {
-        suggestion_map.entry(group_id.clone()).or_default().push(i);
+        if !rows.is_empty() { // Check if RETURNING id produced a row
+            successfully_inserted_group_ids.insert(group_id.0.clone());
+        }
     }
 
-    for (i, (group_id, _, _, _, _, _)) in decision_snapshots.iter().enumerate() {
-        decision_map.entry(group_id.clone()).or_default().push(i);
-    }
+    // 2. Insert Suggestions (only for successfully created groups)
+    if !suggestions_data.is_empty() {
+        let suggestion_stmt = tx.prepare(
+            "INSERT INTO clustering_metadata.suggested_actions (
+                pipeline_run_id, action_type, group_id_1, triggering_confidence, details, 
+                reason_code, reason_message, priority, status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        ).await.context("Geospatial: Prepare suggestion insert")?;
 
-    for (group_id, entity_id_1, entity_id_2, match_values, confidence_score, pre_rl_score) in pairs
-    {
-        // Serialize match values
-        let match_values_json = match serde_json::to_value(&match_values) {
-            Ok(json) => json,
-            Err(e) => {
-                warn!("Geospatial: Failed to serialize match values: {}", e);
-                continue;
-            }
-        };
-
-        // Execute insert
-        match tx
-            .query(
-                // Changed from execute to query to get results
-                &stmt,
-                &[
-                    &group_id.0,
-                    &entity_id_1.0,
-                    &entity_id_2.0,
-                    &MatchMethodType::Geospatial.as_str(),
-                    &match_values_json,
-                    &confidence_score,
-                    &pre_rl_score,
-                ],
-            )
-            .await
-        {
-            Ok(rows) => {
-                if !rows.is_empty() {
-                    // This insert succeeded
-                    created_count += 1;
-                    successful_group_ids.insert(group_id.0.clone());
-                }
-            }
-            Err(e) => {
-                warn!("Geospatial: Failed to insert entity group: {}", e);
+        for (pr_id, act_type, grp_id, trig_conf, details, r_code, r_msg, prio, status) in &suggestions_data {
+            if successfully_inserted_group_ids.contains(grp_id) {
+                tx.execute(&suggestion_stmt, &[
+                    pr_id, act_type, grp_id, trig_conf, details, r_code, r_msg, prio, status,
+                ]).await.with_context(|| format!("Geospatial: Insert suggestion for group {}", grp_id))?;
             }
         }
     }
 
-    // Only insert suggestions for entity groups that were successfully created
-    if !suggestions.is_empty() {
-        let suggestion_stmt = tx
-            .prepare(
-                "INSERT INTO clustering_metadata.suggested_actions (
-                pipeline_run_id, action_type, group_id_1, 
-                triggering_confidence, details, reason_code, reason_message, priority, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-            )
-            .await
-            .context("Failed to prepare suggestion insert statement")?;
+    // 3. Insert Decision Snapshots (only for successfully created groups)
+    if !decision_snapshots_data.is_empty() {
+        let decision_stmt = tx.prepare(
+            "INSERT INTO clustering_metadata.match_decision_details (
+                entity_group_id, pipeline_run_id, snapshotted_features, method_type_at_decision, 
+                pre_rl_confidence_at_decision, tuned_confidence_at_decision, 
+                confidence_tuner_version_at_decision
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        ).await.context("Geospatial: Prepare decision_details insert")?;
 
-        for (
-            i,
-            (
-                pipeline_run_id,
-                action_type,
-                group_id,
-                confidence,
-                details,
-                reason_code,
-                reason_message,
-                priority,
-                status,
-            ),
-        ) in suggestions.iter().enumerate()
-        {
-            // Only insert if the referenced entity group was successfully created
-            if successful_group_ids.contains(group_id) {
-                if let Err(e) = tx
-                    .execute(
-                        &suggestion_stmt,
-                        &[
-                            pipeline_run_id,
-                            action_type,
-                            group_id,
-                            confidence,
-                            details,
-                            reason_code,
-                            reason_message,
-                            priority,
-                            status,
-                        ],
-                    )
-                    .await
-                {
-                    warn!(
-                        "Geospatial: Failed to insert suggestion for existing group {}: {}",
-                        group_id, e
-                    );
-                }
+        for (grp_id, pr_id, features_vec, pre_rl, tuned_conf, tuner_ver) in &decision_snapshots_data {
+            if successfully_inserted_group_ids.contains(grp_id) {
+                let features_json = serde_json::to_value(features_vec)
+                    .with_context(|| format!("Geospatial: Serialize features for decision snapshot of group {}", grp_id))?;
+                tx.execute(&decision_stmt, &[
+                    grp_id, pr_id, &features_json, &MatchMethodType::Geospatial.as_str(),
+                    pre_rl, tuned_conf, tuner_ver,
+                ]).await.with_context(|| format!("Geospatial: Insert decision_details for group {}", grp_id))?;
             }
         }
     }
 
-    // Only insert decision snapshots for entity groups that were successfully created
-    if !decision_snapshots.is_empty() {
-        let decision_stmt = tx
-            .prepare(
-                "INSERT INTO clustering_metadata.match_decision_details (
-                entity_group_id, pipeline_run_id, snapshotted_features,
-                method_type_at_decision, pre_rl_confidence_at_decision,
-                tuned_confidence_at_decision, confidence_tuner_version_at_decision
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            )
-            .await
-            .context("Failed to prepare decision snapshot insert statement")?;
-
-        for (group_id, run_id, features, pre_rl_score, tuned_score, tuner_version) in
-            decision_snapshots.iter()
-        {
-            // Only insert if the referenced entity group was successfully created
-            if successful_group_ids.contains(group_id) {
-                // Serialize features
-                let features_json = match serde_json::to_value(features) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        warn!("Geospatial: Failed to serialize features: {}", e);
-                        continue;
-                    }
-                };
-
-                if let Err(e) = tx
-                    .execute(
-                        &decision_stmt,
-                        &[
-                            group_id,
-                            run_id,
-                            &features_json,
-                            &MatchMethodType::Geospatial.as_str(),
-                            pre_rl_score,
-                            tuned_score,
-                            tuner_version,
-                        ],
-                    )
-                    .await
-                {
-                    warn!(
-                        "Geospatial: Failed to insert decision snapshot for existing group {}: {}",
-                        group_id, e
-                    );
-                }
-            }
-        }
-    }
-
-    // Commit the transaction with all operations
-    tx.commit().await?;
-
-    Ok(created_count)
+    tx.commit().await.context("Geospatial: Commit batch create transaction")?;
+    Ok(successfully_inserted_group_ids.len())
 }
+
 
 /// Helper function to fetch a set of valid entity IDs
 async fn fetch_valid_entity_ids(
@@ -1067,113 +814,8 @@ async fn fetch_valid_entity_ids(
         .query("SELECT id FROM public.entity", &[])
         .await
         .context("Geospatial: Failed to query valid entity IDs")?;
-
-    let mut valid_ids = HashSet::with_capacity(rows.len());
-    for row in rows {
-        let id: String = row.get(0);
-        valid_ids.insert(id);
-    }
-
-    Ok(valid_ids)
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// Helper function to fetch existing pairs with method type parameter
-async fn fetch_existing_pairs(
-    conn: &impl tokio_postgres::GenericClient,
-    method_type: MatchMethodType,
-) -> Result<HashSet<(EntityId, EntityId)>> {
-    debug!(
-        "Geospatial: Fetching existing {}-matched pairs...",
-        method_type.as_str()
-    );
-    let existing_pairs_query = "
-        SELECT entity_id_1, entity_id_2
-        FROM public.entity_group
-        WHERE method_type = $1";
-
-    let existing_pair_rows = conn
-        .query(existing_pairs_query, &[&method_type.as_str()])
-        .await
-        .context(format!(
-            "Geospatial: Failed to query existing {}-matched pairs",
-            method_type.as_str()
-        ))?;
-
-    let mut existing_processed_pairs: HashSet<(EntityId, EntityId)> =
-        HashSet::with_capacity(existing_pair_rows.len());
-    for row in existing_pair_rows {
-        let id1_str: String = row.get("entity_id_1");
-        let id2_str: String = row.get("entity_id_2");
-        // Always ensure consistent ordering for lookup - smaller ID first
-        if id1_str < id2_str {
-            existing_processed_pairs.insert((EntityId(id1_str), EntityId(id2_str)));
-        } else {
-            existing_processed_pairs.insert((EntityId(id2_str), EntityId(id1_str)));
-        }
-    }
-
-    Ok(existing_processed_pairs)
-}
-
-/// Helper function to fetch all candidate pairs
-async fn fetch_candidate_pairs(
-    conn: &impl tokio_postgres::GenericClient,
-) -> Result<Vec<(EntityId, EntityId, f64, f64, f64, f64, f64)>> {
-    let geo_candidates_query = "
-        WITH EntityLocations AS (
-            SELECT
-                e.id AS entity_id,
-                l.geom,
-                l.latitude,
-                l.longitude
-            FROM
-                public.entity e
-            JOIN
-                public.location l ON e.organization_id = l.organization_id
-            WHERE
-                l.geom IS NOT NULL AND e.id IS NOT NULL
-        )
-        SELECT
-            el1.entity_id AS entity_id_1_str,
-            el2.entity_id AS entity_id_2_str,
-            el1.latitude AS lat1,
-            el1.longitude AS lon1,
-            el2.latitude AS lat2,
-            el2.longitude AS lon2,
-            ST_Distance(el1.geom, el2.geom) AS distance_meters
-        FROM
-            EntityLocations el1
-        JOIN
-            EntityLocations el2 ON el1.entity_id < el2.entity_id -- Ensures order & avoids self-match
-            AND ST_DWithin(el1.geom, el2.geom, $1)
-    ";
-
-    debug!("Geospatial: Executing geospatial candidate query...");
-    let candidate_rows = conn
-        .query(geo_candidates_query, &[&METERS_TO_CHECK])
-        .await
-        .context("Geospatial: Candidate query failed")?;
-
-    let mut result = Vec::with_capacity(candidate_rows.len());
-    for row in candidate_rows {
-        let entity_id1_str: String = row.get("entity_id_1_str");
-        let entity_id2_str: String = row.get("entity_id_2_str");
-        let lat1: f64 = row.get("lat1");
-        let lon1: f64 = row.get("lon1");
-        let lat2: f64 = row.get("lat2");
-        let lon2: f64 = row.get("lon2");
-        let distance_meters: f64 = row.get("distance_meters");
-
-        result.push((
-            EntityId(entity_id1_str),
-            EntityId(entity_id2_str),
-            lat1,
-            lon1,
-            lat2,
-            lon2,
-            distance_meters,
-        ));
-    }
-
-    Ok(result)
-}
+// fetch_existing_pairs is no longer needed as its logic is incorporated into fetch_candidate_pairs_excluding_existing
+// fetch_candidate_pairs is also superseded by fetch_candidate_pairs_excluding_existing

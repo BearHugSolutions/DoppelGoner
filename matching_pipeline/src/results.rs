@@ -23,14 +23,22 @@ pub struct PairMlResult {
 #[derive(Debug, Clone)]
 pub struct MatchMethodStats {
     pub method_type: MatchMethodType,
-    /// Number of new pairwise links (entity_group records) created.
-    pub groups_created: usize, // "groups" now means pairwise links
-    /// Number of unique entities that participated in at least one new pairwise link.
+    pub groups_created: usize,
     pub entities_matched: usize,
-    /// Average of the RL-derived confidence_score from new pairwise entity_group records.
     pub avg_confidence: f64,
-    /// This will always be 2.0 as entity_group records are now pairwise.
     pub avg_group_size: f64,
+}
+
+impl MatchMethodStats {
+    pub fn default_for(method_type: MatchMethodType) -> Self {
+        Self {
+            method_type,
+            groups_created: 0,
+            entities_matched: 0,
+            avg_confidence: 0.0,
+            avg_group_size: 0.0, // Or 2.0 if it always defaults to that for URL matches initially
+        }
+    }
 }
 
 /// Cluster statistics
