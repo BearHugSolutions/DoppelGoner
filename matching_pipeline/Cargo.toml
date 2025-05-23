@@ -92,6 +92,10 @@ path = "src/bin/extract_service_context_features.rs"
 name = "calculate_signatures"
 path = "src/bin/calculate_signatures.rs"
 
+[[bin]]
+name = "backfill_comparison_cache"
+path = "src/bin/backfill_comparison_cache.rs"
+
 [lib]
 name = "dedupe_lib"
 path = "src/lib.rs"
