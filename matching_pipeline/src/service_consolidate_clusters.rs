@@ -2,854 +2,716 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, info, warn};
+// use serde_json::json; // Not directly used after changes, but kept if needed for future metadata
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
-use tokio::sync::Mutex;
+use std::time::{Duration as StdDuration, Instant}; // Renamed to avoid conflict with pgvector::Vector
 use tokio_postgres::{GenericClient, Transaction};
 use uuid::Uuid;
-use xgraph::graph::graph::NodeId;
 
-// xgraph imports
-use xgraph::leiden_clustering::{CommunityConfig, CommunityDetection};
-use xgraph::Graph;
+// pgvector for embedding type (assuming it's a crate dependency)
+// If not using pgvector::Vector directly for cosine_similarity, Vec<f32> is fine.
+// For this refactor, we'll fetch as pgvector::Vector and convert to Vec<f32> for use.
+use pgvector::Vector;
+
 
 // Local imports
-use crate::config;
-use crate::db::{self, PgPool};
-use crate::models::{
-    ActionType,
-    ContributingSharedServiceDetail, // New struct (will need to be added to models.rs)
-    NewClusterFormationEdge,
-    NewSuggestedAction,
-    ServiceGroupClusterId,
-    ServiceGroupId,
-    ServiceId,
-    SuggestionStatus,
-};
-use crate::reinforcement::service::service_orchestrator::ServiceMatchingOrchestrator;
+use crate::db::PgPool;
+use crate::models::{ServiceGroupClusterId, ServiceId};
+// Assuming cosine_similarity_manual is available in utils
+use crate::utils::{cosine_similarity_candle, cosine_similarity_manual};
 
+
+/// Configuration for consolidation parameters
+#[derive(Debug, Clone)]
+pub struct ConsolidationConfig {
+    pub similarity_threshold: f64,
+    pub embedding_batch_size: usize, // For fetching from DB to cache
+    pub db_batch_size: usize,        // For DB query LIMIT
+    pub max_cache_size: usize,       // Max items in EmbeddingCache
+    pub min_cluster_size: usize,     // Min services in a cluster to be considered for centroid calculation
+    pub embedding_cache_duration_secs: u64, // Duration for embedding cache entries
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            similarity_threshold: 0.85, // Default similarity for merging clusters
+            embedding_batch_size: 200,  // How many embeddings to process for similarity at once
+            db_batch_size: 100,         // How many services to fetch from DB in one go
+            max_cache_size: 10000,      // Max service embeddings in local cache
+            min_cluster_size: 2,        // Clusters smaller than this won't have centroids calculated (or won't be processed)
+            embedding_cache_duration_secs: 3600, // 1 hour
+        }
+    }
+}
+
+/// Represents a service with its embedding data (using Vec<f32> for processing)
+#[derive(Debug, Clone)]
+struct ServiceWithEmbedding {
+    service_id: ServiceId,
+    cluster_id: ServiceGroupClusterId, // Current cluster
+    embedding: Vec<f32>, // Processed embedding
+    // metadata: serde_json::Value, // If needed later
+}
+
+/// Represents a cluster with aggregated data for consolidation
+#[derive(Debug, Clone)]
+struct ClusterData {
+    cluster_id: ServiceGroupClusterId,
+    service_count: usize,
+    average_embedding: Vec<f32>, // Centroid
+    service_ids: HashSet<ServiceId>, // Services in this cluster
+                                     // coherence_score: Option<f64>, // If needed later
+}
+
+/// Cache for storing service embeddings locally to reduce DB calls
 #[derive(Debug)]
-struct NodeMapper {
-    group_to_idx: HashMap<ServiceGroupId, NodeId>,
-    idx_to_group: HashMap<NodeId, ServiceGroupId>,
+struct ServiceEmbeddingCache {
+    embeddings: HashMap<ServiceId, CachedServiceEmbedding>,
+    cache_duration: StdDuration,
+    max_size: usize,
+    hits: u64,
+    misses: u64,
 }
 
-impl NodeMapper {
-    fn new() -> Self {
-        NodeMapper {
-            group_to_idx: HashMap::new(),
-            idx_to_group: HashMap::new(),
+#[derive(Debug, Clone)]
+struct CachedServiceEmbedding {
+    embedding: Vec<f32>,
+    cached_at: Instant,
+}
+
+impl ServiceEmbeddingCache {
+    fn new(duration_secs: u64, max_size: usize) -> Self {
+        Self {
+            embeddings: HashMap::with_capacity(max_size / 2), // Pre-allocate a bit
+            cache_duration: StdDuration::from_secs(duration_secs),
+            max_size,
+            hits: 0,
+            misses: 0,
         }
     }
 
-    fn get_or_add_node(
-        &mut self,
-        graph: &mut Graph<f64, ServiceGroupId, ()>,
-        group_id: &ServiceGroupId,
-    ) -> NodeId {
-        *self
-            .group_to_idx
-            .entry(group_id.clone())
-            .or_insert_with(|| {
-                let node_idx = graph.add_node(group_id.clone());
-                self.idx_to_group.insert(node_idx, group_id.clone());
-                node_idx
-            })
-    }
-
-    fn get_group_id(&self, idx: NodeId) -> Option<&ServiceGroupId> {
-        self.idx_to_group.get(&idx)
-    }
-
-    fn get_node_count(&self) -> usize {
-        self.idx_to_group.len()
-    }
-}
-
-// Get confidence score for a pairwise service group
-async fn get_confidence_for_pairwise_group(
-    transaction: &impl GenericClient,
-    service_group_id: &str,
-) -> Result<Option<f64>> {
-    let row = transaction
-        .query_opt(
-            "SELECT service_id_1, service_id_2, confidence_score FROM public.service_group WHERE id = $1",
-            &[&service_group_id],
-        )
-        .await
-        .context("Failed to fetch pairwise service_group for confidence")?;
-
-    if let Some(row) = row {
-        Ok(row.get("confidence_score"))
-    } else {
-        Ok(None)
-    }
-}
-
-async fn build_weighted_xgraph(
-    pool: &PgPool,
-    transaction: &Transaction<'_>,
-    pipeline_run_id: &str,
-) -> Result<(Graph<f64, ServiceGroupId, ()>, NodeMapper)> {
-    info!(
-        "Building weighted xgraph for service cluster consolidation (run ID: {})...",
-        pipeline_run_id
-    );
-    let start_time = Instant::now();
-
-    // 1. Nodes: Fetch pairwise service_group records where group_cluster_id IS NULL
-    let groups_query = "SELECT id, service_id_1, service_id_2, confidence_score FROM public.service_group WHERE group_cluster_id IS NULL";
-    let group_rows = transaction
-        .query(groups_query, &[])
-        .await
-        .context("Failed to fetch unclustered pairwise service groups")?;
-
-    if group_rows.is_empty() {
-        info!("No unclustered service groups found to build graph.");
-        return Ok((Graph::new(false), NodeMapper::new()));
-    }
-
-    let mut node_mapper = NodeMapper::new();
-    let mut xgraph_instance: Graph<f64, ServiceGroupId, ()> = Graph::new(false); // Undirected
-    let mut service_to_pairwise_groups: HashMap<ServiceId, Vec<ServiceGroupId>> = HashMap::new();
-
-    // Map to store confidence of each pairwise group (node)
-    let mut group_confidences: HashMap<ServiceGroupId, f64> = HashMap::new();
-
-    for row in &group_rows {
-        let group_id_str: String = row.get("id");
-        let service_group_id = ServiceGroupId(group_id_str);
-        let service_id_1_str: String = row.get("service_id_1");
-        let service_id_2_str: String = row.get("service_id_2");
-        let confidence_score: Option<f64> = row.get("confidence_score");
-
-        let _node_id = node_mapper.get_or_add_node(&mut xgraph_instance, &service_group_id);
-
-        if let Some(conf) = confidence_score {
-            group_confidences.insert(service_group_id.clone(), conf);
-        } else {
-            // Default to 0.0 if confidence is NULL
-            warn!(
-                "Pairwise service group {} has NULL confidence_score. Defaulting to 0.0.",
-                service_group_id.0
-            );
-            group_confidences.insert(service_group_id.clone(), 0.0);
-        }
-
-        service_to_pairwise_groups
-            .entry(ServiceId(service_id_1_str))
-            .or_default()
-            .push(service_group_id.clone());
-        service_to_pairwise_groups
-            .entry(ServiceId(service_id_2_str))
-            .or_default()
-            .push(service_group_id.clone());
-    }
-
-    info!(
-        "Loaded {} pairwise service groups as nodes.",
-        node_mapper.get_node_count()
-    );
-    info!(
-        "Processed service memberships for {} unique services in these pairs.",
-        service_to_pairwise_groups.len()
-    );
-
-    // 2. Edge Creation & Weighting: Edges between PAIRS that share a service
-    let mut edge_contributions: HashMap<
-        (ServiceGroupId, ServiceGroupId), // Key: (PairwiseGroupId1, PairwiseGroupId2)
-        Vec<ContributingSharedServiceDetail>, // Value: Details of the shared service
-    > = HashMap::new();
-
-    for (service_z, groups_sharing_service_z) in service_to_pairwise_groups {
-        if groups_sharing_service_z.len() < 2 {
-            continue; // No edge can be formed by this shared service
-        }
-
-        // Generate pairs of service groups that share service_z
-        for i in 0..groups_sharing_service_z.len() {
-            for j in (i + 1)..groups_sharing_service_z.len() {
-                let group_a_id = &groups_sharing_service_z[i]; // This is a pairwise group
-                let group_b_id = &groups_sharing_service_z[j]; // This is another pairwise group
-
-                // Confidence of GroupA (pair A) is its direct confidence_score
-                let c_a = group_confidences
-                    .get(group_a_id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "Confidence not found for group_a_id {}. Defaulting to 0.0",
-                            group_a_id.0
-                        );
-                        0.0
-                    });
-
-                // Confidence of GroupB (pair B) is its direct confidence_score
-                let c_b = group_confidences
-                    .get(group_b_id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "Confidence not found for group_b_id {}. Defaulting to 0.0",
-                            group_b_id.0
-                        );
-                        0.0
-                    });
-
-                // W_z is the average confidence of the two pairs linked by service_z
-                let w_z = (c_a + c_b) / 2.0;
-
-                let key = if group_a_id.0 < group_b_id.0 {
-                    (group_a_id.clone(), group_b_id.clone())
-                } else {
-                    (group_b_id.clone(), group_a_id.clone())
-                };
-
-                edge_contributions
-                    .entry(key)
-                    .or_default()
-                    .push(ContributingSharedServiceDetail {
-                        service_id: service_z.0.clone(),
-                        conf_service_in_source_group: c_a,
-                        conf_service_in_target_group: c_b,
-                        w_z,
-                    });
+    fn get(&mut self, service_id: &ServiceId) -> Option<&Vec<f32>> {
+        // First, check if the entry exists and if it's expired.
+        // This initial check is purely immutable.
+        let entry_is_expired = match self.embeddings.get(service_id) {
+            Some(cached) => cached.cached_at.elapsed() >= self.cache_duration, // Check if expired
+            None => {
+                // Entry does not exist
+                self.misses += 1;
+                return None;
             }
-        }
-    }
-
-    info!(
-        "Calculated initial W_z contributions for {} potential inter-group edges.",
-        edge_contributions.len()
-    );
-
-    for ((group_a_id, group_b_id), contributions) in edge_contributions {
-        if contributions.is_empty() {
-            continue;
-        }
-
-        let product_of_negations = contributions.iter().fold(1.0, |acc, detail| {
-            acc * (1.0 - detail.w_z.max(0.0).min(1.0)) // Clamp w_z
-        });
-        let edge_weight = 1.0 - product_of_negations;
-
-        if edge_weight <= 0.0 {
-            debug!(
-                "Skipping edge between {} and {} due to non-positive weight {:.4}",
-                group_a_id.0, group_b_id.0, edge_weight
-            );
-            continue;
-        }
-
-        let node_a_idx = node_mapper.get_or_add_node(&mut xgraph_instance, &group_a_id);
-        let node_b_idx = node_mapper.get_or_add_node(&mut xgraph_instance, &group_b_id);
-
-        if let Err(e) = xgraph_instance.add_edge(node_a_idx, node_b_idx, edge_weight, ()) {
-            warn!(
-                "Failed to add edge to xgraph between {} ({:?}) and {} ({:?}): {}",
-                group_a_id.0, node_a_idx, group_b_id.0, node_b_idx, e
-            );
-            continue;
-        }
-        debug!(
-            "Added edge to xgraph: {} --({:.4})-- {}",
-            group_a_id.0, edge_weight, group_b_id.0
-        );
-
-        let contributing_services_json = serde_json::to_value(&contributions).ok();
-        let cfe = NewClusterFormationEdge {
-            pipeline_run_id: pipeline_run_id.to_string(),
-            source_group_id: group_a_id.0.clone(),
-            target_group_id: group_b_id.0.clone(),
-            calculated_edge_weight: edge_weight,
-            contributing_shared_entities: contributing_services_json,
         };
-        if let Err(e) = db::insert_cluster_formation_edge(transaction, &cfe).await {
-            warn!(
-                "Failed to log cluster formation edge between {} and {}: {}",
-                group_a_id.0, group_b_id.0, e
-            );
-        }
 
-        // Using SERVICE_WEAK_LINK_THRESHOLD which should be defined in config.rs
-        if edge_weight > 0.0 && edge_weight < config::SERVICE_WEAK_LINK_THRESHOLD {
-            let details_json = serde_json::json!({
-                "calculated_edge_weight": edge_weight,
-                "contributing_links_count": contributions.len(),
-                "shared_service_details": contributions, // Log full contribution details
-            });
-            let reason_message = format!(
-                "Inter-pairwise-group link between ServiceGroup {} and ServiceGroup {} has a weak calculated weight of {:.4}",
-                group_a_id.0, group_b_id.0, edge_weight
-            );
-            let suggestion = NewSuggestedAction {
-                pipeline_run_id: Some(pipeline_run_id.to_string()),
-                action_type: ActionType::ReviewInterGroupLink.as_str().to_string(),
-                entity_id: None,
-                group_id_1: Some(group_a_id.0.clone()),
-                group_id_2: Some(group_b_id.0.clone()),
-                cluster_id: None,
-                triggering_confidence: Some(edge_weight),
-                details: Some(details_json),
-                reason_code: Some("WEAK_INTER_SERVICE_GROUP_EDGE".to_string()),
-                reason_message: Some(reason_message),
-                priority: 0,
-                status: SuggestionStatus::PendingReview.as_str().to_string(),
-                reviewer_id: None,
-                reviewed_at: None,
-                review_notes: None,
-            };
-            if let Err(e) = db::insert_suggestion(transaction, &suggestion).await {
-                warn!(
-                    "Failed to log suggestion for weak inter-service-group link: {}",
-                    e
-                );
-            }
+        // If we reach here, the entry exists. Now, handle based on expiration.
+        if entry_is_expired {
+            // Entry exists but is expired. Remove it. This is a mutable operation.
+            // The previous immutable borrow from `self.embeddings.get()` in the match is now finished.
+            self.embeddings.remove(service_id);
+            self.misses += 1; // It was a miss because it was unusable.
+            None
+        } else {
+            // Entry exists and is not expired. Increment hits and return the reference.
+            // We need to get the reference again because the previous one from the match scope is gone.
+            // This is safe because we've established it's not expired and haven't done a mutable op since.
+            self.hits += 1;
+            // This re-borrows `self.embeddings` immutably.
+            self.embeddings.get(service_id).map(|c| &c.embedding)
         }
     }
 
-    info!(
-        "Weighted xgraph built in {:.2?} with {} nodes and {} edges.",
-        start_time.elapsed(),
-        node_mapper.get_node_count(),
-        xgraph_instance.edges.len()
-    );
-
-    Ok((xgraph_instance, node_mapper))
+    fn insert(&mut self, service_id: ServiceId, embedding: Vec<f32>) {
+        if self.embeddings.len() >= self.max_size && self.max_size > 0 { // ensure max_size > 0 to prevent division by zero or unintended full clear
+            // Simple eviction: remove a random key if full (can be improved with LRU)
+            // To make it slightly more deterministic for testing or specific needs,
+            // one might sort keys or use a more sophisticated eviction.
+            // For now, `keys().next()` is simple but not truly random.
+            // A more robust LRU would require more state (e.g., a linked list of keys).
+            if let Some(key_to_remove) = self.embeddings.keys().next().cloned() { // .cloned() is important here
+                self.embeddings.remove(&key_to_remove);
+            }
+        }
+        self.embeddings.insert(
+            service_id,
+            CachedServiceEmbedding {
+                embedding,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+    #[allow(dead_code)] // Potentially useful for debugging
+    fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
 }
 
-pub async fn process_clusters(
+
+/// Batch fetcher for service embeddings
+struct ServiceEmbeddingBatch;
+
+impl ServiceEmbeddingBatch {
+    /// Fetches embeddings for a batch of service IDs, utilizing the cache.
+    async fn fetch_embeddings(
+        conn: &impl GenericClient,
+        service_ids: &[ServiceId],
+        cache: &mut ServiceEmbeddingCache,
+    ) -> Result<HashMap<ServiceId, Vec<f32>>> {
+        let mut results = HashMap::new();
+        let mut ids_to_fetch_from_db = Vec::new();
+
+        for service_id in service_ids {
+            if let Some(embedding) = cache.get(service_id) {
+                results.insert(service_id.clone(), embedding.clone());
+            } else {
+                ids_to_fetch_from_db.push(service_id.0.clone()); // Store String for query
+            }
+        }
+
+        if !ids_to_fetch_from_db.is_empty() {
+            debug!("Cache miss for {} service IDs, fetching from DB.", ids_to_fetch_from_db.len());
+            // Corrected table name to public.service and column to embedding_v2
+            let query = "
+                SELECT id, embedding_v2
+                FROM public.service
+                WHERE id = ANY($1) AND embedding_v2 IS NOT NULL
+            ";
+            let rows = conn
+                .query(query, &[&ids_to_fetch_from_db])
+                .await
+                .context("Failed to batch fetch service embeddings from DB")?;
+
+            for row in rows {
+                let id_str: String = row.get("id");
+                let service_id = ServiceId(id_str);
+                if let Some(pg_vector) = row.get::<_, Option<Vector>>("embedding_v2") {
+                    let embedding_vec_f32 = pg_vector.to_vec(); // Convert pgvector::Vector to Vec<f32>
+                    results.insert(service_id.clone(), embedding_vec_f32.clone());
+                    cache.insert(service_id, embedding_vec_f32);
+                } else {
+                    warn!("Service {} found but its embedding_v2 is NULL.", service_id.0);
+                }
+            }
+        }
+        Ok(results)
+    }
+}
+
+
+/// Main function to consolidate service clusters based on embedding similarity
+pub async fn consolidate_service_clusters(
     pool: &PgPool,
-    reinforcement_orchestrator: Option<&Mutex<ServiceMatchingOrchestrator>>,
     pipeline_run_id: &str,
+    config: Option<ConsolidationConfig>,
 ) -> Result<usize> {
+    let config = config.unwrap_or_default();
     info!(
-        "Starting service cluster consolidation process (run ID: {})...",
-        pipeline_run_id
+        "Starting service cluster consolidation (run ID: {}, threshold: {:.3}, min_cluster_size: {})...",
+        pipeline_run_id, config.similarity_threshold, config.min_cluster_size
     );
     let start_time = Instant::now();
+
+    // Initialize cache
+    let mut embedding_cache = ServiceEmbeddingCache::new(config.embedding_cache_duration_secs, config.max_cache_size);
+
 
     let mut conn = pool
         .get()
         .await
-        .context("Failed to get DB connection for service_process_clusters")?;
+        .context("Failed to get DB connection for cluster consolidation")?;
     let transaction = conn
         .transaction()
         .await
-        .context("Failed to start transaction for service_process_clusters")?;
+        .context("Failed to start transaction for cluster consolidation")?;
 
-    info!("Building weighted service group graph (pairwise nodes)...");
-    let build_start = Instant::now();
-    let (graph, node_mapper) = build_weighted_xgraph(pool, &transaction, pipeline_run_id).await?;
-    info!("Graph built in {:.2?}", build_start.elapsed());
+    // Step 1: Load all services that are part of any cluster, along with their embeddings
+    // This is slightly different from entity consolidation; we get services from service_group.
+    let services_with_embeddings =
+        load_clustered_services_with_embeddings(&transaction, &config, &mut embedding_cache).await?;
+    info!(
+        "Loaded {} services with embeddings for consolidation. Cache hits: {}, misses: {}",
+        services_with_embeddings.len(), embedding_cache.hits, embedding_cache.misses
+    );
 
-    if graph.nodes.is_empty() {
-        info!("No nodes in the graph. Skipping Leiden clustering for services.");
-        transaction
-            .commit()
-            .await
-            .context("Failed to commit empty service cluster transaction")?;
+    if services_with_embeddings.is_empty() {
+        info!("No services with embeddings found in clusters, skipping consolidation.");
+        transaction.commit().await.context("Failed to commit empty transaction")?;
         return Ok(0);
     }
 
+    // Step 2: Group services by current clusters
+    let mut clusters_map = group_services_into_cluster_data(services_with_embeddings);
+    info!("Found {} initial service clusters from service_group records", clusters_map.len());
+
+    // Step 3: Calculate cluster centroids and filter by minimum size
+    calculate_and_filter_cluster_centroids(&mut clusters_map, config.min_cluster_size);
+    let mut clusters_to_process: Vec<ClusterData> = clusters_map.into_values().collect();
+
     info!(
-        "Graph built with {} nodes (pairwise service groups) and {} edges. Starting Leiden clustering...",
-        node_mapper.get_node_count(),
-        graph.edges.len()
+        "Processing {} service clusters meeting minimum size requirement ({} services)",
+        clusters_to_process.len(), config.min_cluster_size
     );
 
-    // Use a different resolution parameter for services if needed
-    let leiden_config = CommunityConfig {
-        resolution: config::SERVICE_LEIDEN_RESOLUTION_PARAMETER,
-        deterministic: true,
-        seed: Some(42),
-        iterations: 10,
-        gamma: 1.0,
-    };
+    if clusters_to_process.len() < 2 {
+        info!("Not enough service clusters ({} found) to consolidate further.", clusters_to_process.len());
+        transaction.commit().await.context("Failed to commit transaction")?;
+        return Ok(0);
+    }
+    
+    // Sort clusters by ID for deterministic processing (optional, but good for reproducibility)
+    clusters_to_process.sort_by(|a, b| a.cluster_id.0.cmp(&b.cluster_id.0));
 
-    let leiden_start = Instant::now();
-    let communities_result = match graph.detect_communities_with_config(leiden_config) {
-        Ok(communities) => communities,
-        Err(e) => {
-            let _ = transaction
-                .rollback()
-                .await
-                .map_err(|rb_err| warn!("Rollback failed: {}", rb_err));
-            return Err(
-                anyhow::Error::from(e).context("Leiden community detection failed for services")
-            );
-        }
-    };
-    info!(
-        "Leiden algorithm finished in {:.2?}, found {} raw communities for services.",
-        leiden_start.elapsed(),
-        communities_result.len()
-    );
 
-    let mut clusters_created = 0;
-    let mut new_cluster_ids_for_verification = Vec::new();
+    // Step 4: Find similar clusters using batched similarity calculations
+    // SimilarityCache for cluster-pair similarities (not individual embeddings)
+    let mut similarity_pair_cache = ClusterSimilarityPairCache::new(config.max_cache_size / 10); // Smaller cache for pairs
 
-    for (_community_key, node_indices_in_community) in communities_result.iter() {
-        // These node_indices map to pairwise ServiceGroupIds
-        let pairwise_group_ids_in_community: Vec<ServiceGroupId> = node_indices_in_community
-            .iter()
-            .filter_map(|&node_idx| node_mapper.get_group_id(node_idx).cloned())
-            .collect();
+    let merge_candidates = find_merge_candidates_for_services(&clusters_to_process, &config, &mut similarity_pair_cache).await?;
+    info!("Found {} potential service cluster merges. Similarity cache hits: {}, misses: {}", merge_candidates.len(), similarity_pair_cache.hits, similarity_pair_cache.misses);
 
-        if pairwise_group_ids_in_community.is_empty() {
-            debug!("Skipping community with 0 mapped pairwise service groups.");
-            continue;
-        }
-
-        // Fetch all unique service_id_1 and service_id_2 from these pairwise_group_ids
-        let mut unique_services_in_cluster = HashSet::new();
-        let group_id_strings_for_query: Vec<String> = pairwise_group_ids_in_community
-            .iter()
-            .map(|g| g.0.clone())
-            .collect();
-
-        if group_id_strings_for_query.is_empty() {
-            continue;
-        }
-
-        // Query to get all service IDs from the involved pairwise groups
-        let services_query = "
-            SELECT service_id_1, service_id_2
-            FROM public.service_group
-            WHERE id = ANY($1)";
-
-        let service_rows = match transaction
-            .query(services_query, &[&group_id_strings_for_query])
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                warn!(
-                    "Failed to fetch services for community {:?}: {}",
-                    group_id_strings_for_query, e
-                );
-                continue;
-            }
-        };
-
-        for row in service_rows {
-            unique_services_in_cluster.insert(ServiceId(row.get("service_id_1")));
-            unique_services_in_cluster.insert(ServiceId(row.get("service_id_2")));
-        }
-        let unique_service_count = unique_services_in_cluster.len() as i32;
-
-        // A cluster makes sense if it has at least 2 unique services.
-        // A single pairwise group already guarantees this.
-        if unique_service_count < 2 {
-            debug!(
-                "Skipping community with < 2 unique services: {:?} ({} services)",
-                group_id_strings_for_query, unique_service_count
-            );
-            continue;
-        }
-
-        debug!(
-            "Processing community of {} pairwise service groups, forming a cluster with {} unique services: {:?}",
-            pairwise_group_ids_in_community.len(),
-            unique_service_count,
-            pairwise_group_ids_in_community.iter().map(|g| &g.0).collect::<Vec<_>>()
-        );
-
-        let new_cluster_id = ServiceGroupClusterId(Uuid::new_v4().to_string());
-        if let Err(e) = create_service_cluster_record(
-            &transaction,
-            &new_cluster_id,
-            pairwise_group_ids_in_community.len() as i32, // This is count of PAIRS
-            unique_service_count,
-        )
-        .await
-        {
-            warn!(
-                "Failed to create service cluster record for cluster {}: {}",
-                new_cluster_id.0, e
-            );
-            continue;
-        }
-
-        // Update all the *pairwise* service_group records with this new_cluster_id
-        if let Err(e) = update_service_groups_with_cluster_id(
-            &transaction,
-            &new_cluster_id,
-            &pairwise_group_ids_in_community,
-        )
-        .await
-        {
-            warn!(
-                "Failed to update pairwise service groups for cluster {}: {}",
-                new_cluster_id.0, e
-            );
-            continue;
-        }
-
-        new_cluster_ids_for_verification.push(new_cluster_id.clone());
-        clusters_created += 1;
-        info!(
-            "Created ServiceGroupCluster {} (ID: {}) for {} pairwise groups and {} unique services.",
-            clusters_created,
-            new_cluster_id.0,
-            pairwise_group_ids_in_community.len(),
-            unique_service_count
-        );
+    if merge_candidates.is_empty() {
+        info!("No similar service clusters found for merging.");
+        transaction.commit().await.context("Failed to commit transaction")?;
+        return Ok(0);
     }
 
-    info!(
-        "Completed processing Leiden communities for services. {} new service clusters created.",
-        clusters_created
-    );
-
-    if let Some(orchestrator_ref) = reinforcement_orchestrator {
-        if !new_cluster_ids_for_verification.is_empty() {
-            info!(
-                "Verifying {} newly formed service clusters...",
-                new_cluster_ids_for_verification.len()
-            );
-            let verify_start = Instant::now();
-            match verify_service_clusters(
-                &transaction,
-                pool,
-                &new_cluster_ids_for_verification,
-                orchestrator_ref,
-                pipeline_run_id,
-            )
-            .await
-            {
-                Ok(_) => info!(
-                    "Service cluster verification step completed in {:.2?}.",
-                    verify_start.elapsed()
-                ),
-                Err(e) => warn!("Service cluster verification step failed: {}", e),
-            }
-        }
-    }
+    // Step 5: Execute cluster merges in the database
+    let merged_count =
+        execute_service_cluster_merges(&transaction, merge_candidates, pipeline_run_id, pool).await?;
 
     transaction
         .commit()
         .await
-        .context("Failed to commit service cluster processing transaction")?;
+        .context("Failed to commit service cluster consolidation transaction")?;
+
+    let (cache_hits, cache_misses) = embedding_cache.stats();
+    let total_lookups = cache_hits + cache_misses;
+    let hit_ratio = if total_lookups > 0 { (cache_hits as f64 / total_lookups as f64) * 100.0 } else { 0.0 };
+
     info!(
-        "Service cluster consolidation finished in {:.2?}. {} service clusters created.",
+        "Service cluster consolidation completed in {:.2?}. {} cluster pairs merged. Embedding Cache hit ratio: {:.2}% ({}/{} lookups)",
         start_time.elapsed(),
-        clusters_created
-    );
-    Ok(clusters_created)
-}
-
-async fn create_service_cluster_record(
-    transaction: &Transaction<'_>,
-    cluster_id: &ServiceGroupClusterId,
-    pair_count: i32,
-    service_count: i32,
-) -> Result<()> {
-    let now = Utc::now().naive_utc();
-    let cluster_name = format!("ServiceLeidenCluster-{}", &cluster_id.0[..8]);
-    let description = format!(
-        "Leiden-generated service cluster from {} pairwise service groups, {} unique services.",
-        pair_count, service_count
+        merged_count,
+        hit_ratio,
+        cache_hits,
+        total_lookups
     );
 
-    transaction.execute(
-        "INSERT INTO public.service_group_cluster (id, name, description, created_at, updated_at, service_count, service_group_count, average_coherence_score)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)", 
-        &[&cluster_id.0, &cluster_name, &description, &now, &now, &service_count, &pair_count],
-    ).await.context("Failed to insert service_group_cluster")?;
-    Ok(())
+    Ok(merged_count)
 }
 
-async fn update_service_groups_with_cluster_id(
+/// Load services that are part of clusters, along with their embeddings.
+async fn load_clustered_services_with_embeddings(
     transaction: &Transaction<'_>,
-    cluster_id: &ServiceGroupClusterId,
-    pairwise_group_ids: &[ServiceGroupId],
-) -> Result<()> {
-    if pairwise_group_ids.is_empty() {
-        return Ok(());
+    config: &ConsolidationConfig,
+    cache: &mut ServiceEmbeddingCache,
+) -> Result<Vec<ServiceWithEmbedding>> {
+    // Get all distinct service IDs present in service_group table that have a group_cluster_id
+    let query_service_ids_in_clusters = "
+        SELECT DISTINCT service_id, sg.group_cluster_id
+        FROM (
+            SELECT service_id_1 AS service_id, group_cluster_id FROM public.service_group WHERE group_cluster_id IS NOT NULL
+            UNION
+            SELECT service_id_2 AS service_id, group_cluster_id FROM public.service_group WHERE group_cluster_id IS NOT NULL
+        ) sg
+    ";
+    let rows = transaction.query(query_service_ids_in_clusters, &[])
+        .await.context("Failed to fetch service IDs from service_group")?;
+
+    let mut service_cluster_map = HashMap::new();
+    let mut distinct_service_ids_to_fetch_embeddings = HashSet::new();
+
+    for row in rows {
+        let service_id_str: String = row.get("service_id");
+        let cluster_id_str: String = row.get("group_cluster_id");
+        let service_id = ServiceId(service_id_str);
+        
+        service_cluster_map.insert(service_id.clone(), ServiceGroupClusterId(cluster_id_str));
+        distinct_service_ids_to_fetch_embeddings.insert(service_id);
     }
-    let now = Utc::now().naive_utc();
-    let group_id_strings: Vec<String> = pairwise_group_ids.iter().map(|g| g.0.clone()).collect();
-    transaction.execute(
-        "UPDATE public.service_group SET group_cluster_id = $1, updated_at = $2 WHERE id = ANY($3)",
-        &[&cluster_id.0, &now, &group_id_strings],
-    ).await.context("Failed to update service_group with cluster_id for pairwise groups")?;
-    Ok(())
+    
+    if distinct_service_ids_to_fetch_embeddings.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    info!("Found {} distinct services across all service clusters. Fetching embeddings...", distinct_service_ids_to_fetch_embeddings.len());
+
+    let mut all_services_with_embeddings = Vec::new();
+    let service_id_vec: Vec<ServiceId> = distinct_service_ids_to_fetch_embeddings.into_iter().collect();
+
+    // Fetch embeddings in batches using ServiceEmbeddingBatch
+    for chunk in service_id_vec.chunks(config.db_batch_size) { // db_batch_size for fetching from DB
+        let fetched_embeddings_map = ServiceEmbeddingBatch::fetch_embeddings(transaction, chunk, cache).await?;
+        for (service_id, embedding) in fetched_embeddings_map {
+            if let Some(cluster_id) = service_cluster_map.get(&service_id) {
+                 all_services_with_embeddings.push(ServiceWithEmbedding {
+                    service_id,
+                    cluster_id: cluster_id.clone(),
+                    embedding,
+                });
+            }
+        }
+    }
+    Ok(all_services_with_embeddings)
 }
 
-async fn verify_service_clusters(
-    transaction: &Transaction<'_>,
-    pool: &PgPool,
-    new_cluster_ids: &[ServiceGroupClusterId],
-    reinforcement_orchestrator_mutex: &Mutex<ServiceMatchingOrchestrator>,
-    pipeline_run_id: &str,
-) -> Result<()> {
-    info!(
-        "Verifying quality of {} newly formed service clusters (run ID: {})...",
-        new_cluster_ids.len(),
-        pipeline_run_id
-    );
 
-    for cluster_id in new_cluster_ids {
-        debug!("Verifying service cluster: {}", cluster_id.0);
+/// Group services into clusters and prepare cluster data structures
+fn group_services_into_cluster_data(
+    services_with_embeddings: Vec<ServiceWithEmbedding>,
+) -> HashMap<ServiceGroupClusterId, ClusterData> {
+    let mut cluster_map: HashMap<ServiceGroupClusterId, ClusterData> = HashMap::new();
 
-        // Fetch all unique service_ids for the current cluster
-        let mut services_in_cluster = HashSet::new();
-        let service_query = "
-            SELECT service_id_1, service_id_2
-            FROM public.service_group
-            WHERE group_cluster_id = $1";
+    for svc_emb in services_with_embeddings {
+        let cluster_id_key = svc_emb.cluster_id.clone();
 
-        let service_rows = match transaction.query(service_query, &[&cluster_id.0]).await {
-            Ok(rows) => rows,
-            Err(e) => {
+        cluster_map
+            .entry(cluster_id_key)
+            .and_modify(|cluster_data| {
+                cluster_data.service_count += 1;
+                cluster_data.service_ids.insert(svc_emb.service_id.clone());
+                // Accumulate embeddings for centroid calculation
+                if cluster_data.average_embedding.len() == svc_emb.embedding.len() {
+                    for (i, &val) in svc_emb.embedding.iter().enumerate() {
+                        cluster_data.average_embedding[i] += val;
+                    }
+                } else if cluster_data.average_embedding.is_empty() && !svc_emb.embedding.is_empty() {
+                    // This is the first non-empty embedding for this cluster
+                    cluster_data.average_embedding = svc_emb.embedding.clone();
+                } else if !svc_emb.embedding.is_empty() { // average_embedding is not empty but dimensions mismatch
+                     warn!("Embedding dimension mismatch for service {} in cluster {}. Expected {}, got {}. Skipping accumulation for this service.",
+                           svc_emb.service_id.0, svc_emb.cluster_id.0, cluster_data.average_embedding.len(), svc_emb.embedding.len());
+                }
+                // If svc_emb.embedding is empty, we do nothing for accumulation, but service_count is incremented.
+            })
+            .or_insert_with(|| {
+                let mut service_ids_set = HashSet::new();
+                service_ids_set.insert(svc_emb.service_id.clone());
+                ClusterData {
+                    cluster_id: svc_emb.cluster_id.clone(),
+                    service_count: 1,
+                    average_embedding: svc_emb.embedding.clone(), // Initialize with first service's embedding
+                    service_ids: service_ids_set,
+                }
+            });
+    }
+    cluster_map
+}
+
+/// Calculate centroid embeddings for each cluster and filter out small/empty ones
+fn calculate_and_filter_cluster_centroids(
+    clusters_map: &mut HashMap<ServiceGroupClusterId, ClusterData>,
+    min_cluster_size: usize,
+) {
+    clusters_map.retain(|_id, cluster_data| {
+        if cluster_data.service_count == 0 || cluster_data.average_embedding.is_empty() {
+            debug!("Removing cluster {} from centroid calculation due to zero services or empty average embedding.", cluster_data.cluster_id.0);
+            return false; // Remove if no services or if the initial embedding was empty and never updated
+        }
+        if cluster_data.service_count < min_cluster_size {
+             debug!("Cluster {} with {} services is smaller than min_cluster_size {}, removing from consolidation consideration.",
+                   cluster_data.cluster_id.0, cluster_data.service_count, min_cluster_size);
+            return false; // Remove if too small
+        }
+
+        // Average the accumulated embeddings for the centroid
+        // This check is technically redundant due to the retain condition above, but good for clarity
+        if cluster_data.service_count > 0 { 
+            for val in cluster_data.average_embedding.iter_mut() {
+                *val /= cluster_data.service_count as f32;
+            }
+        }
+        debug!(
+            "Cluster {} centroid calculated. Size: {}, Embedding dim: {}",
+            cluster_data.cluster_id.0,
+            cluster_data.service_count,
+            cluster_data.average_embedding.len()
+        );
+        true // Keep this cluster
+    });
+}
+
+
+/// Cache for storing computed cluster-pair similarities
+struct ClusterSimilarityPairCache {
+    cache: HashMap<(String, String), f64>,
+    max_size: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl ClusterSimilarityPairCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            cache: HashMap::with_capacity(max_size.min(1024)), // Cap initial capacity
+            max_size,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, id1: &str, id2: &str) -> Option<f64> {
+        let key = if id1 < id2 { (id1.to_string(), id2.to_string()) } else { (id2.to_string(), id1.to_string()) };
+        if let Some(similarity) = self.cache.get(&key).copied() {
+            self.hits += 1;
+            Some(similarity)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    fn insert(&mut self, id1: &str, id2: &str, similarity: f64) {
+        if self.cache.len() >= self.max_size && self.max_size > 0 {
+            // Simple eviction: remove a fraction of entries if full
+            let num_to_remove = (self.max_size / 10).max(1);
+            let keys_to_remove: Vec<_> = self.cache.keys().take(num_to_remove).cloned().collect();
+            for key in keys_to_remove {
+                self.cache.remove(&key);
+            }
+        }
+        let key = if id1 < id2 { (id1.to_string(), id2.to_string()) } else { (id2.to_string(), id1.to_string()) };
+        self.cache.insert(key, similarity);
+    }
+}
+
+
+/// Find service clusters that should be merged based on similarity threshold
+async fn find_merge_candidates_for_services(
+    clusters: &[ClusterData],
+    config: &ConsolidationConfig,
+    similarity_cache: &mut ClusterSimilarityPairCache,
+) -> Result<Vec<(ServiceGroupClusterId, ServiceGroupClusterId, f64)>> {
+    let mut merge_candidates = Vec::new();
+    let mut comparisons_made = 0;
+
+    for i in 0..clusters.len() {
+        for j in (i + 1)..clusters.len() {
+            let cluster1 = &clusters[i];
+            let cluster2 = &clusters[j];
+
+            if cluster1.average_embedding.is_empty() || cluster2.average_embedding.is_empty() {
+                warn!("Skipping similarity calculation between {} and {} due to empty centroid.", cluster1.cluster_id.0, cluster2.cluster_id.0);
+                continue;
+            }
+            if cluster1.average_embedding.len() != cluster2.average_embedding.len() {
                 warn!(
-                    "Failed to fetch services for cluster verification {}: {}. Skipping.",
-                    cluster_id.0, e
+                    "Cluster {} (dim {}) and {} (dim {}) have different embedding dimensions, skipping comparison.",
+                    cluster1.cluster_id.0, cluster1.average_embedding.len(),
+                    cluster2.cluster_id.0, cluster2.average_embedding.len()
                 );
                 continue;
             }
-        };
 
-        if service_rows.is_empty() {
-            debug!(
-                "No pairwise groups found for service cluster {} during verification. Skipping.",
-                cluster_id.0
-            );
-            // If no services, we can't calculate a score, so update with NULL
-            let update_null_score_query = "
-                UPDATE public.service_group_cluster
-                SET average_coherence_score = NULL
-                WHERE id = $1";
-            if let Err(e) = transaction
-                .execute(update_null_score_query, &[&cluster_id.0])
-                .await
-            {
-                warn!(
-                    "Failed to update average_coherence_score to NULL for empty service cluster {}: {}",
-                    cluster_id.0, e
-                );
+            // Check cache first
+            if let Some(cached_similarity) = similarity_cache.get(&cluster1.cluster_id.0, &cluster2.cluster_id.0) {
+                if cached_similarity >= config.similarity_threshold {
+                    merge_candidates.push((
+                        cluster1.cluster_id.clone(),
+                        cluster2.cluster_id.clone(),
+                        cached_similarity,
+                    ));
+                }
+                continue; // Move to next pair if cache hit
             }
+            
+            comparisons_made +=1;
+            match cosine_similarity_candle(&cluster1.average_embedding, &cluster2.average_embedding) {
+                Ok(similarity) => {
+                    similarity_cache.insert(&cluster1.cluster_id.0, &cluster2.cluster_id.0, similarity);
+                    if similarity >= config.similarity_threshold {
+                        debug!(
+                            "Found similar service clusters: {} and {} (similarity: {:.4})",
+                            cluster1.cluster_id.0, cluster2.cluster_id.0, similarity
+                        );
+                        merge_candidates.push((
+                            cluster1.cluster_id.clone(),
+                            cluster2.cluster_id.clone(),
+                            similarity,
+                        ));
+                    }
+                }
+                Err(e_candle) => {
+                    // Fallback to manual calculation
+                    warn!("Candle cosine similarity failed for service clusters {} and {}: {}. Trying manual calculation.",
+                          cluster1.cluster_id.0, cluster2.cluster_id.0, e_candle);
+                    if let Some(manual_similarity) = cosine_similarity_manual(&cluster1.average_embedding, &cluster2.average_embedding) {
+                        similarity_cache.insert(&cluster1.cluster_id.0, &cluster2.cluster_id.0, manual_similarity);
+                        if manual_similarity >= config.similarity_threshold {
+                             merge_candidates.push((
+                                cluster1.cluster_id.clone(),
+                                cluster2.cluster_id.clone(),
+                                manual_similarity,
+                            ));
+                        }
+                    } else {
+                        warn!("Manual cosine similarity also failed for service clusters {} and {}. Similarity set to 0.0",
+                              cluster1.cluster_id.0, cluster2.cluster_id.0);
+                        similarity_cache.insert(&cluster1.cluster_id.0, &cluster2.cluster_id.0, 0.0); // Cache failure as 0.0
+                    }
+                }
+            }
+        }
+        if i > 0 && i % 100 == 0 { // Log progress
+            debug!("Processed {} clusters for merge candidates. Comparisons: {}, Cache hits: {}, misses: {}",
+                i, comparisons_made, similarity_cache.hits, similarity_cache.misses);
+        }
+    }
+
+    // Sort by similarity score (highest first) to prioritize best matches
+    merge_candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(merge_candidates)
+}
+
+/// Execute service cluster merges in the database
+async fn execute_service_cluster_merges(
+    transaction: &Transaction<'_>,
+    merge_candidates: Vec<(ServiceGroupClusterId, ServiceGroupClusterId, f64)>,
+    pipeline_run_id: &str,
+    _pool: &PgPool, // _pool is not used in the current implementation of this function after corrections
+) -> Result<usize> {
+    let mut merged_count = 0;
+    let mut already_merged_ids: HashSet<String> = HashSet::new(); // Tracks original IDs that have been merged away
+
+    for (target_cluster_id_obj, source_cluster_id_obj, similarity) in merge_candidates {
+        let target_cluster_id = target_cluster_id_obj.0; // Keep this one
+        let source_cluster_id = source_cluster_id_obj.0; // Merge this one into target
+
+        // Skip if either cluster was already involved in a merge (source became target, or target was merged away)
+        if already_merged_ids.contains(&target_cluster_id) || already_merged_ids.contains(&source_cluster_id) {
+            debug!("Skipping merge between {} and {}: one or both already processed.", source_cluster_id, target_cluster_id);
             continue;
         }
 
-        for row in service_rows {
-            services_in_cluster.insert(ServiceId(row.get("service_id_1")));
-            services_in_cluster.insert(ServiceId(row.get("service_id_2")));
-        }
+        // Perform the merge: update all service_group records from source_cluster_id to target_cluster_id
+        let update_result = transaction
+            .execute(
+                "UPDATE public.service_group
+                 SET group_cluster_id = $1,
+                     updated_at = $3
+                 WHERE group_cluster_id = $2",
+                &[&target_cluster_id, &source_cluster_id, &Utc::now()],
+            )
+            .await
+            .context(format!("Failed to update service_group cluster assignments from {} to {}", source_cluster_id, target_cluster_id))?;
 
-        let services: Vec<ServiceId> = services_in_cluster.into_iter().collect();
+        if update_result > 0 {
+            // Update target_cluster_id's service_count and service_group_count
+            let new_counts = {
+                // Corrected query for counts:
+                let count_row_corrected = transaction.query_one(
+                    "WITH services_in_target_cluster AS (
+                        SELECT service_id_1 AS service_id FROM public.service_group WHERE group_cluster_id = $1
+                        UNION
+                        SELECT service_id_2 AS service_id FROM public.service_group WHERE group_cluster_id = $1
+                    )
+                    SELECT
+                        (SELECT COUNT(*) FROM services_in_target_cluster) AS unique_service_count,
+                        (SELECT COUNT(*) FROM public.service_group WHERE group_cluster_id = $1) AS group_count",
+                    &[&target_cluster_id]
+                ).await.context(format!("Failed to query corrected new counts for target cluster {}", target_cluster_id))?;
 
-        if services.len() < 2 {
-            debug!(
-                "Skipping verification for service cluster {} as it has < 2 unique services ({} found).",
-                cluster_id.0,
-                services.len()
-            );
-            // If less than 2 services, score is not meaningful. Update with NULL.
-            let update_null_score_query = "
-                UPDATE public.service_group_cluster
-                SET average_coherence_score = NULL
-                WHERE id = $1";
-            if let Err(e) = transaction
-                .execute(update_null_score_query, &[&cluster_id.0])
-                .await
-            {
-                warn!(
-                    "Failed to update average_coherence_score to NULL for service cluster {} with < 2 services: {}",
-                    cluster_id.0, e
-                );
-            }
-            continue;
-        }
-
-        // Sample pairs of services if the cluster is too large
-        let mut service_pairs_to_check: Vec<(ServiceId, ServiceId)> = Vec::new();
-        let max_services_to_sample = 10;
-        let max_pairs_to_check_per_cluster = 20;
-
-        if services.len() <= max_services_to_sample {
-            for i in 0..services.len() {
-                for j in (i + 1)..services.len() {
-                    if service_pairs_to_check.len() >= max_pairs_to_check_per_cluster {
-                        break;
-                    }
-                    service_pairs_to_check.push((services[i].clone(), services[j].clone()));
-                }
-                if service_pairs_to_check.len() >= max_pairs_to_check_per_cluster {
-                    break;
-                }
-            }
-        } else {
-            // Basic sampling: just take pairs from the first N services
-            use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
-            let sampled_services: Vec<ServiceId> = services
-                .choose_multiple(&mut rng, max_services_to_sample)
-                .cloned()
-                .collect();
-            for i in 0..sampled_services.len() {
-                for j in (i + 1)..sampled_services.len() {
-                    if service_pairs_to_check.len() >= max_pairs_to_check_per_cluster {
-                        break;
-                    }
-                    service_pairs_to_check
-                        .push((sampled_services[i].clone(), sampled_services[j].clone()));
-                }
-                if service_pairs_to_check.len() >= max_pairs_to_check_per_cluster {
-                    break;
-                }
-            }
-        }
-
-        if service_pairs_to_check.is_empty() && services.len() >= 2 {
-            // Handle case where sampling yielded no pairs but should have
-            // Fallback to first pair if possible
-            if services.len() >= 2 {
-                service_pairs_to_check.push((services[0].clone(), services[1].clone()));
-            }
-        }
-
-        debug!(
-            "Verifying service cluster {} with {} sampled service pairs (out of {} total services).",
-            cluster_id.0,
-            service_pairs_to_check.len(),
-            services.len()
-        );
-
-        let mut verification_scores: Vec<f64> = Vec::new();
-
-        // Here you would get your orchestrator and extract features for each pair
-        // For now, we'll just use a placeholder for the verification scores
-        for (service1_id, service2_id) in service_pairs_to_check {
-            debug!(
-                "Verifying pair: ({}, {}) for service cluster {}",
-                service1_id.0, service2_id.0, cluster_id.0
-            );
-
-            // This would be the actual feature extraction from the ServiceMatchingOrchestrator
-            // For now, let's use a placeholder logic to get confidence between the services
-            let confidence = match transaction
-                .query_opt(
-                    "SELECT confidence_score FROM public.service_group 
-                     WHERE (service_id_1 = $1 AND service_id_2 = $2) 
-                     OR (service_id_1 = $2 AND service_id_2 = $1)",
-                    &[&service1_id.0, &service2_id.0],
-                )
-                .await
-            {
-                Ok(Some(row)) => row.get::<_, Option<f64>>("confidence_score").unwrap_or(0.5),
-                Ok(None) => 0.5, // Default if no direct match exists
-                Err(e) => {
-                    warn!(
-                        "Error querying service pair confidence ({}, {}): {}",
-                        service1_id.0, service2_id.0, e
-                    );
-                    0.5 // Default on error
-                }
+                (count_row_corrected.get::<_, i64>("unique_service_count") as i32, count_row_corrected.get::<_, i64>("group_count") as i32)
             };
 
-            verification_scores.push(confidence);
-        }
 
-        let avg_score_to_store: Option<f64>;
+            transaction
+                .execute(
+                    "UPDATE public.service_group_cluster
+                     SET service_count = $1,
+                         service_group_count = $2,
+                         updated_at = $3
+                     WHERE id = $4",
+                    &[&new_counts.0, &new_counts.1, &Utc::now(), &target_cluster_id],
+                )
+                .await
+                .context(format!("Failed to update service_group_cluster metadata for {}", target_cluster_id))?;
 
-        if verification_scores.is_empty() {
-            debug!("No verification scores obtained for service cluster {}. Storing NULL for average_coherence_score.", cluster_id.0);
-            avg_score_to_store = None;
-        } else {
-            let calculated_avg_score: f64 =
-                verification_scores.iter().sum::<f64>() / verification_scores.len() as f64;
-            avg_score_to_store = Some(calculated_avg_score);
-            debug!(
-                "Service cluster {} - Avg internal pair confidence: {:.4} from {} scores. Storing this score.",
-                cluster_id.0,
-                calculated_avg_score,
-                verification_scores.len()
+            // Mark source_cluster_id as inactive or delete it
+            transaction
+                .execute(
+                    "DELETE FROM public.service_group_cluster WHERE id = $1",
+                    &[&source_cluster_id],
+                )
+                .await
+                .context(format!("Failed to remove merged service_group_cluster {}", source_cluster_id))?;
+
+            // Log the merge
+            transaction
+                .execute(
+                    "INSERT INTO clustering_metadata.cluster_merge_log
+                     (id, source_cluster_id, target_cluster_id, similarity_score, pipeline_run_id, created_at, item_type)
+                     VALUES ($1, $2, $3, $4, $5, $6, 'SERVICE_CLUSTER')", // Added item_type
+                    &[
+                        &Uuid::new_v4().to_string(),
+                        &source_cluster_id,
+                        &target_cluster_id,
+                        &similarity,
+                        &pipeline_run_id,
+                        &Utc::now(),
+                    ],
+                )
+                .await
+                .context("Failed to log service cluster merge")?;
+
+            already_merged_ids.insert(source_cluster_id.clone()); // Add the merged-away ID
+            merged_count += 1;
+
+            info!(
+                "Merged service cluster {} into {} (similarity: {:.4}, {} service_group records updated)",
+                source_cluster_id, target_cluster_id, similarity, update_result
             );
-        }
-
-        // Update the service_group_cluster table with the calculated average_coherence_score (or NULL)
-        let update_score_query = "
-            UPDATE public.service_group_cluster
-            SET average_coherence_score = $1
-            WHERE id = $2";
-        if let Err(e) = transaction
-            .execute(update_score_query, &[&avg_score_to_store, &cluster_id.0])
-            .await
-        {
-            warn!(
-                "Failed to update average_coherence_score for service cluster {}: {}",
-                cluster_id.0, e
-            );
         } else {
-            if let Some(score_val) = avg_score_to_store {
-                info!(
-                    "Successfully stored average_coherence_score {:.4} for service cluster {}.",
-                    score_val, cluster_id.0
-                );
-            } else {
-                info!(
-                    "Successfully stored NULL average_coherence_score for service cluster {} (no scores calculated).",
-                    cluster_id.0
-                );
-            }
-        }
-
-        // Check if score is below threshold and log suggestion if needed
-        if let Some(calculated_avg_score) = avg_score_to_store {
-            // Use SERVICE_VERIFICATION_THRESHOLD from config
-            if calculated_avg_score < config::SERVICE_VERIFICATION_THRESHOLD {
-                info!("Service cluster {} has low internal coherence (avg score: {:.4}, threshold: {}). Logging SUGGEST_SPLIT_CLUSTER.", 
-                      cluster_id.0, calculated_avg_score, config::SERVICE_VERIFICATION_THRESHOLD);
-                let details_json = serde_json::json!({
-                    "average_internal_pair_confidence": calculated_avg_score,
-                    "services_in_cluster_count": services.len(),
-                    "checked_pairs_count": verification_scores.len(),
-                    "verification_threshold": config::SERVICE_VERIFICATION_THRESHOLD,
-                    "verification_scores_sample": verification_scores.iter().take(5).copied().collect::<Vec<_>>(),
-                });
-                let reason_message = format!(
-                    "Service cluster {} ({} services, {} pairs checked) has low average internal service-pair confidence: {:.4}, below threshold of {}.",
-                    cluster_id.0, services.len(), verification_scores.len(), calculated_avg_score, config::SERVICE_VERIFICATION_THRESHOLD
-                );
-                let suggestion = NewSuggestedAction {
-                    pipeline_run_id: Some(pipeline_run_id.to_string()),
-                    action_type: ActionType::SuggestSplitCluster.as_str().to_string(),
-                    entity_id: None,
-                    group_id_1: None,
-                    group_id_2: None,
-                    cluster_id: Some(cluster_id.0.clone()),
-                    triggering_confidence: Some(calculated_avg_score),
-                    details: Some(details_json),
-                    reason_code: Some("LOW_INTERNAL_SERVICE_CLUSTER_COHERENCE".to_string()),
-                    reason_message: Some(reason_message),
-                    priority: 1,
-                    status: SuggestionStatus::PendingReview.as_str().to_string(),
-                    reviewer_id: None,
-                    reviewed_at: None,
-                    review_notes: None,
-                };
-                match db::insert_suggestion(transaction, &suggestion).await {
-                    Ok(id) => info!(
-                        "Logged SUGGEST_SPLIT_CLUSTER suggestion {} for service cluster {}.",
-                        id, cluster_id.0
-                    ),
-                    Err(e) => warn!(
-                        "Failed to log SUGGEST_SPLIT_CLUSTER for service cluster {}: {}",
-                        cluster_id.0, e
-                    ),
-                }
-            } else {
-                info!(
-                    "Service cluster {} passed verification (avg score: {:.4}, threshold: {}).",
-                    cluster_id.0,
-                    calculated_avg_score,
-                    config::SERVICE_VERIFICATION_THRESHOLD
-                );
+            // If no records were updated, it might mean source_cluster_id was already empty or processed.
+            // Still, attempt to delete it if it exists, to clean up.
+            debug!("No service_group records found for source_cluster_id {} during merge attempt. Attempting to delete cluster record if it exists.", source_cluster_id);
+             let del_res = transaction
+                .execute(
+                    "DELETE FROM public.service_group_cluster WHERE id = $1",
+                    &[&source_cluster_id],
+                )
+                .await
+                .context(format!("Failed to remove (potentially empty) merged service_group_cluster {}", source_cluster_id))?;
+            if del_res > 0 {
+                info!("Cleaned up empty or already processed source_cluster_id: {}", source_cluster_id);
+                 already_merged_ids.insert(source_cluster_id.clone()); // Also mark as processed if deleted
             }
         }
     }
-    info!("Finished verifying all new service clusters.");
+
+    Ok(merged_count)
+}
+
+
+/// Helper function to ensure consolidation tables exist
+pub async fn ensure_consolidation_tables_exist(pool: &PgPool) -> Result<()> {
+    let client = pool.get().await.context("Failed to get DB connection")?;
+
+    // Added item_type to distinguish between entity and service cluster merges if using the same log table.
+    let table_sql = "
+        CREATE TABLE IF NOT EXISTS clustering_metadata.cluster_merge_log (
+            id TEXT PRIMARY KEY,
+            source_cluster_id TEXT NOT NULL,
+            target_cluster_id TEXT NOT NULL,
+            similarity_score DOUBLE PRECISION NOT NULL,
+            pipeline_run_id TEXT NOT NULL,
+            item_type TEXT DEFAULT 'ENTITY_CLUSTER', -- Added item_type
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cluster_merge_log_pipeline_run
+        ON clustering_metadata.cluster_merge_log(pipeline_run_id);
+        
+        CREATE INDEX IF NOT EXISTS idx_cluster_merge_log_created_at
+        ON clustering_metadata.cluster_merge_log(created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_cluster_merge_log_item_type -- Index for new column
+        ON clustering_metadata.cluster_merge_log(item_type);
+    ";
+
+    client
+        .batch_execute(table_sql) // batch_execute for multiple statements
+        .await
+        .context("Failed to create/update consolidation tables (cluster_merge_log)")?;
+    info!("Ensured cluster_merge_log table exists and is up-to-date.");
     Ok(())
 }
