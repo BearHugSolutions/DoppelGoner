@@ -164,9 +164,6 @@ pub struct EntityGroup {
     /// The cluster this group belongs to (null until clustering is performed)
     pub group_cluster_id: Option<GroupClusterId>,
 
-    /// Version of this group record, for optimistic locking or history.
-    pub version: Option<i32>,
-
     /// When this group was first created
     pub created_at: NaiveDateTime,
 
@@ -180,7 +177,7 @@ pub struct EntityGroup {
 /// Enum for supported matching method types
 ///
 /// Defines the standardized method types used for entity matching
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum MatchMethodType {
     /// Matching based on normalized website domains
     Url,

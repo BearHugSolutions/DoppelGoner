@@ -322,7 +322,7 @@ pub async fn collect_cluster_stats(pool: &PgPool) -> Result<Option<ClusterStats>
     // group_count (number of pairwise links in the cluster).
     // These are populated by the refactored consolidate_clusters.rs.
 
-    let count_query = "SELECT COUNT(*)::bigint FROM public.group_cluster";
+    let count_query = "SELECT COUNT(*)::bigint FROM public.entity_group_cluster";
     let count_row = conn
         .query_one(count_query, &[])
         .await
@@ -340,7 +340,7 @@ pub async fn collect_cluster_stats(pool: &PgPool) -> Result<Option<ClusterStats>
             SUM(CASE WHEN group_count = 1 THEN 1 ELSE 0 END)::bigint as single_group_clusters, -- cluster with one pair
             SUM(CASE WHEN group_count > 1 THEN 1 ELSE 0 END)::bigint as multi_group_clusters
         FROM 
-            public.group_cluster
+            public.entity_group_cluster
     ";
     // Note: The DDL for group_cluster has entity_count and group_count.
     // Ensure these are correctly populated by consolidate_clusters.rs.
