@@ -9,38 +9,156 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::config::{self, CRITICALLY_LOW_SUGGESTION_THRESHOLD, MODERATE_LOW_SUGGESTION_THRESHOLD};
-use crate::db::{insert_entity_group_tx, insert_match_decision_detail_tx, insert_suggestion_tx, PgPool};
+use crate::db::{
+    self, PgPool, // Using db::upsert_entity_group, db::insert_match_decision_detail_direct, db::insert_suggestion
+};
 use crate::models::{
-    ActionType, EntityGroupId, EntityId, MatchMethodType, MatchValues, NewSuggestedAction,
-    PhoneMatchValue, SuggestionStatus,
+    ActionType, EntityId, MatchMethodType, MatchValues, NewSuggestedAction, PhoneMatchValue,
+    SuggestionStatus,
 };
 use crate::reinforcement::entity::feature_cache_service::SharedFeatureCache;
 use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
 use crate::results::{AnyMatchResult, MatchMethodStats, PhoneMatchResult};
 use serde_json;
 
-// Import pipeline_state_utils
 use crate::pipeline_state_utils::{
     check_comparison_cache, get_current_signatures_for_pair, store_in_comparison_cache,
 };
 
-// SQL query for inserting into entity_group
-const INSERT_ENTITY_GROUP_SQL: &str = "
-    INSERT INTO public.entity_group
-(id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, 
- pre_rl_confidence_score)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING RETURNING id"; // Added ON CONFLICT and RETURNING
+#[allow(clippy::too_many_arguments)]
+async fn create_entity_group_entry(
+    pool: &PgPool, // Pass pool directly
+    entity_id_1: &EntityId, // Ensure these are already ordered e1_id < e2_id before calling
+    entity_id_2: &EntityId,
+    match_values: &MatchValues,
+    final_confidence_score: f64,
+    pre_rl_confidence_score: f64,
+    reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
+    pipeline_run_id: &str,
+    normalized_shared_phone_for_suggestion: &str,
+    features_for_rl_snapshot: Option<Vec<f64>>,
+) -> Result<bool> { // Returns true if a new group was created
+    let new_entity_group_id_str = Uuid::new_v4().to_string();
+
+    // Step 1: Upsert Entity Group
+    let (group_id, was_newly_inserted) = match db::upsert_entity_group(
+        pool,
+        &new_entity_group_id_str,
+        entity_id_1, // Pass directly, upsert_entity_group handles internal ordering for DB
+        entity_id_2,
+        final_confidence_score,
+        pre_rl_confidence_score,
+        MatchMethodType::Phone,
+        match_values.clone(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            return Err(e.context("Phone: upsert_entity_group failed"));
+        }
+    };
+
+    if was_newly_inserted {
+        if let (Some(ro_arc), Some(features_vec)) =
+            (reinforcement_orchestrator_option, features_for_rl_snapshot) // Use the passed Option
+        {
+            let version = ro_arc.lock().await.confidence_tuner.version;
+            let snapshot_features_json =
+                serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
+
+            if let Err(e) = db::insert_match_decision_detail_direct(
+                pool,
+                &group_id,
+                pipeline_run_id,
+                snapshot_features_json,
+                MatchMethodType::Phone.as_str(),
+                pre_rl_confidence_score,
+                final_confidence_score,
+                Some(version as i32),
+            )
+            .await
+            {
+                warn!(
+                    "Phone: Failed to log decision snapshot for new group {}: {}. Group created, RL context lost.",
+                    group_id, e
+                );
+            }
+        }
+
+        if final_confidence_score < MODERATE_LOW_SUGGESTION_THRESHOLD {
+            let priority = if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+                2
+            } else {
+                1
+            };
+            let (p1, p2, e1_ext_opt, e2_ext_opt) = if let MatchValues::Phone(p_val) = match_values {
+                (
+                    p_val.original_phone1.clone(),
+                    p_val.original_phone2.clone(),
+                    p_val.extension1.clone(),
+                    p_val.extension2.clone(),
+                )
+            } else {
+                ("".into(), "".into(), None, None)
+            };
+
+            let details_json = serde_json::json!({
+                "method_type": MatchMethodType::Phone.as_str(),
+                "matched_value": normalized_shared_phone_for_suggestion,
+                "original_phone1": p1, "original_phone2": p2,
+                "extension1": e1_ext_opt, "extension2": e2_ext_opt,
+                "entity_group_id": &group_id,
+                "pre_rl_confidence": pre_rl_confidence_score,
+            });
+            let reason_message = format!(
+                "Pair ({}, {}) matched by Phone with low tuned confidence ({:.4}). Pre-RL: {:.2}.",
+                entity_id_1.0, entity_id_2.0, final_confidence_score, pre_rl_confidence_score
+            );
+
+            let suggestion = NewSuggestedAction {
+                pipeline_run_id: Some(pipeline_run_id.to_string()),
+                action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
+                entity_id: None,
+                group_id_1: Some(group_id.clone()),
+                group_id_2: None,
+                cluster_id: None,
+                triggering_confidence: Some(final_confidence_score),
+                details: Some(details_json),
+                reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
+                reason_message: Some(reason_message),
+                priority,
+                status: SuggestionStatus::PendingReview.as_str().to_string(),
+                reviewer_id: None,
+                reviewed_at: None,
+                review_notes: None,
+            };
+
+            if let Err(e) = db::insert_suggestion(pool, &suggestion).await {
+                warn!(
+                    "Phone: Failed to insert suggestion for new group {}: {}. Group and detail (if any) created.",
+                    group_id, e
+                );
+            }
+        }
+        Ok(true)
+    } else {
+        debug!(
+            "Phone: Group for pair ({}, {}) already exists or updated (ID: {}). Skipping details/suggestions.",
+            entity_id_1.0, entity_id_2.0, group_id
+        );
+        Ok(false)
+    }
+}
 
 pub async fn find_matches(
     pool: &PgPool,
-    // Changed to Option<Arc<Mutex<MatchingOrchestrator>>> for consistency
     reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedFeatureCache>,
 ) -> Result<AnyMatchResult> {
     info!(
-        "Starting pairwise phone matching (run ID: {}){} with INCREMENTAL CHECKS...", // Log update
+        "Starting pairwise phone matching (run ID: {}){} with INCREMENTAL CHECKS (direct DB calls)...",
         pipeline_run_id,
         if reinforcement_orchestrator_option.is_some() {
             " with RL confidence tuning"
@@ -68,7 +186,7 @@ pub async fn find_matches(
         JOIN public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'phone'
         JOIN public.phone p ON ef.table_id = p.id 
         WHERE p.number IS NOT NULL AND p.number != ''
-    "; // Ensured ef.table_name = 'phone'
+    ";
     debug!("Phone: Executing phone query for all entities...");
     let phone_rows = initial_conn
         .query(phone_query, &[])
@@ -197,21 +315,16 @@ pub async fn find_matches(
                     }
                 }
 
-                let base_confidence = if e1_orig_ext == e2_orig_ext {
-                    0.95
-                } else {
-                    0.85
-                };
+                let base_confidence = if e1_orig_ext == e2_orig_ext { 0.95 } else { 0.85 };
                 let pre_rl_confidence = base_confidence;
                 let mut final_confidence_score = base_confidence;
                 let mut features_for_rl_snapshot: Option<Vec<f64>> = None;
                 let mut features_json_for_cache: Option<serde_json::Value> = None;
 
                 if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
-                    match if let Some(_cache_service) = feature_cache.as_ref() { // Renamed parameter to _cache_service to mark it as intentionally unused for now
-                        // Assuming get_pair_features uses the cache_service internally
-                        let orchestrator_guard = ro_arc.lock().await;
-                        orchestrator_guard.get_pair_features(pool, e1_id, e2_id).await
+                    match if let Some(cache_service_arc) = feature_cache.as_ref() {
+                        let mut cache_service_guard = cache_service_arc.lock().await;
+                        cache_service_guard.get_pair_features(pool, e1_id, e2_id).await
                     } else {
                         MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await
                     } {
@@ -219,12 +332,9 @@ pub async fn find_matches(
                             if !features_vec.is_empty() {
                                 features_for_rl_snapshot = Some(features_vec.clone());
                                 features_json_for_cache = serde_json::to_value(features_vec.clone()).ok();
-
                                 let orchestrator_guard = ro_arc.lock().await;
                                 match orchestrator_guard.get_tuned_confidence(
-                                    &MatchMethodType::Phone,
-                                    pre_rl_confidence,
-                                    &features_vec,
+                                    &MatchMethodType::Phone, pre_rl_confidence, &features_vec,
                                 ) {
                                     Ok(tuned_score) => final_confidence_score = tuned_score,
                                     Err(e) => warn!("Phone: RL tuning failed for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
@@ -237,36 +347,18 @@ pub async fn find_matches(
                     }
                 }
 
-                // For phone, a "MATCH" is if normalized numbers are the same. Confidence varies.
-                let comparison_outcome_for_cache = "MATCH"; // Since they share a normalized_shared_phone
+                let comparison_outcome_for_cache = "MATCH"; 
 
                 if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
                     if let Err(e) = store_in_comparison_cache(
-                        pool,
-                        e1_id,
-                        e2_id,
-                        &sig1_data.signature,
-                        &sig2_data.signature,
-                        &MatchMethodType::Phone,
-                        pipeline_run_id,
-                        comparison_outcome_for_cache,
-                        Some(final_confidence_score),
-                        features_json_for_cache.as_ref(),
-                    )
-                    .await
-                    {
-                        warn!(
-                            "Phone: Failed to store in comparison_cache for ({}, {}): {}",
-                            e1_id.0, e2_id.0, e
-                        );
+                        pool, e1_id, e2_id, &sig1_data.signature, &sig2_data.signature,
+                        &MatchMethodType::Phone, pipeline_run_id, comparison_outcome_for_cache,
+                        Some(final_confidence_score), features_json_for_cache.as_ref(),
+                    ).await {
+                        warn!("Phone: Failed to store in comparison_cache for ({}, {}): {}", e1_id.0, e2_id.0, e);
                     }
                 }
                 processed_pairs_this_run.insert(current_pair_ordered.clone());
-
-                // Only create entity_group if confidence is high enough (or whatever criteria for phone)
-                // The original code created an entity_group if they shared a normalized phone.
-                // We'll keep that, but the confidence might be low.
-                // The comparison_outcome_for_cache being "MATCH" means we proceed.
 
                 let match_values_obj = MatchValues::Phone(PhoneMatchValue {
                     original_phone1: e1_orig_phone.clone(),
@@ -276,22 +368,14 @@ pub async fn find_matches(
                     extension2: e2_orig_ext.clone(),
                 });
 
-                match create_entity_group_entry( // Renamed to avoid confusion with old create_entity_group
-                    pool,
-                    e1_id, // Pass ordered IDs
-                    e2_id,
-                    &match_values_obj, // This will be ordered internally by create_entity_group_entry
-                    final_confidence_score,
-                    pre_rl_confidence,
-                    reinforcement_orchestrator_option.as_ref(), // Pass as Option<&Arc<Mutex<...>>>
-                    pipeline_run_id,
-                    &normalized_shared_phone, // For suggestion details
-                    features_for_rl_snapshot, // Pass Option<Vec<f64>>
-                ).await // Removed feature_cache.clone() from here as it's not used
-                {
+                match create_entity_group_entry(
+                    pool, e1_id, e2_id, &match_values_obj,
+                    final_confidence_score, pre_rl_confidence,
+                    reinforcement_orchestrator_option.as_ref(), pipeline_run_id,
+                    &normalized_shared_phone, features_for_rl_snapshot,
+                ).await {
                     Ok(created) => {
                         if created {
-                            // Log was here, it's fine.
                             new_pairs_created_count += 1;
                             entities_in_new_pairs.insert(e1_id.clone());
                             entities_in_new_pairs.insert(e2_id.clone());
@@ -308,37 +392,25 @@ pub async fn find_matches(
     }
 
     if individual_operation_errors > 0 {
-        warn!(
-            "Phone: {} errors during individual pair operations.",
-            individual_operation_errors
-        );
+        warn!("Phone: {} errors during individual pair operations.", individual_operation_errors);
     }
     info!("Phone: Cache hits during this run: {}", cache_hits_count);
 
     let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
         confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
-    } else {
-        0.0
-    };
+    } else {0.0};
 
     let method_stats = MatchMethodStats {
         method_type: MatchMethodType::Phone,
         groups_created: new_pairs_created_count,
         entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size: if new_pairs_created_count > 0 {
-            2.0
-        } else {
-            0.0
-        },
+        avg_group_size: if new_pairs_created_count > 0 { 2.0 } else { 0.0 },
     };
 
     info!(
         "Pairwise phone matching complete in {:.2?}: created {} new pairs, involving {} unique entities. Cache hits: {}.",
-        start_time.elapsed(),
-        method_stats.groups_created,
-        method_stats.entities_matched,
-        cache_hits_count
+        start_time.elapsed(), method_stats.groups_created, method_stats.entities_matched, cache_hits_count
     );
 
     Ok(AnyMatchResult::Phone(PhoneMatchResult {
@@ -347,117 +419,7 @@ pub async fn find_matches(
     }))
 }
 
-/// Creates an entity group entry, logs decision, and adds suggestions if needed.
-/// Ensures entity_id_1 < entity_id_2 in the database.
-#[allow(clippy::too_many_arguments)]
-async fn create_entity_group_entry(
-    pool: &PgPool,
-    entity_id_1: &EntityId,
-    entity_id_2: &EntityId,
-    match_values: &MatchValues,
-    final_confidence_score: f64,
-    pre_rl_confidence_score: f64,
-    reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
-    pipeline_run_id: &str,
-    normalized_shared_phone_for_suggestion: &str,
-    features_for_rl_snapshot: Option<Vec<f64>>,
-) -> Result<bool> {
-
-    let new_entity_group_id_str = Uuid::new_v4().to_string();
-
-    let mut conn = pool.get().await.context("Phone: Failed to get DB connection")?;
-    let mut tx = conn.transaction().await.context("Phone: Failed to start transaction")?;
-
-    let (group_id, was_newly_inserted) = match insert_entity_group_tx(
-        &mut tx,
-        &new_entity_group_id_str,
-        entity_id_1,
-        entity_id_2,
-        final_confidence_score,
-        pre_rl_confidence_score,
-        MatchMethodType::Phone,
-        match_values.clone(),
-    ).await {
-        Ok(result) => result,
-        Err(e) => {
-            tx.rollback().await.context("Phone: Failed to rollback after insert_entity_group_tx error")?;
-            return Err(e.context("Phone: insert_entity_group_tx failed"));
-        }
-    };
-
-    if was_newly_inserted {
-        let mut version: Option<i32> = None;
-
-        if let (Some(ro_arc), Some(features_vec)) = (reinforcement_orchestrator_option, features_for_rl_snapshot) {
-            let orchestrator_guard = ro_arc.lock().await;
-            version = Some(orchestrator_guard.confidence_tuner.version as i32);
-            let snapshot_features_json = serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
-
-            if let Err(e) = insert_match_decision_detail_tx(
-                &mut tx,
-                &group_id,
-                pipeline_run_id,
-                snapshot_features_json,
-                MatchMethodType::Phone.as_str(),
-                pre_rl_confidence_score,
-                final_confidence_score,
-                version,
-            ).await {
-                warn!("Phone: Failed to log decision snapshot for new group {}: {}. Rolling back.", group_id, e);
-                tx.rollback().await.context("Phone: Failed to rollback after decision detail error")?;
-                return Err(e.context("Phone: insert_match_decision_detail_tx failed"));
-            }
-        }
-
-        if final_confidence_score < MODERATE_LOW_SUGGESTION_THRESHOLD {
-            let priority = if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 };
-            let (p1, p2, e1, e2) = if let MatchValues::Phone(p) = match_values {
-                (p.original_phone1.clone(), p.original_phone2.clone(), p.extension1.clone(), p.extension2.clone())
-            } else { ("".into(), "".into(), None, None) };
-
-            let details_json = serde_json::json!({
-                "method_type": MatchMethodType::Phone.as_str(),
-                "matched_value": normalized_shared_phone_for_suggestion,
-                "original_phone1": p1, "original_phone2": p2,
-                "extension1": e1, "extension2": e2,
-                "entity_group_id": &group_id,
-                "pre_rl_confidence": pre_rl_confidence_score,
-            });
-            let reason_message = format!(
-                "Pair ({}, {}) matched by Phone with low tuned confidence ({:.4}). Pre-RL: {:.2}.",
-                entity_id_1.0, entity_id_2.0, final_confidence_score, pre_rl_confidence_score
-            );
-
-            let suggestion = NewSuggestedAction {
-                pipeline_run_id: Some(pipeline_run_id.to_string()),
-                action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
-                entity_id: None, group_id_1: Some(group_id.clone()), group_id_2: None, cluster_id: None,
-                triggering_confidence: Some(final_confidence_score),
-                details: Some(details_json), reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
-                reason_message: Some(reason_message), priority,
-                status: SuggestionStatus::PendingReview.as_str().to_string(),
-                reviewer_id: None, reviewed_at: None, review_notes: None,
-            };
-
-            if let Err(e) = insert_suggestion_tx(&mut tx, &suggestion).await {
-                 warn!("Phone: Failed to insert suggestion for new group {}: {}. Rolling back.", group_id, e);
-                 tx.rollback().await.context("Phone: Failed to rollback after suggestion error")?;
-                 return Err(e.context("Phone: insert_suggestion_tx failed"));
-            }
-        }
-
-        tx.commit().await.context("Phone: Failed to commit transaction (new group)")?;
-        Ok(true)
-    } else {
-        debug!("Phone: Group for pair ({}, {}) already exists or updated (ID: {}). Skipping.", entity_id_1.0, entity_id_2.0, group_id);
-        tx.commit().await.context("Phone: Failed to commit transaction (existing group)")?;
-        Ok(false)
-    }
-}
-
-/// Fetch existing phone-matched pairs from public.entity_group
 async fn fetch_existing_entity_groups(
-    // Renamed for clarity
     conn: &impl tokio_postgres::GenericClient,
 ) -> Result<HashSet<(EntityId, EntityId)>> {
     let query = "SELECT entity_id_1, entity_id_2 FROM public.entity_group WHERE method_type = $1";
@@ -470,8 +432,6 @@ async fn fetch_existing_entity_groups(
     for row in rows {
         let id1_str: String = row.get("entity_id_1");
         let id2_str: String = row.get("entity_id_2");
-        // Order is guaranteed by DB constraint or application logic before this,
-        // but ensuring order here for the HashSet is robust.
         if id1_str < id2_str {
             existing_pairs.insert((EntityId(id1_str), EntityId(id2_str)));
         } else {
@@ -487,7 +447,6 @@ pub fn normalize_phone(phone: &str) -> String {
         return digits_only[1..].to_string();
     }
     if (7..=15).contains(&digits_only.len()) {
-        // More idiomatic range check
         return digits_only;
     }
     debug!(

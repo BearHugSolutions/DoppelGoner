@@ -8,14 +8,13 @@ use serde_json;
 use tokio_postgres::{Client as PgConnection, GenericClient, Row as PgRow};
 use uuid::Uuid;
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 
 use crate::db::PgPool;
 use crate::models::ServiceId;
@@ -130,7 +129,8 @@ pub fn get_service_feature_metadata() -> Vec<FeatureMetadata> {
         },
         FeatureMetadata {
             name: "s_organization_name_length".to_string(),
-            description: "Normalized length of the organization name associated with the service.".to_string(),
+            description: "Normalized length of the organization name associated with the service."
+                .to_string(),
             min_value: 0.0,
             max_value: 1.0,
         },
@@ -185,27 +185,27 @@ pub fn get_service_feature_metadata() -> Vec<FeatureMetadata> {
             min_value: 0.0,
             max_value: 1.0,
         }, // Index 16 (pairwise index 6)
-        // NEW PAIRWISE FEATURES (as per III.A)
-        // The original taxonomy_jaccard and location_jaccard are already present.
-        // We'll ensure their calculation logic is robust.
-        // The plan mentions "Service Name & Description : Utilize advanced text similarity".
-        // Jaro-Winkler is already there for name. For description, a new feature could be added.
-        // For now, let's ensure the existing ones are correctly placed and add placeholders if needed.
-        // The vector will be 10 (s1) + 10 (s2) + 7 (original pairwise) = 27.
-        // If we add more, this needs to be updated.
-        // The document mentions "Service Taxonomy Overlap" and "Service Location Overlap"
-        // which are covered by pair_s_taxonomy_jaccard and pair_s_location_jaccard.
-        // Let's stick to the 7 original pairwise features for now to maintain the 27-feature vector length
-        // and ensure the existing Jaccard calculations are robust.
-        // If new *distinct* features are required, they would be added here and increase the vector size.
+           // NEW PAIRWISE FEATURES (as per III.A)
+           // The original taxonomy_jaccard and location_jaccard are already present.
+           // We'll ensure their calculation logic is robust.
+           // The plan mentions "Service Name & Description : Utilize advanced text similarity".
+           // Jaro-Winkler is already there for name. For description, a new feature could be added.
+           // For now, let's ensure the existing ones are correctly placed and add placeholders if needed.
+           // The vector will be 10 (s1) + 10 (s2) + 7 (original pairwise) = 27.
+           // If we add more, this needs to be updated.
+           // The document mentions "Service Taxonomy Overlap" and "Service Location Overlap"
+           // which are covered by pair_s_taxonomy_jaccard and pair_s_location_jaccard.
+           // Let's stick to the 7 original pairwise features for now to maintain the 27-feature vector length
+           // and ensure the existing Jaccard calculations are robust.
+           // If new *distinct* features are required, they would be added here and increase the vector size.
     ]
 }
 
 const INDIVIDUAL_FEATURE_COUNT: usize = 10;
 const PAIRWISE_FEATURE_COUNT: usize = 7; // Number of pairwise features we calculate
 const TOTAL_PAIR_FEATURES_IN_CONTEXT: usize = PAIRWISE_FEATURE_COUNT; // For clarity in context vector assembly
-pub const SERVICE_CONTEXT_FEATURE_VECTOR_PAIR_SIZE: usize = INDIVIDUAL_FEATURE_COUNT * 2 + TOTAL_PAIR_FEATURES_IN_CONTEXT;
-
+pub const SERVICE_CONTEXT_FEATURE_VECTOR_PAIR_SIZE: usize =
+    INDIVIDUAL_FEATURE_COUNT * 2 + TOTAL_PAIR_FEATURES_IN_CONTEXT;
 
 #[derive(Debug, Hash)] // Added Hash for signature calculation
 pub struct RawServiceData {
@@ -232,7 +232,6 @@ fn calculate_service_signature(raw_data: &RawServiceData) -> String {
     raw_data.hash(&mut hasher);
     hasher.finish().to_string()
 }
-
 
 /// Fetches raw data for a service and calculates its signature.
 pub async fn get_service_raw_data_and_signature(
@@ -265,10 +264,14 @@ pub async fn get_service_raw_data_and_signature(
         GROUP BY s.id, s.name, s.description, s.email, s.url, s.status, o.name, o.embedding, s.organization_id;
     ";
 
-    let row = conn.query_one(query, &[&service_id.0])
+    let row = conn
+        .query_one(query, &[&service_id.0])
         .await
         .map_err(anyhow::Error::from)
-        .context(format!("Consolidated query for service raw data failed for service {}", service_id.0))?;
+        .context(format!(
+            "Consolidated query for service raw data failed for service {}",
+            service_id.0
+        ))?;
 
     let raw_data = RawServiceData {
         service_id: row.try_get("service_id").context("service_id missing")?,
@@ -280,7 +283,9 @@ pub async fn get_service_raw_data_and_signature(
         service_embedding_v2_present: row.try_get("service_embedding_v2_present").unwrap_or(false),
         organization_id: row.try_get("organization_id").ok(),
         organization_name: row.try_get("organization_name").ok(),
-        organization_embedding_present: row.try_get("organization_embedding_present").unwrap_or(false),
+        organization_embedding_present: row
+            .try_get("organization_embedding_present")
+            .unwrap_or(false),
         taxonomy_ids: row.try_get("taxonomy_ids").unwrap_or_else(|_| Vec::new()),
         location_ids: row.try_get("location_ids").unwrap_or_else(|_| Vec::new()),
         updated_at: row.try_get("updated_at").ok(),
@@ -290,7 +295,6 @@ pub async fn get_service_raw_data_and_signature(
     debug!("{} Calculated signature: {}", service_context, signature);
     Ok((raw_data, signature))
 }
-
 
 /// Extracts the individual features for a single service.
 /// If features are already stored, they are retrieved; otherwise, they are calculated and stored.
@@ -369,8 +373,12 @@ pub async fn get_stored_service_features(
 
     // If not all features were present or rows were empty, extract and store them.
     // We need the raw data for this.
-     let (raw_data, _signature) = get_service_raw_data_and_signature(conn, service_id).await
-        .context(format!("Failed to get raw_data for feature extraction for service {}", service_id.0))?;
+    let (raw_data, _signature) = get_service_raw_data_and_signature(conn, service_id)
+        .await
+        .context(format!(
+            "Failed to get raw_data for feature extraction for service {}",
+            service_id.0
+        ))?;
 
     extract_and_store_service_features(conn, service_id, &raw_data, &metadata).await
 }
@@ -425,7 +433,6 @@ pub async fn extract_and_store_service_features(
     Ok(features_vec)
 }
 
-
 /// Extracts the full feature vector for a pair of services.
 /// The vector will have 10 (s1) + 10 (s2) + 7 (pair) = 27 features.
 pub async fn extract_context_for_service_pair(
@@ -463,9 +470,14 @@ pub async fn extract_context_for_service_pair(
         get_service_raw_data_and_signature(conn, service2_id)
     );
 
-    let (raw_data1, _sig1) = raw_data1_res.context(format!("Failed to get raw_data for service1 ({})", service1_id.0))?;
-    let (raw_data2, _sig2) = raw_data2_res.context(format!("Failed to get raw_data for service2 ({})", service2_id.0))?;
-
+    let (raw_data1, _sig1) = raw_data1_res.context(format!(
+        "Failed to get raw_data for service1 ({})",
+        service1_id.0
+    ))?;
+    let (raw_data2, _sig2) = raw_data2_res.context(format!(
+        "Failed to get raw_data for service2 ({})",
+        service2_id.0
+    ))?;
 
     // --- TASK 1: Get Service 1 Features ---
     let service1_features_task = wrap_with_progress(
@@ -493,18 +505,16 @@ pub async fn extract_context_for_service_pair(
     let rd1_clone = Arc::new(raw_data1); // Use Arc for shared ownership if raw_data is large, or clone if small
     let rd2_clone = Arc::new(raw_data2);
 
-
     let pair_features_calculation_task_inner = async move {
         let pair_calc_tasks_completed_inner = Arc::new(AtomicUsize::new(0));
         const PAIRWISE_METADATA_OFFSET: usize = INDIVIDUAL_FEATURE_COUNT; // Pairwise features start after individual ones in metadata
-        // NUM_PAIRWISE_FEATURES is defined globally
+                                                                          // NUM_PAIRWISE_FEATURES is defined globally
 
         let mut feature_outcomes = HashMap::with_capacity(PAIRWISE_FEATURE_COUNT);
 
         // Pass references to raw_data1 and raw_data2 into the async block
         let raw_data1_ref = rd1_clone.as_ref();
         let raw_data2_ref = rd2_clone.as_ref();
-
 
         let feature_tasks: Vec<(
             String,
@@ -522,67 +532,91 @@ pub async fn extract_context_for_service_pair(
                 )),
             ),
             (
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 1].name.clone(), // pair_s_embedding_v2_cosine_similarity
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 1]
+                    .name
+                    .clone(), // pair_s_embedding_v2_cosine_similarity
                 Box::pin(wrap_with_progress(
                     calculate_embedding_cosine_similarity(conn, service1_id, service2_id), // Still needs DB for embeddings
                     pair_calc_tasks_completed_inner.clone(),
                     PAIRWISE_FEATURE_COUNT,
-                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 1].name.clone(),
+                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 1]
+                        .name
+                        .clone(),
                     pair_context_for_inner.clone(),
                     LogLevel::Debug,
                 )),
             ),
             (
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 2].name.clone(), // pair_s_taxonomy_jaccard
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 2]
+                    .name
+                    .clone(), // pair_s_taxonomy_jaccard
                 Box::pin(wrap_with_progress(
                     calculate_taxonomy_jaccard_from_data(raw_data1_ref, raw_data2_ref),
                     pair_calc_tasks_completed_inner.clone(),
                     PAIRWISE_FEATURE_COUNT,
-                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 2].name.clone(),
+                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 2]
+                        .name
+                        .clone(),
                     pair_context_for_inner.clone(),
                     LogLevel::Debug,
                 )),
             ),
             (
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 3].name.clone(), // pair_s_location_jaccard
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 3]
+                    .name
+                    .clone(), // pair_s_location_jaccard
                 Box::pin(wrap_with_progress(
                     calculate_location_jaccard_from_data(raw_data1_ref, raw_data2_ref),
                     pair_calc_tasks_completed_inner.clone(),
                     PAIRWISE_FEATURE_COUNT,
-                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 3].name.clone(),
+                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 3]
+                        .name
+                        .clone(),
                     pair_context_for_inner.clone(),
                     LogLevel::Debug,
                 )),
             ),
             (
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 4].name.clone(), // pair_s_same_organization
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 4]
+                    .name
+                    .clone(), // pair_s_same_organization
                 Box::pin(wrap_with_progress(
                     check_same_organization_from_data(raw_data1_ref, raw_data2_ref),
                     pair_calc_tasks_completed_inner.clone(),
                     PAIRWISE_FEATURE_COUNT,
-                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 4].name.clone(),
+                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 4]
+                        .name
+                        .clone(),
                     pair_context_for_inner.clone(),
                     LogLevel::Debug,
                 )),
             ),
             (
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 5].name.clone(), // pair_s_email_exact_match
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 5]
+                    .name
+                    .clone(), // pair_s_email_exact_match
                 Box::pin(wrap_with_progress(
                     check_email_exact_match_from_data(raw_data1_ref, raw_data2_ref),
                     pair_calc_tasks_completed_inner.clone(),
                     PAIRWISE_FEATURE_COUNT,
-                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 5].name.clone(),
+                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 5]
+                        .name
+                        .clone(),
                     pair_context_for_inner.clone(),
                     LogLevel::Debug,
                 )),
             ),
             (
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 6].name.clone(), // pair_s_url_domain_match
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 6]
+                    .name
+                    .clone(), // pair_s_url_domain_match
                 Box::pin(wrap_with_progress(
                     check_url_domain_match_from_data(raw_data1_ref, raw_data2_ref),
                     pair_calc_tasks_completed_inner.clone(),
                     PAIRWISE_FEATURE_COUNT,
-                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 6].name.clone(),
+                    all_feature_metadata[PAIRWISE_METADATA_OFFSET + 6]
+                        .name
+                        .clone(),
                     pair_context_for_inner.clone(),
                     LogLevel::Debug,
                 )),
@@ -617,10 +651,13 @@ pub async fn extract_context_for_service_pair(
                 "{} Completed pairwise feature extraction with {} successes and {} failures: {:?}",
                 pair_context_for_inner, success_count, failure_count, feature_outcomes
             );
-            if failure_count > PAIRWISE_FEATURE_COUNT / 2 { // If more than half failed
+            if failure_count > PAIRWISE_FEATURE_COUNT / 2 {
+                // If more than half failed
                 return Err(anyhow::anyhow!(
                     "Too many pairwise feature failures ({}/{}): {:?}",
-                    failure_count, PAIRWISE_FEATURE_COUNT, feature_outcomes
+                    failure_count,
+                    PAIRWISE_FEATURE_COUNT,
+                    feature_outcomes
                 ));
             }
         } else {
@@ -647,9 +684,18 @@ pub async fn extract_context_for_service_pair(
         pair_features_task_logged
     );
 
-    let service1_features = service1_features_res.context(format!("Feature extraction failed for service1 ({})", service1_id.0))?;
-    let service2_features = service2_features_res.context(format!("Feature extraction failed for service2 ({})", service2_id.0))?;
-    let pair_features = pair_features_res.context(format!("Pairwise feature calculation failed for pair ({}, {})", service1_id.0, service2_id.0))?;
+    let service1_features = service1_features_res.context(format!(
+        "Feature extraction failed for service1 ({})",
+        service1_id.0
+    ))?;
+    let service2_features = service2_features_res.context(format!(
+        "Feature extraction failed for service2 ({})",
+        service2_id.0
+    ))?;
+    let pair_features = pair_features_res.context(format!(
+        "Pairwise feature calculation failed for pair ({}, {})",
+        service1_id.0, service2_id.0
+    ))?;
 
     let mut final_context_vector = Vec::with_capacity(SERVICE_CONTEXT_FEATURE_VECTOR_PAIR_SIZE);
     final_context_vector.extend(service1_features.clone());
@@ -677,7 +723,6 @@ pub async fn extract_context_for_service_pair(
 
     Ok(final_context_vector)
 }
-
 
 async fn store_individual_service_features(
     conn: &PgConnection,
@@ -758,36 +803,67 @@ async fn store_individual_service_features(
 
 // --- Individual Feature Calculation Helpers (using RawServiceData) ---
 fn calculate_name_length_from_data(data: &RawServiceData) -> f64 {
-    data.service_name.as_ref().map_or(0.0, |name| (name.len() as f64 / 100.0).min(1.0))
+    data.service_name
+        .as_ref()
+        .map_or(0.0, |name| (name.len() as f64 / 100.0).min(1.0))
 }
 fn calculate_desc_length_from_data(data: &RawServiceData) -> f64 {
-    data.service_description.as_ref().map_or(0.0, |desc| (desc.len() as f64 / 1000.0).min(1.0))
+    data.service_description
+        .as_ref()
+        .map_or(0.0, |desc| (desc.len() as f64 / 1000.0).min(1.0))
 }
 fn calculate_has_email_from_data(data: &RawServiceData) -> f64 {
-    if data.service_email.as_ref().map_or(false, |e| !e.is_empty()) { 1.0 } else { 0.0 }
+    if data.service_email.as_ref().map_or(false, |e| !e.is_empty()) {
+        1.0
+    } else {
+        0.0
+    }
 }
 fn calculate_has_url_from_data(data: &RawServiceData) -> f64 {
-    if data.service_url.as_ref().map_or(false, |u| !u.is_empty()) { 1.0 } else { 0.0 }
+    if data.service_url.as_ref().map_or(false, |u| !u.is_empty()) {
+        1.0
+    } else {
+        0.0
+    }
 }
 fn calculate_status_active_from_data(data: &RawServiceData) -> f64 {
-    if data.service_status.as_ref().map_or(false, |s| s.to_lowercase() == "active") { 1.0 } else { 0.0 }
+    if data
+        .service_status
+        .as_ref()
+        .map_or(false, |s| s.to_lowercase() == "active")
+    {
+        1.0
+    } else {
+        0.0
+    }
 }
-fn calculate_taxonomy_count_from_data(data: &RawServiceData) -> f64 { // Uses actual IDs now
+fn calculate_taxonomy_count_from_data(data: &RawServiceData) -> f64 {
+    // Uses actual IDs now
     (data.taxonomy_ids.len() as f64 / 20.0).min(1.0)
 }
-fn calculate_location_count_from_data(data: &RawServiceData) -> f64 { // Uses actual IDs now
+fn calculate_location_count_from_data(data: &RawServiceData) -> f64 {
+    // Uses actual IDs now
     (data.location_ids.len() as f64 / 10.0).min(1.0)
 }
 fn calculate_embedding_v2_present_from_data(data: &RawServiceData) -> f64 {
-    if data.service_embedding_v2_present { 1.0 } else { 0.0 }
+    if data.service_embedding_v2_present {
+        1.0
+    } else {
+        0.0
+    }
 }
 fn calculate_organization_name_length_from_data(data: &RawServiceData) -> f64 {
-    data.organization_name.as_ref().map_or(0.0, |name| (name.len() as f64 / 100.0).min(1.0))
+    data.organization_name
+        .as_ref()
+        .map_or(0.0, |name| (name.len() as f64 / 100.0).min(1.0))
 }
 fn calculate_organization_embedding_present_from_data(data: &RawServiceData) -> f64 {
-    if data.organization_embedding_present { 1.0 } else { 0.0 }
+    if data.organization_embedding_present {
+        1.0
+    } else {
+        0.0
+    }
 }
-
 
 // --- Pairwise Feature Calculation Functions (some using RawServiceData) ---
 
@@ -822,12 +898,20 @@ async fn calculate_embedding_cosine_similarity(
         if let (Some(e1), Some(e2)) = (emb1_pg, emb2_pg) {
             let v1_f32 = e1.to_vec();
             let v2_f32 = e2.to_vec();
-            if v1_f32.is_empty() || v2_f32.is_empty() { return Ok(0.0); }
-            if v1_f32.len() != v2_f32.len() { return Ok(0.0); }
+            if v1_f32.is_empty() || v2_f32.is_empty() {
+                return Ok(0.0);
+            }
+            if v1_f32.len() != v2_f32.len() {
+                return Ok(0.0);
+            }
             cosine_similarity_candle(&v1_f32, &v2_f32)
                 .map_err(|e| anyhow::anyhow!("Candle similarity failed: {}", e))
-        } else { Ok(0.0) }
-    } else { Ok(0.0) }
+        } else {
+            Ok(0.0)
+        }
+    } else {
+        Ok(0.0)
+    }
 }
 
 fn jaccard_similarity_str(set1_ids: &[String], set2_ids: &[String]) -> f64 {
@@ -844,19 +928,24 @@ fn jaccard_similarity_str(set1_ids: &[String], set2_ids: &[String]) -> f64 {
     }
 }
 
-
 async fn calculate_taxonomy_jaccard_from_data(
     data1: &RawServiceData,
     data2: &RawServiceData,
 ) -> Result<f64> {
-    Ok(jaccard_similarity_str(&data1.taxonomy_ids, &data2.taxonomy_ids))
+    Ok(jaccard_similarity_str(
+        &data1.taxonomy_ids,
+        &data2.taxonomy_ids,
+    ))
 }
 
 async fn calculate_location_jaccard_from_data(
     data1: &RawServiceData,
     data2: &RawServiceData,
 ) -> Result<f64> {
-     Ok(jaccard_similarity_str(&data1.location_ids, &data2.location_ids))
+    Ok(jaccard_similarity_str(
+        &data1.location_ids,
+        &data2.location_ids,
+    ))
 }
 
 async fn check_same_organization_from_data(

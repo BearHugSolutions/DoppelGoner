@@ -326,10 +326,10 @@ async fn run_pipeline_from_phase4(
     // Custom config with performance optimizations
     let consolidation_config = service_consolidate_clusters::ConsolidationConfig {
         similarity_threshold: 0.5, // Lower threshold for more broad clustering
-        embedding_batch_size: 200,  // Larger batches if memory allows
-        db_batch_size: 100,         // Larger DB batches for I/O efficiency
-        max_cache_size: 15000,      // Larger cache for better hit rates
-        min_cluster_size: 3,        // Only consolidate clusters with 3+ services
+        embedding_batch_size: 200, // Larger batches if memory allows
+        db_batch_size: 100,        // Larger DB batches for I/O efficiency
+        max_cache_size: 15000,     // Larger cache for better hit rates
+        min_cluster_size: 3,       // Only consolidate clusters with 3+ services
         embedding_cache_duration_secs: 3600, // Explicitly set or use default (adjust as needed)
     };
 

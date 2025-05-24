@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::sync::Arc;
 use tokio::sync::Mutex; // Ensure Mutex is from tokio::sync
-// use uuid::Uuid; // Uuid was only used in the removed log_decision_snapshot
+                        // use uuid::Uuid; // Uuid was only used in the removed log_decision_snapshot
 
 use super::service_confidence_tuner::ServiceConfidenceTuner;
 use super::service_feature_cache_service::SharedServiceFeatureCache;

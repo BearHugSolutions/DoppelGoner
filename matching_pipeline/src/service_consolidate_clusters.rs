@@ -13,13 +13,11 @@ use uuid::Uuid;
 // For this refactor, we'll fetch as pgvector::Vector and convert to Vec<f32> for use.
 use pgvector::Vector;
 
-
 // Local imports
 use crate::db::PgPool;
 use crate::models::{ServiceGroupClusterId, ServiceId};
 // Assuming cosine_similarity_manual is available in utils
 use crate::utils::{cosine_similarity_candle, cosine_similarity_manual};
-
 
 /// Configuration for consolidation parameters
 #[derive(Debug, Clone)]
@@ -28,7 +26,7 @@ pub struct ConsolidationConfig {
     pub embedding_batch_size: usize, // For fetching from DB to cache
     pub db_batch_size: usize,        // For DB query LIMIT
     pub max_cache_size: usize,       // Max items in EmbeddingCache
-    pub min_cluster_size: usize,     // Min services in a cluster to be considered for centroid calculation
+    pub min_cluster_size: usize, // Min services in a cluster to be considered for centroid calculation
     pub embedding_cache_duration_secs: u64, // Duration for embedding cache entries
 }
 
@@ -39,7 +37,7 @@ impl Default for ConsolidationConfig {
             embedding_batch_size: 200,  // How many embeddings to process for similarity at once
             db_batch_size: 100,         // How many services to fetch from DB in one go
             max_cache_size: 10000,      // Max service embeddings in local cache
-            min_cluster_size: 2,        // Clusters smaller than this won't have centroids calculated (or won't be processed)
+            min_cluster_size: 2, // Clusters smaller than this won't have centroids calculated (or won't be processed)
             embedding_cache_duration_secs: 3600, // 1 hour
         }
     }
@@ -50,8 +48,8 @@ impl Default for ConsolidationConfig {
 struct ServiceWithEmbedding {
     service_id: ServiceId,
     cluster_id: ServiceGroupClusterId, // Current cluster
-    embedding: Vec<f32>, // Processed embedding
-    // metadata: serde_json::Value, // If needed later
+    embedding: Vec<f32>,               // Processed embedding
+                                       // metadata: serde_json::Value, // If needed later
 }
 
 /// Represents a cluster with aggregated data for consolidation
@@ -61,7 +59,7 @@ struct ClusterData {
     service_count: usize,
     average_embedding: Vec<f32>, // Centroid
     service_ids: HashSet<ServiceId>, // Services in this cluster
-                                     // coherence_score: Option<f64>, // If needed later
+                                 // coherence_score: Option<f64>, // If needed later
 }
 
 /// Cache for storing service embeddings locally to reduce DB calls
@@ -121,13 +119,15 @@ impl ServiceEmbeddingCache {
     }
 
     fn insert(&mut self, service_id: ServiceId, embedding: Vec<f32>) {
-        if self.embeddings.len() >= self.max_size && self.max_size > 0 { // ensure max_size > 0 to prevent division by zero or unintended full clear
+        if self.embeddings.len() >= self.max_size && self.max_size > 0 {
+            // ensure max_size > 0 to prevent division by zero or unintended full clear
             // Simple eviction: remove a random key if full (can be improved with LRU)
             // To make it slightly more deterministic for testing or specific needs,
             // one might sort keys or use a more sophisticated eviction.
             // For now, `keys().next()` is simple but not truly random.
             // A more robust LRU would require more state (e.g., a linked list of keys).
-            if let Some(key_to_remove) = self.embeddings.keys().next().cloned() { // .cloned() is important here
+            if let Some(key_to_remove) = self.embeddings.keys().next().cloned() {
+                // .cloned() is important here
                 self.embeddings.remove(&key_to_remove);
             }
         }
@@ -144,7 +144,6 @@ impl ServiceEmbeddingCache {
         (self.hits, self.misses)
     }
 }
-
 
 /// Batch fetcher for service embeddings
 struct ServiceEmbeddingBatch;
@@ -168,7 +167,10 @@ impl ServiceEmbeddingBatch {
         }
 
         if !ids_to_fetch_from_db.is_empty() {
-            debug!("Cache miss for {} service IDs, fetching from DB.", ids_to_fetch_from_db.len());
+            debug!(
+                "Cache miss for {} service IDs, fetching from DB.",
+                ids_to_fetch_from_db.len()
+            );
             // Corrected table name to public.service and column to embedding_v2
             let query = "
                 SELECT id, embedding_v2
@@ -188,14 +190,16 @@ impl ServiceEmbeddingBatch {
                     results.insert(service_id.clone(), embedding_vec_f32.clone());
                     cache.insert(service_id, embedding_vec_f32);
                 } else {
-                    warn!("Service {} found but its embedding_v2 is NULL.", service_id.0);
+                    warn!(
+                        "Service {} found but its embedding_v2 is NULL.",
+                        service_id.0
+                    );
                 }
             }
         }
         Ok(results)
     }
 }
-
 
 /// Main function to consolidate service clusters based on embedding similarity
 pub async fn consolidate_service_clusters(
@@ -211,8 +215,8 @@ pub async fn consolidate_service_clusters(
     let start_time = Instant::now();
 
     // Initialize cache
-    let mut embedding_cache = ServiceEmbeddingCache::new(config.embedding_cache_duration_secs, config.max_cache_size);
-
+    let mut embedding_cache =
+        ServiceEmbeddingCache::new(config.embedding_cache_duration_secs, config.max_cache_size);
 
     let mut conn = pool
         .get()
@@ -226,21 +230,30 @@ pub async fn consolidate_service_clusters(
     // Step 1: Load all services that are part of any cluster, along with their embeddings
     // This is slightly different from entity consolidation; we get services from service_group.
     let services_with_embeddings =
-        load_clustered_services_with_embeddings(&transaction, &config, &mut embedding_cache).await?;
+        load_clustered_services_with_embeddings(&transaction, &config, &mut embedding_cache)
+            .await?;
     info!(
         "Loaded {} services with embeddings for consolidation. Cache hits: {}, misses: {}",
-        services_with_embeddings.len(), embedding_cache.hits, embedding_cache.misses
+        services_with_embeddings.len(),
+        embedding_cache.hits,
+        embedding_cache.misses
     );
 
     if services_with_embeddings.is_empty() {
         info!("No services with embeddings found in clusters, skipping consolidation.");
-        transaction.commit().await.context("Failed to commit empty transaction")?;
+        transaction
+            .commit()
+            .await
+            .context("Failed to commit empty transaction")?;
         return Ok(0);
     }
 
     // Step 2: Group services by current clusters
     let mut clusters_map = group_services_into_cluster_data(services_with_embeddings);
-    info!("Found {} initial service clusters from service_group records", clusters_map.len());
+    info!(
+        "Found {} initial service clusters from service_group records",
+        clusters_map.len()
+    );
 
     // Step 3: Calculate cluster centroids and filter by minimum size
     calculate_and_filter_cluster_centroids(&mut clusters_map, config.min_cluster_size);
@@ -248,35 +261,55 @@ pub async fn consolidate_service_clusters(
 
     info!(
         "Processing {} service clusters meeting minimum size requirement ({} services)",
-        clusters_to_process.len(), config.min_cluster_size
+        clusters_to_process.len(),
+        config.min_cluster_size
     );
 
     if clusters_to_process.len() < 2 {
-        info!("Not enough service clusters ({} found) to consolidate further.", clusters_to_process.len());
-        transaction.commit().await.context("Failed to commit transaction")?;
+        info!(
+            "Not enough service clusters ({} found) to consolidate further.",
+            clusters_to_process.len()
+        );
+        transaction
+            .commit()
+            .await
+            .context("Failed to commit transaction")?;
         return Ok(0);
     }
-    
+
     // Sort clusters by ID for deterministic processing (optional, but good for reproducibility)
     clusters_to_process.sort_by(|a, b| a.cluster_id.0.cmp(&b.cluster_id.0));
-
 
     // Step 4: Find similar clusters using batched similarity calculations
     // SimilarityCache for cluster-pair similarities (not individual embeddings)
     let mut similarity_pair_cache = ClusterSimilarityPairCache::new(config.max_cache_size / 10); // Smaller cache for pairs
 
-    let merge_candidates = find_merge_candidates_for_services(&clusters_to_process, &config, &mut similarity_pair_cache).await?;
-    info!("Found {} potential service cluster merges. Similarity cache hits: {}, misses: {}", merge_candidates.len(), similarity_pair_cache.hits, similarity_pair_cache.misses);
+    let merge_candidates = find_merge_candidates_for_services(
+        &clusters_to_process,
+        &config,
+        &mut similarity_pair_cache,
+    )
+    .await?;
+    info!(
+        "Found {} potential service cluster merges. Similarity cache hits: {}, misses: {}",
+        merge_candidates.len(),
+        similarity_pair_cache.hits,
+        similarity_pair_cache.misses
+    );
 
     if merge_candidates.is_empty() {
         info!("No similar service clusters found for merging.");
-        transaction.commit().await.context("Failed to commit transaction")?;
+        transaction
+            .commit()
+            .await
+            .context("Failed to commit transaction")?;
         return Ok(0);
     }
 
     // Step 5: Execute cluster merges in the database
     let merged_count =
-        execute_service_cluster_merges(&transaction, merge_candidates, pipeline_run_id, pool).await?;
+        execute_service_cluster_merges(&transaction, merge_candidates, pipeline_run_id, pool)
+            .await?;
 
     transaction
         .commit()
@@ -285,7 +318,11 @@ pub async fn consolidate_service_clusters(
 
     let (cache_hits, cache_misses) = embedding_cache.stats();
     let total_lookups = cache_hits + cache_misses;
-    let hit_ratio = if total_lookups > 0 { (cache_hits as f64 / total_lookups as f64) * 100.0 } else { 0.0 };
+    let hit_ratio = if total_lookups > 0 {
+        (cache_hits as f64 / total_lookups as f64) * 100.0
+    } else {
+        0.0
+    };
 
     info!(
         "Service cluster consolidation completed in {:.2?}. {} cluster pairs merged. Embedding Cache hit ratio: {:.2}% ({}/{} lookups)",
@@ -314,8 +351,10 @@ async fn load_clustered_services_with_embeddings(
             SELECT service_id_2 AS service_id, group_cluster_id FROM public.service_group WHERE group_cluster_id IS NOT NULL
         ) sg
     ";
-    let rows = transaction.query(query_service_ids_in_clusters, &[])
-        .await.context("Failed to fetch service IDs from service_group")?;
+    let rows = transaction
+        .query(query_service_ids_in_clusters, &[])
+        .await
+        .context("Failed to fetch service IDs from service_group")?;
 
     let mut service_cluster_map = HashMap::new();
     let mut distinct_service_ids_to_fetch_embeddings = HashSet::new();
@@ -324,26 +363,33 @@ async fn load_clustered_services_with_embeddings(
         let service_id_str: String = row.get("service_id");
         let cluster_id_str: String = row.get("group_cluster_id");
         let service_id = ServiceId(service_id_str);
-        
+
         service_cluster_map.insert(service_id.clone(), ServiceGroupClusterId(cluster_id_str));
         distinct_service_ids_to_fetch_embeddings.insert(service_id);
     }
-    
+
     if distinct_service_ids_to_fetch_embeddings.is_empty() {
         return Ok(Vec::new());
     }
 
-    info!("Found {} distinct services across all service clusters. Fetching embeddings...", distinct_service_ids_to_fetch_embeddings.len());
+    info!(
+        "Found {} distinct services across all service clusters. Fetching embeddings...",
+        distinct_service_ids_to_fetch_embeddings.len()
+    );
 
     let mut all_services_with_embeddings = Vec::new();
-    let service_id_vec: Vec<ServiceId> = distinct_service_ids_to_fetch_embeddings.into_iter().collect();
+    let service_id_vec: Vec<ServiceId> = distinct_service_ids_to_fetch_embeddings
+        .into_iter()
+        .collect();
 
     // Fetch embeddings in batches using ServiceEmbeddingBatch
-    for chunk in service_id_vec.chunks(config.db_batch_size) { // db_batch_size for fetching from DB
-        let fetched_embeddings_map = ServiceEmbeddingBatch::fetch_embeddings(transaction, chunk, cache).await?;
+    for chunk in service_id_vec.chunks(config.db_batch_size) {
+        // db_batch_size for fetching from DB
+        let fetched_embeddings_map =
+            ServiceEmbeddingBatch::fetch_embeddings(transaction, chunk, cache).await?;
         for (service_id, embedding) in fetched_embeddings_map {
             if let Some(cluster_id) = service_cluster_map.get(&service_id) {
-                 all_services_with_embeddings.push(ServiceWithEmbedding {
+                all_services_with_embeddings.push(ServiceWithEmbedding {
                     service_id,
                     cluster_id: cluster_id.clone(),
                     embedding,
@@ -353,7 +399,6 @@ async fn load_clustered_services_with_embeddings(
     }
     Ok(all_services_with_embeddings)
 }
-
 
 /// Group services into clusters and prepare cluster data structures
 fn group_services_into_cluster_data(
@@ -415,7 +460,7 @@ fn calculate_and_filter_cluster_centroids(
 
         // Average the accumulated embeddings for the centroid
         // This check is technically redundant due to the retain condition above, but good for clarity
-        if cluster_data.service_count > 0 { 
+        if cluster_data.service_count > 0 {
             for val in cluster_data.average_embedding.iter_mut() {
                 *val /= cluster_data.service_count as f32;
             }
@@ -429,7 +474,6 @@ fn calculate_and_filter_cluster_centroids(
         true // Keep this cluster
     });
 }
-
 
 /// Cache for storing computed cluster-pair similarities
 struct ClusterSimilarityPairCache {
@@ -450,7 +494,11 @@ impl ClusterSimilarityPairCache {
     }
 
     fn get(&mut self, id1: &str, id2: &str) -> Option<f64> {
-        let key = if id1 < id2 { (id1.to_string(), id2.to_string()) } else { (id2.to_string(), id1.to_string()) };
+        let key = if id1 < id2 {
+            (id1.to_string(), id2.to_string())
+        } else {
+            (id2.to_string(), id1.to_string())
+        };
         if let Some(similarity) = self.cache.get(&key).copied() {
             self.hits += 1;
             Some(similarity)
@@ -469,11 +517,14 @@ impl ClusterSimilarityPairCache {
                 self.cache.remove(&key);
             }
         }
-        let key = if id1 < id2 { (id1.to_string(), id2.to_string()) } else { (id2.to_string(), id1.to_string()) };
+        let key = if id1 < id2 {
+            (id1.to_string(), id2.to_string())
+        } else {
+            (id2.to_string(), id1.to_string())
+        };
         self.cache.insert(key, similarity);
     }
 }
-
 
 /// Find service clusters that should be merged based on similarity threshold
 async fn find_merge_candidates_for_services(
@@ -490,7 +541,10 @@ async fn find_merge_candidates_for_services(
             let cluster2 = &clusters[j];
 
             if cluster1.average_embedding.is_empty() || cluster2.average_embedding.is_empty() {
-                warn!("Skipping similarity calculation between {} and {} due to empty centroid.", cluster1.cluster_id.0, cluster2.cluster_id.0);
+                warn!(
+                    "Skipping similarity calculation between {} and {} due to empty centroid.",
+                    cluster1.cluster_id.0, cluster2.cluster_id.0
+                );
                 continue;
             }
             if cluster1.average_embedding.len() != cluster2.average_embedding.len() {
@@ -503,7 +557,9 @@ async fn find_merge_candidates_for_services(
             }
 
             // Check cache first
-            if let Some(cached_similarity) = similarity_cache.get(&cluster1.cluster_id.0, &cluster2.cluster_id.0) {
+            if let Some(cached_similarity) =
+                similarity_cache.get(&cluster1.cluster_id.0, &cluster2.cluster_id.0)
+            {
                 if cached_similarity >= config.similarity_threshold {
                     merge_candidates.push((
                         cluster1.cluster_id.clone(),
@@ -513,11 +569,16 @@ async fn find_merge_candidates_for_services(
                 }
                 continue; // Move to next pair if cache hit
             }
-            
-            comparisons_made +=1;
-            match cosine_similarity_candle(&cluster1.average_embedding, &cluster2.average_embedding) {
+
+            comparisons_made += 1;
+            match cosine_similarity_candle(&cluster1.average_embedding, &cluster2.average_embedding)
+            {
                 Ok(similarity) => {
-                    similarity_cache.insert(&cluster1.cluster_id.0, &cluster2.cluster_id.0, similarity);
+                    similarity_cache.insert(
+                        &cluster1.cluster_id.0,
+                        &cluster2.cluster_id.0,
+                        similarity,
+                    );
                     if similarity >= config.similarity_threshold {
                         debug!(
                             "Found similar service clusters: {} and {} (similarity: {:.4})",
@@ -534,10 +595,17 @@ async fn find_merge_candidates_for_services(
                     // Fallback to manual calculation
                     warn!("Candle cosine similarity failed for service clusters {} and {}: {}. Trying manual calculation.",
                           cluster1.cluster_id.0, cluster2.cluster_id.0, e_candle);
-                    if let Some(manual_similarity) = cosine_similarity_manual(&cluster1.average_embedding, &cluster2.average_embedding) {
-                        similarity_cache.insert(&cluster1.cluster_id.0, &cluster2.cluster_id.0, manual_similarity);
+                    if let Some(manual_similarity) = cosine_similarity_manual(
+                        &cluster1.average_embedding,
+                        &cluster2.average_embedding,
+                    ) {
+                        similarity_cache.insert(
+                            &cluster1.cluster_id.0,
+                            &cluster2.cluster_id.0,
+                            manual_similarity,
+                        );
                         if manual_similarity >= config.similarity_threshold {
-                             merge_candidates.push((
+                            merge_candidates.push((
                                 cluster1.cluster_id.clone(),
                                 cluster2.cluster_id.clone(),
                                 manual_similarity,
@@ -546,12 +614,17 @@ async fn find_merge_candidates_for_services(
                     } else {
                         warn!("Manual cosine similarity also failed for service clusters {} and {}. Similarity set to 0.0",
                               cluster1.cluster_id.0, cluster2.cluster_id.0);
-                        similarity_cache.insert(&cluster1.cluster_id.0, &cluster2.cluster_id.0, 0.0); // Cache failure as 0.0
+                        similarity_cache.insert(
+                            &cluster1.cluster_id.0,
+                            &cluster2.cluster_id.0,
+                            0.0,
+                        ); // Cache failure as 0.0
                     }
                 }
             }
         }
-        if i > 0 && i % 100 == 0 { // Log progress
+        if i > 0 && i % 100 == 0 {
+            // Log progress
             debug!("Processed {} clusters for merge candidates. Comparisons: {}, Cache hits: {}, misses: {}",
                 i, comparisons_made, similarity_cache.hits, similarity_cache.misses);
         }
@@ -577,8 +650,13 @@ async fn execute_service_cluster_merges(
         let source_cluster_id = source_cluster_id_obj.0; // Merge this one into target
 
         // Skip if either cluster was already involved in a merge (source became target, or target was merged away)
-        if already_merged_ids.contains(&target_cluster_id) || already_merged_ids.contains(&source_cluster_id) {
-            debug!("Skipping merge between {} and {}: one or both already processed.", source_cluster_id, target_cluster_id);
+        if already_merged_ids.contains(&target_cluster_id)
+            || already_merged_ids.contains(&source_cluster_id)
+        {
+            debug!(
+                "Skipping merge between {} and {}: one or both already processed.",
+                source_cluster_id, target_cluster_id
+            );
             continue;
         }
 
@@ -592,7 +670,10 @@ async fn execute_service_cluster_merges(
                 &[&target_cluster_id, &source_cluster_id, &Utc::now()],
             )
             .await
-            .context(format!("Failed to update service_group cluster assignments from {} to {}", source_cluster_id, target_cluster_id))?;
+            .context(format!(
+                "Failed to update service_group cluster assignments from {} to {}",
+                source_cluster_id, target_cluster_id
+            ))?;
 
         if update_result > 0 {
             // Update target_cluster_id's service_count and service_group_count
@@ -610,9 +691,11 @@ async fn execute_service_cluster_merges(
                     &[&target_cluster_id]
                 ).await.context(format!("Failed to query corrected new counts for target cluster {}", target_cluster_id))?;
 
-                (count_row_corrected.get::<_, i64>("unique_service_count") as i32, count_row_corrected.get::<_, i64>("group_count") as i32)
+                (
+                    count_row_corrected.get::<_, i64>("unique_service_count") as i32,
+                    count_row_corrected.get::<_, i64>("group_count") as i32,
+                )
             };
-
 
             transaction
                 .execute(
@@ -621,10 +704,18 @@ async fn execute_service_cluster_merges(
                          service_group_count = $2,
                          updated_at = $3
                      WHERE id = $4",
-                    &[&new_counts.0, &new_counts.1, &Utc::now(), &target_cluster_id],
+                    &[
+                        &new_counts.0,
+                        &new_counts.1,
+                        &Utc::now(),
+                        &target_cluster_id,
+                    ],
                 )
                 .await
-                .context(format!("Failed to update service_group_cluster metadata for {}", target_cluster_id))?;
+                .context(format!(
+                    "Failed to update service_group_cluster metadata for {}",
+                    target_cluster_id
+                ))?;
 
             // Mark source_cluster_id as inactive or delete it
             transaction
@@ -633,7 +724,10 @@ async fn execute_service_cluster_merges(
                     &[&source_cluster_id],
                 )
                 .await
-                .context(format!("Failed to remove merged service_group_cluster {}", source_cluster_id))?;
+                .context(format!(
+                    "Failed to remove merged service_group_cluster {}",
+                    source_cluster_id
+                ))?;
 
             // Log the merge
             transaction
@@ -664,23 +758,28 @@ async fn execute_service_cluster_merges(
             // If no records were updated, it might mean source_cluster_id was already empty or processed.
             // Still, attempt to delete it if it exists, to clean up.
             debug!("No service_group records found for source_cluster_id {} during merge attempt. Attempting to delete cluster record if it exists.", source_cluster_id);
-             let del_res = transaction
+            let del_res = transaction
                 .execute(
                     "DELETE FROM public.service_group_cluster WHERE id = $1",
                     &[&source_cluster_id],
                 )
                 .await
-                .context(format!("Failed to remove (potentially empty) merged service_group_cluster {}", source_cluster_id))?;
+                .context(format!(
+                    "Failed to remove (potentially empty) merged service_group_cluster {}",
+                    source_cluster_id
+                ))?;
             if del_res > 0 {
-                info!("Cleaned up empty or already processed source_cluster_id: {}", source_cluster_id);
-                 already_merged_ids.insert(source_cluster_id.clone()); // Also mark as processed if deleted
+                info!(
+                    "Cleaned up empty or already processed source_cluster_id: {}",
+                    source_cluster_id
+                );
+                already_merged_ids.insert(source_cluster_id.clone()); // Also mark as processed if deleted
             }
         }
     }
 
     Ok(merged_count)
 }
-
 
 /// Helper function to ensure consolidation tables exist
 pub async fn ensure_consolidation_tables_exist(pool: &PgPool) -> Result<()> {

@@ -8,14 +8,13 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-// Ensure these are correctly defined in your actual config.rs
 use crate::config::{CRITICALLY_LOW_SUGGESTION_THRESHOLD, MODERATE_LOW_SUGGESTION_THRESHOLD};
-// Removed: use crate::config::MIN_CONFIDENCE_FOR_GROUPING_THRESHOLD_STRICT;
-
-use crate::db::{self, insert_entity_group_tx, insert_match_decision_detail_tx, insert_suggestion_tx, PgPool}; // db for insert_suggestion if used
+use crate::db::{
+    self, PgPool, // Using db::upsert_entity_group, db::insert_match_decision_detail_direct, db::insert_suggestion
+};
 use crate::models::{
-    ActionType, EmailMatchValue, EntityGroupId, EntityId, MatchMethodType, MatchValues,
-    NewSuggestedAction, SuggestionStatus,
+    ActionType, EmailMatchValue, EntityId, MatchMethodType, MatchValues, NewSuggestedAction,
+    SuggestionStatus,
 };
 use crate::reinforcement::entity::feature_cache_service::SharedFeatureCache;
 use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
@@ -26,15 +25,8 @@ use crate::pipeline_state_utils::{
     check_comparison_cache, get_current_signatures_for_pair, store_in_comparison_cache,
 };
 
-const INSERT_ENTITY_GROUP_SQL: &str = "
-    INSERT INTO public.entity_group
-(id, entity_id_1, entity_id_2, method_type, match_values, confidence_score,
- pre_rl_confidence_score)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING"; // Important for return value logic
-
 async fn create_entity_group(
-    pool: &PgPool,
+    pool: &PgPool, // Pass pool directly
     entity_id_1: &EntityId,
     entity_id_2: &EntityId,
     match_values: &MatchValues,
@@ -43,16 +35,13 @@ async fn create_entity_group(
     features_for_snapshot: Option<Vec<f64>>,
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    normalized_shared_email: &str, // Used in logging and suggestions
-) -> Result<bool> { // Returns true if a new group was created and processed
-
+    normalized_shared_email: &str,
+) -> Result<bool> {
     let new_entity_group_id_str = Uuid::new_v4().to_string();
 
-    let mut conn = pool.get().await.context("Email: Failed to get DB connection")?;
-    let mut tx = conn.transaction().await.context("Email: Failed to start transaction")?;
-
-    let (group_id, was_newly_inserted) = match insert_entity_group_tx(
-        &mut tx,
+    // Step 1: Upsert Entity Group
+    let (group_id, was_newly_inserted) = match db::upsert_entity_group(
+        pool,
         &new_entity_group_id_str,
         entity_id_1,
         entity_id_2,
@@ -60,11 +49,12 @@ async fn create_entity_group(
         pre_rl_confidence_score,
         MatchMethodType::Email,
         match_values.clone(),
-    ).await {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(e) => {
-            tx.rollback().await.context("Email: Failed to rollback after insert_entity_group_tx error")?;
-            return Err(e.context("Email: insert_entity_group_tx failed"));
+            return Err(e.context("Email: upsert_entity_group failed"));
         }
     };
 
@@ -74,26 +64,29 @@ async fn create_entity_group(
             group_id, entity_id_1.0, entity_id_2.0, normalized_shared_email, final_confidence_score
         );
 
-        let mut version: Option<i32> = None;
+        if let (Some(orch_arc), Some(features_vec)) =
+            (reinforcement_orchestrator, &features_for_snapshot)
+        {
+            let version = orch_arc.lock().await.confidence_tuner.version;
+            let snapshot_features_json =
+                serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
 
-        if let (Some(orch_arc), Some(features_vec)) = (reinforcement_orchestrator, &features_for_snapshot) {
-            let orchestrator_guard = orch_arc.lock().await;
-            version = Some(orchestrator_guard.confidence_tuner.version as i32);
-            let snapshot_features_json = serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
-
-            if let Err(e) = insert_match_decision_detail_tx(
-                &mut tx,
+            if let Err(e) = db::insert_match_decision_detail_direct(
+                pool,
                 &group_id,
                 pipeline_run_id,
                 snapshot_features_json,
                 MatchMethodType::Email.as_str(),
                 pre_rl_confidence_score,
                 final_confidence_score,
-                version,
-            ).await {
-                warn!("Email: Failed to log decision snapshot for new group {}: {}. Rolling back.", group_id, e);
-                tx.rollback().await.context("Email: Failed to rollback after decision detail error")?;
-                return Err(e.context("Email: insert_match_decision_detail_tx failed"));
+                Some(version as i32),
+            )
+            .await
+            {
+                warn!(
+                    "Email: Failed to log decision snapshot for new group {}: {}. Group created, RL context lost.",
+                    group_id, e
+                );
             }
         }
 
@@ -101,8 +94,8 @@ async fn create_entity_group(
             let details_json = serde_json::json!({
                 "method_type": MatchMethodType::Email.as_str(),
                 "matched_value": normalized_shared_email,
-                "original_email1": match match_values { MatchValues::Email(e) => &e.original_email1, _ => "" },
-                "original_email2": match match_values { MatchValues::Email(e) => &e.original_email2, _ => "" },
+                "original_email1": match match_values { MatchValues::Email(em_val) => &em_val.original_email1, _ => "" },
+                "original_email2": match match_values { MatchValues::Email(em_val) => &em_val.original_email2, _ => "" },
                 "entity_group_id": &group_id,
                 "pre_rl_confidence": pre_rl_confidence_score,
             });
@@ -115,30 +108,34 @@ async fn create_entity_group(
                 action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
                 entity_id: None,
                 group_id_1: Some(group_id.clone()),
-                group_id_2: None, cluster_id: None,
+                group_id_2: None,
+                cluster_id: None,
                 triggering_confidence: Some(final_confidence_score),
                 details: Some(details_json),
                 reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
                 reason_message: Some(reason_message),
-                priority: if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 },
+                priority: if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+                    2
+                } else {
+                    1
+                },
                 status: SuggestionStatus::PendingReview.as_str().to_string(),
-                reviewer_id: None, reviewed_at: None, review_notes: None,
+                reviewer_id: None,
+                reviewed_at: None,
+                review_notes: None,
             };
 
-            if let Err(e) = insert_suggestion_tx(&mut tx, &suggestion).await {
-                warn!("Email: Failed to insert suggestion for new group {}: {}. Rolling back.", group_id, e);
-                tx.rollback().await.context("Email: Failed to rollback after suggestion error")?;
-                return Err(e.context("Email: insert_suggestion_tx failed"));
+            if let Err(e) = db::insert_suggestion(pool, &suggestion).await {
+                warn!(
+                    "Email: Failed to insert suggestion for new group {}: {}. Group and detail (if any) created.",
+                    group_id, e
+                );
             }
         }
-
-        tx.commit().await.context("Email: Failed to commit transaction (new group)")?;
-        Ok(true) // New group created and processed.
-
+        Ok(true)
     } else {
         debug!("Email: Group for pair ({}, {}) already exists or updated (ID: {}). Skipping details/suggestions.", entity_id_1.0, entity_id_2.0, group_id);
-        tx.commit().await.context("Email: Failed to commit transaction (existing group)")?;
-        Ok(false) // No new group created.
+        Ok(false)
     }
 }
 
@@ -149,7 +146,7 @@ pub async fn find_matches(
     feature_cache: Option<SharedFeatureCache>,
 ) -> Result<AnyMatchResult> {
     info!(
-        "Starting V1 pairwise email matching (run ID: {}){} with INCREMENTAL CHECKS...",
+        "Starting V1 pairwise email matching (run ID: {}){} with INCREMENTAL CHECKS (direct DB calls)...",
         pipeline_run_id,
         if reinforcement_orchestrator_option.is_some() {
             " with RL confidence tuning"
@@ -289,7 +286,7 @@ pub async fn find_matches(
                     }
                 }
 
-                let mut pre_rl_confidence_score = 1.0;
+                let mut pre_rl_confidence_score = 1.0; // Default high for email
                 if is_generic_organizational_email(&normalized_shared_email) {
                     pre_rl_confidence_score *= 0.9;
                 }
@@ -308,12 +305,9 @@ pub async fn find_matches(
                 let mut features_json_for_cache: Option<serde_json::Value> = None;
 
                 if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
-                    match if let Some(_cache_service) = feature_cache.as_ref() {
-                        ro_arc
-                            .lock()
-                            .await
-                            .get_pair_features(pool, e1_id, e2_id)
-                            .await
+                    match if let Some(cache_service_arc) = feature_cache.as_ref() {
+                        let mut cache_service_guard = cache_service_arc.lock().await;
+                        cache_service_guard.get_pair_features(pool, e1_id, e2_id).await
                     } else {
                         MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id)
                             .await
@@ -366,7 +360,6 @@ pub async fn find_matches(
                     reinforcement_orchestrator_option.as_ref(),
                     pipeline_run_id,
                     &normalized_shared_email,
-                    // feature_cache.clone(), // Not directly passed if features are already extracted
                 )
                 .await
                 {
@@ -391,7 +384,7 @@ pub async fn find_matches(
                 let comparison_outcome_for_cache = if group_created_successfully {
                     "MATCH"
                 } else {
-                    "NON_MATCH"
+                    "NON_MATCH_OR_EXISTED"
                 };
                 if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
                     if let Err(e) = store_in_comparison_cache(
@@ -488,32 +481,39 @@ fn calculate_email_frequency(
 pub fn normalize_email(email: &str) -> String {
     let email_trimmed = email.trim().to_lowercase();
     if !email_trimmed.contains('@') {
-        return email_trimmed;
+        return email_trimmed; // Or handle as invalid
     }
     let parts: Vec<&str> = email_trimmed.splitn(2, '@').collect();
     if parts.len() != 2 {
-        return email_trimmed;
+        return email_trimmed; // Or handle as invalid
     }
     let (local_part_full, domain_part) = (parts[0], parts[1]);
+
+    // Remove part after '+'
     let local_part_no_plus = local_part_full.split('+').next().unwrap_or("").to_string();
-    let final_local_part = if domain_part == "gmail.com" || domain_part == "googlemail.com" {
-        local_part_no_plus.replace('.', "")
-    } else {
-        local_part_no_plus
-    };
+
+    // Normalize domain (e.g., googlemail.com -> gmail.com)
     let final_domain_part = match domain_part {
         "googlemail.com" => "gmail.com",
         _ => domain_part,
     };
+
+    // Remove dots from local part for Gmail addresses
+    let final_local_part = if final_domain_part == "gmail.com" {
+        local_part_no_plus.replace('.', "")
+    } else {
+        local_part_no_plus
+    };
+
     if final_local_part.is_empty() {
-        String::new()
+        String::new() // Invalid or empty local part after normalization
     } else {
         format!("{}@{}", final_local_part, final_domain_part)
     }
 }
 
 fn is_generic_organizational_email(email: &str) -> bool {
-    ["info@", "contact@", "office@", "admin@"]
+    ["info@", "contact@", "office@", "admin@", "support@", "sales@", "hello@", "help@"]
         .iter()
         .any(|prefix| email.starts_with(prefix))
 }

@@ -135,7 +135,7 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
 
     // Shared counter for total edges
     let total_edges = Arc::new(Mutex::new(0usize));
-    
+
     // Process clusters in parallel batches
     let mut cluster_stream = stream::iter(clusters.into_iter());
     let mut handles = Vec::new();
@@ -156,9 +156,9 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
                 rl_weight_copy,
             )
             .await;
-            
+
             progress_clone.inc(1);
-            
+
             match result {
                 Ok(edges) => {
                     let edge_count = edges.len();
@@ -265,12 +265,12 @@ async fn process_cluster_optimized(
             };
 
             let key = (source_id.0.clone(), target_id.0.clone());
-            
+
             // Check if we have matching methods for this pair
             if let Some(methods) = all_methods.get(&key) {
                 if !methods.is_empty() {
                     let (edge_weight, details_json) = calculate_edge_details(methods, rl_weight)?;
-                    
+
                     edges.push(EdgeData {
                         cluster_id: cluster_id.0.clone(),
                         entity_id_1: source_id.0.clone(),
@@ -300,7 +300,7 @@ async fn fetch_all_matching_methods_for_cluster(
 ) -> Result<HashMap<(String, String), Vec<EntityGroupRecord>>> {
     // Convert EntityIds to strings for the query
     let entity_id_strings: Vec<String> = entity_ids.iter().map(|e| e.0.clone()).collect();
-    
+
     // Query all entity_group records where both entities are in our list
     let query = "
         SELECT id, entity_id_1, entity_id_2, method_type, confidence_score, 
@@ -309,26 +309,26 @@ async fn fetch_all_matching_methods_for_cluster(
         WHERE entity_id_1 = ANY($1) AND entity_id_2 = ANY($1)
         ORDER BY entity_id_1, entity_id_2
     ";
-    
+
     let rows = client
         .query(query, &[&entity_id_strings])
         .await
         .context("Failed to fetch entity matching methods in bulk")?;
-    
+
     // Group methods by entity pair
     let mut methods_map: HashMap<(String, String), Vec<EntityGroupRecord>> = HashMap::new();
-    
+
     for row in rows {
         let entity_id_1: String = row.get("entity_id_1");
         let entity_id_2: String = row.get("entity_id_2");
-        
+
         // Ensure consistent ordering for the key
         let key = if entity_id_1 < entity_id_2 {
             (entity_id_1, entity_id_2)
         } else {
             (entity_id_2.clone(), entity_id_1.clone())
         };
-        
+
         let record = EntityGroupRecord {
             id: row.get("id"),
             method_type: row.get("method_type"),
@@ -336,10 +336,10 @@ async fn fetch_all_matching_methods_for_cluster(
             pre_rl_confidence_score: row.get("pre_rl_confidence_score"),
             match_values: row.get("match_values"),
         };
-        
+
         methods_map.entry(key).or_insert_with(Vec::new).push(record);
     }
-    
+
     Ok(methods_map)
 }
 
@@ -363,10 +363,7 @@ async fn bulk_insert_edges(pool: &PgPool, edges: &[EdgeData]) -> Result<()> {
 }
 
 /// Insert a chunk of edges
-async fn insert_edge_chunk(
-    client: &impl GenericClient,
-    chunk: &[EdgeData],
-) -> Result<()> {
+async fn insert_edge_chunk(client: &impl GenericClient, chunk: &[EdgeData]) -> Result<()> {
     let mut id_vec = Vec::with_capacity(chunk.len());
     let mut cluster_id_vec = Vec::with_capacity(chunk.len());
     let mut entity_id_1_vec = Vec::with_capacity(chunk.len());
@@ -407,8 +404,7 @@ async fn insert_edge_chunk(
 
 /// Fetch all clusters from the database
 async fn fetch_clusters(client: &impl GenericClient) -> Result<Vec<GroupClusterRecord>> {
-    let query =
-        "SELECT id, name, entity_count, average_coherence_score 
+    let query = "SELECT id, name, entity_count, average_coherence_score 
          FROM public.entity_group_cluster
          ORDER BY entity_count DESC"; // Process larger clusters first for better load balancing
 

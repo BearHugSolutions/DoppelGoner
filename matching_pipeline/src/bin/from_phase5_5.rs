@@ -13,22 +13,18 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
 
 use dedupe_lib::{
-    service_cluster_visualization, service_consolidate_clusters, service_matching,
     db::{self, PgPool},
     models::{self, *},
-    reinforcement::{
-        service::{
-            service_feature_cache_prewarmer::{
-                extract_and_store_all_service_features_and_prewarm_cache,
-                prewarm_service_pair_features_cache,
-            },
-            service_feature_cache_service::{
-                create_shared_service_cache, SharedServiceFeatureCache,
-            },
-            service_orchestrator::{self, ServiceMatchingOrchestrator},
+    reinforcement::service::{
+        service_feature_cache_prewarmer::{
+            extract_and_store_all_service_features_and_prewarm_cache,
+            prewarm_service_pair_features_cache,
         },
+        service_feature_cache_service::{create_shared_service_cache, SharedServiceFeatureCache},
+        service_orchestrator::{self, ServiceMatchingOrchestrator},
     },
     results::{self, AnyMatchResult, MatchMethodStats, PipelineStats, ServiceMatchResult},
+    service_cluster_visualization, service_consolidate_clusters, service_matching,
 };
 
 #[tokio::main]
@@ -82,7 +78,9 @@ async fn main() -> Result<()> {
     );
 
     // Generate and store report
-    let description = Some("Pipeline run from Phase 5.5 (service context feature extraction) onwards".to_string());
+    let description = Some(
+        "Pipeline run from Phase 5.5 (service context feature extraction) onwards".to_string(),
+    );
     results::generate_report(&pool, stats, &phase_times, description).await?;
 
     Ok(())
@@ -118,7 +116,7 @@ async fn run_pipeline_from_phase5_5(
         total_entities: current_state.total_entities,
         total_groups: current_state.total_groups,
         total_clusters: current_state.total_clusters, // Load existing clusters
-        total_service_matches: 0, // Will be updated in Phase 6
+        total_service_matches: 0,                     // Will be updated in Phase 6
         total_visualization_edges: 0,
         total_service_clusters: 0,
         total_service_visualization_edges: 0,
@@ -127,8 +125,8 @@ async fn run_pipeline_from_phase5_5(
         entity_processing_time: 0.0,          // Not run in this execution
         context_feature_extraction_time: 0.0, // Not run in this execution
         service_context_feature_extraction_time: 0.0,
-        matching_time: 0.0, // Not run in this execution
-        clustering_time: 0.0, // Not run in this execution
+        matching_time: 0.0,                       // Not run in this execution
+        clustering_time: 0.0,                     // Not run in this execution
         visualization_edge_calculation_time: 0.0, // Not run in this execution
         service_matching_time: 0.0,
         total_processing_time: 0.0,
@@ -263,10 +261,10 @@ async fn run_pipeline_from_phase5_5(
     // Custom config with performance optimizations
     let consolidation_config = service_consolidate_clusters::ConsolidationConfig {
         similarity_threshold: 0.5, // Lower threshold for more broad clustering
-        embedding_batch_size: 200,  // Larger batches if memory allows
-        db_batch_size: 100,         // Larger DB batches for I/O efficiency
-        max_cache_size: 15000,      // Larger cache for better hit rates
-        min_cluster_size: 3,        // Only consolidate clusters with 3+ services
+        embedding_batch_size: 200, // Larger batches if memory allows
+        db_batch_size: 100,        // Larger DB batches for I/O efficiency
+        max_cache_size: 15000,     // Larger cache for better hit rates
+        min_cluster_size: 3,       // Only consolidate clusters with 3+ services
         embedding_cache_duration_secs: 3600, // Explicitly set or use default (adjust as needed)
     };
 

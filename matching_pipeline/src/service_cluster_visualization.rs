@@ -98,8 +98,10 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
         .await
         .context("Failed to clean up existing service edges")?;
     drop(client_cleanup); // Release connection
-    debug!("Cleaned up existing service edges for pipeline_run_id: {}", pipeline_run_id);
-
+    debug!(
+        "Cleaned up existing service edges for pipeline_run_id: {}",
+        pipeline_run_id
+    );
 
     // Fetch all service clusters
     let clusters = {
@@ -183,10 +185,7 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
                     Ok(edge_count)
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to process service cluster {}: {}",
-                        cluster_id.0, e
-                    );
+                    warn!("Failed to process service cluster {}: {}", cluster_id.0, e);
                     Err(e) // Propagate error for the handle
                 }
             }
@@ -199,7 +198,8 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
             let num_to_await = handles.len() / 2 + 1;
             let completed_handles = handles.drain(..num_to_await).collect::<Vec<_>>();
             for h in completed_handles {
-                if let Err(e) = h.await? { // Using `?` to propagate panics from spawned tasks
+                if let Err(e) = h.await? {
+                    // Using `?` to propagate panics from spawned tasks
                     warn!("A service cluster processing task failed: {}", e);
                 }
             }
@@ -208,7 +208,7 @@ pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str)
 
     // Wait for any remaining tasks
     for handle in handles {
-         if let Err(e) = handle.await? {
+        if let Err(e) = handle.await? {
             warn!("A service cluster processing task failed: {}", e);
         }
     }
@@ -266,7 +266,6 @@ async fn process_service_cluster_optimized(
         return Ok(vec![]);
     }
 
-
     // 3. For each service pair, calculate edge weight
     let mut edges_to_insert = Vec::new();
     for i in 0..services.len() {
@@ -288,7 +287,8 @@ async fn process_service_cluster_optimized(
                     let (edge_weight, details_json) =
                         calculate_service_edge_details(matching_methods, rl_weight)?;
 
-                    if edge_weight > 0.0 { // Only create edges with some weight
+                    if edge_weight > 0.0 {
+                        // Only create edges with some weight
                         edges_to_insert.push(ServiceEdgeData {
                             service_group_cluster_id: cluster_id.0.clone(),
                             service_id_1: source_id.0.clone(),
@@ -317,8 +317,7 @@ async fn fetch_service_clusters(
 ) -> Result<Vec<ServiceGroupClusterRecord>> {
     // Order by service_count descending to potentially process larger clusters first
     // This can sometimes help with load balancing if larger clusters take longer.
-    let query =
-        "SELECT id, name, service_count, average_coherence_score 
+    let query = "SELECT id, name, service_count, average_coherence_score 
          FROM public.service_group_cluster
          ORDER BY service_count DESC NULLS LAST"; // Ensure consistent ordering
 
@@ -368,7 +367,10 @@ async fn fetch_services_in_cluster(
         let service_id_str: String = row.get("service_id");
         // Basic validation: ensure service_id is not empty
         if service_id_str.trim().is_empty() {
-            warn!("Fetched empty service_id string for cluster {}, skipping.", cluster_id.0);
+            warn!(
+                "Fetched empty service_id string for cluster {}, skipping.",
+                cluster_id.0
+            );
             continue;
         }
         services.push(ServiceId(service_id_str));
@@ -431,7 +433,6 @@ async fn fetch_all_matching_methods_for_service_cluster(
     Ok(methods_map)
 }
 
-
 /// Determine the proper weighting between RL and pre-RL confidence scores
 /// based on historical human feedback for services
 async fn get_service_rl_weight_from_feedback(client: &impl GenericClient) -> Result<f64> {
@@ -461,13 +462,19 @@ async fn get_service_rl_weight_from_feedback(client: &impl GenericClient) -> Res
                 Ok(0.6) // Balanced default
             }
         }
-        Ok(None) => { // Query returned no rows (e.g. table is empty)
-            debug!("No human feedback for services found (empty table), using default RL weight 0.6");
+        Ok(None) => {
+            // Query returned no rows (e.g. table is empty)
+            debug!(
+                "No human feedback for services found (empty table), using default RL weight 0.6"
+            );
             Ok(0.6)
         }
         Err(e) => {
             // Table might not exist or query had an issue
-            warn!("Could not query service human feedback (error: {}), using default RL weight 0.6", e);
+            warn!(
+                "Could not query service human feedback (error: {}), using default RL weight 0.6",
+                e
+            );
             Ok(0.6) // Balanced default, but log the error
         }
     }
@@ -596,7 +603,10 @@ async fn insert_service_edge_chunk(
 }
 
 /// Checks if service visualization edges already exist for a given pipeline run ID.
-pub async fn service_visualization_edges_exist(pool: &PgPool, pipeline_run_id: &str) -> Result<bool> {
+pub async fn service_visualization_edges_exist(
+    pool: &PgPool,
+    pipeline_run_id: &str,
+) -> Result<bool> {
     let client = pool.get().await.context("Failed to get DB connection")?;
     let row = client
         .query_one(
@@ -609,4 +619,3 @@ pub async fn service_visualization_edges_exist(pool: &PgPool, pipeline_run_id: &
     let count: i64 = row.get(0);
     Ok(count > 0)
 }
-

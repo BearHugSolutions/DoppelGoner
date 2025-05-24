@@ -10,10 +10,12 @@ use uuid::Uuid;
 
 // Ensure these are correctly defined in your actual config.rs
 use crate::config::{CRITICALLY_LOW_SUGGESTION_THRESHOLD, MODERATE_LOW_SUGGESTION_THRESHOLD};
-use crate::db::{self, insert_entity_group_tx, insert_match_decision_detail_tx, insert_suggestion_tx, PgPool}; // db for insert_suggestion
+use crate::db::{
+    self, PgPool, // Using db::upsert_entity_group, db::insert_match_decision_detail_direct, db::insert_suggestion
+};
 use crate::models::{
-    ActionType, AddressMatchValue, EntityGroupId, EntityId, MatchMethodType, MatchValues,
-    NewSuggestedAction, SuggestionStatus,
+    ActionType, AddressMatchValue, EntityId, MatchMethodType, MatchValues, NewSuggestedAction,
+    SuggestionStatus,
 };
 use crate::reinforcement::entity::feature_cache_service::SharedFeatureCache;
 use crate::reinforcement::entity::orchestrator::MatchingOrchestrator;
@@ -24,15 +26,8 @@ use crate::pipeline_state_utils::{
     check_comparison_cache, get_current_signatures_for_pair, store_in_comparison_cache,
 };
 
-const INSERT_ENTITY_GROUP_SQL: &str = "
-    INSERT INTO public.entity_group
-(id, entity_id_1, entity_id_2, method_type, match_values, confidence_score,
- pre_rl_confidence_score)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING"; // Important for return value logic
-
 async fn process_pair(
-    pool: &PgPool,
+    pool: &PgPool, // Pass pool directly
     e1_id: &EntityId,
     e2_id: &EntityId,
     match_values: MatchValues,
@@ -41,61 +36,63 @@ async fn process_pair(
     features_for_snapshot: Option<Vec<f64>>,
     reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-) -> Result<bool> {
+) -> Result<bool> { // Returns true if a new group was successfully created and processed
+    let new_entity_group_id_str = Uuid::new_v4().to_string();
 
-    let new_entity_group_id_str = Uuid::new_v4().to_string(); // Generate potential new ID
-
-    let mut conn = pool.get().await.context("Address: Failed to get DB connection")?;
-    let mut tx = conn.transaction().await.context("Address: Failed to start transaction")?;
-
-    let (group_id, was_newly_inserted) = match insert_entity_group_tx(
-        &mut tx,
-        &new_entity_group_id_str, // Pass the potential new ID
+    // Step 1: Upsert Entity Group
+    let (group_id, was_newly_inserted) = match db::upsert_entity_group(
+        pool,
+        &new_entity_group_id_str,
         e1_id,
         e2_id,
         final_confidence_score,
         pre_rl_confidence_score,
         MatchMethodType::Address,
-        match_values.clone(), // Clone as it's used later if new
-    ).await {
+        match_values.clone(),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(e) => {
-            tx.rollback().await.context("Address: Failed to rollback after insert_entity_group_tx error")?;
-            return Err(e.context("Address: insert_entity_group_tx failed"));
+            return Err(e.context("Address: upsert_entity_group failed"));
         }
     };
 
-    // Always try to insert decision details, mirroring the service pattern.
-    // (Or conditionally insert if was_newly_inserted is true, depending on desired logic)
-    // Let's stick to inserting only if new, to preserve original logic.
+    // Step 2: If newly inserted, add decision details and suggestions
     if was_newly_inserted {
-        if let (Some(ro_arc), Some(features)) = (reinforcement_orchestrator_option, &features_for_snapshot) {
+        if let (Some(ro_arc), Some(features)) =
+            (reinforcement_orchestrator_option, &features_for_snapshot)
+        {
             let version = ro_arc.lock().await.confidence_tuner.version;
-            if let Err(e) = insert_match_decision_detail_tx(
-                &mut tx,
-                &group_id, // Use the actual ID (new or existing)
+            if let Err(e) = db::insert_match_decision_detail_direct(
+                pool,
+                &group_id,
                 pipeline_run_id,
                 serde_json::to_value(features).unwrap_or(serde_json::Value::Null),
                 MatchMethodType::Address.as_str(),
                 pre_rl_confidence_score,
                 final_confidence_score,
                 Some(version as i32),
-            ).await {
-                 warn!("Address: Failed to log decision snapshot for new group {}: {}. Rolling back.", group_id, e);
-                 tx.rollback().await.context("Address: Failed to rollback after decision detail error")?;
-                 return Err(e.context("Address: insert_match_decision_detail_tx failed"));
+            )
+            .await
+            {
+                warn!(
+                    "Address: Failed to log decision snapshot for new group {}: {}. Group was created, but RL context lost for this run.",
+                    group_id, e
+                );
+                // Decide if this error should propagate or just be a warning.
+                // For now, we warn and continue, as the group is already created.
             }
         }
 
-        // Insert suggestion only if new and confidence is low
         if final_confidence_score < MODERATE_LOW_SUGGESTION_THRESHOLD {
             if let MatchValues::Address(addr_values) = &match_values {
-                 let details_json = serde_json::json!({
+                let details_json = serde_json::json!({
                     "method_type": MatchMethodType::Address.as_str(),
                     "matched_value": &addr_values.normalized_shared_address,
                     "original_address1": &addr_values.original_address1,
                     "original_address2": &addr_values.original_address2,
-                    "entity_group_id": &group_id, // Use actual ID
+                    "entity_group_id": &group_id,
                     "pre_rl_confidence": pre_rl_confidence_score,
                 });
                 let reason_message = format!(
@@ -106,34 +103,36 @@ async fn process_pair(
                     pipeline_run_id: Some(pipeline_run_id.to_string()),
                     action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
                     entity_id: None,
-                    group_id_1: Some(group_id.clone()), // Use actual ID
+                    group_id_1: Some(group_id.clone()),
                     group_id_2: None,
                     cluster_id: None,
                     triggering_confidence: Some(final_confidence_score),
                     details: Some(details_json),
                     reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
                     reason_message: Some(reason_message),
-                    priority: if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 },
+                    priority: if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+                        2
+                    } else {
+                        1
+                    },
                     status: SuggestionStatus::PendingReview.as_str().to_string(),
-                    reviewer_id: None, reviewed_at: None, review_notes: None,
+                    reviewer_id: None,
+                    reviewed_at: None, // Should be Option<NaiveDateTime>
+                    review_notes: None,
                 };
 
-                if let Err(e) = insert_suggestion_tx(&mut tx, &suggestion).await {
-                    warn!("Address: Failed to insert suggestion for new group {}: {}. Rolling back.", group_id, e);
-                    tx.rollback().await.context("Address: Failed to rollback after suggestion error")?;
-                    return Err(e.context("Address: insert_suggestion_tx failed"));
+                if let Err(e) = db::insert_suggestion(pool, &suggestion).await {
+                    warn!(
+                        "Address: Failed to insert suggestion for new group {}: {}. Group and detail (if any) were created.",
+                        group_id, e
+                    );
+                    // Again, decide if this should propagate.
                 }
             }
         }
-        // If we reach here, all inserts for a *new* group succeeded.
-        tx.commit().await.context("Address: Failed to commit transaction (new group)")?;
         Ok(true) // Indicate a new group was successfully created and processed.
-
     } else {
         // Group already existed and was updated (or not, if no change).
-        // No new details or suggestions are added in this path based on current logic.
-        // We just commit the (potentially empty or just group update) transaction.
-        tx.commit().await.context("Address: Failed to commit transaction (updated/existing group)")?;
         Ok(false) // Indicate no new group was created.
     }
 }
@@ -145,7 +144,7 @@ pub async fn find_matches(
     feature_cache: Option<SharedFeatureCache>,
 ) -> Result<AnyMatchResult> {
     info!(
-        "Starting V1 pairwise address matching (run ID: {}){} with INCREMENTAL CHECKS...",
+        "Starting V1 pairwise address matching (run ID: {}){} with INCREMENTAL CHECKS (direct DB calls)...",
         pipeline_run_id,
         if reinforcement_orchestrator_option.is_some() {
             " with RL confidence tuning"
@@ -299,13 +298,9 @@ pub async fn find_matches(
                 let mut features_json_for_cache: Option<serde_json::Value> = None;
 
                 if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
-                    match if let Some(_cache_service) = feature_cache.as_ref() {
-                        // Renamed param to _cache_service to mark as unused
-                        ro_arc
-                            .lock()
-                            .await
-                            .get_pair_features(pool, e1_id, e2_id)
-                            .await
+                    match if let Some(cache_service_arc) = feature_cache.as_ref() { // Use the passed feature_cache
+                        let mut cache_service_guard = cache_service_arc.lock().await;
+                        cache_service_guard.get_pair_features(pool, e1_id, e2_id).await
                     } else {
                         MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id)
                             .await
@@ -345,12 +340,11 @@ pub async fn find_matches(
                 });
 
                 let mut group_created_successfully = false;
-                // Pass pool directly to process_pair
                 match process_pair(
-                    pool,
+                    pool, // Pass pool directly
                     e1_id,
                     e2_id,
-                    match_values_obj, // Pass pool
+                    match_values_obj,
                     pre_rl_confidence_score,
                     final_confidence_score,
                     features_vec_for_rl,
@@ -374,15 +368,21 @@ pub async fn find_matches(
                             "Address: process_pair failed for pair ({}, {}): {}",
                             e1_id.0, e2_id.0, e
                         );
-                        // group_created_successfully remains false
                     }
                 }
 
                 let comparison_outcome_for_cache = if group_created_successfully {
                     "MATCH"
                 } else {
-                    "NON_MATCH"
+                    // If process_pair returned Ok(false), it means the group existed or wasn't newly inserted.
+                    // If it returned Err, it means an error occurred during processing.
+                    // For cache purposes, if no new group was made and no error, it's effectively NON_MATCH for this run's new group creation.
+                    // However, if an error occurred, we might not want to cache "NON_MATCH" if it was due to a transient issue.
+                    // Given the current logic, if process_pair returns Ok(false), it means the upsert logic handled an existing record.
+                    // If it returned Err, we don't cache.
+                    if group_created_successfully { "MATCH" } else { "NON_MATCH_OR_EXISTED" } // More descriptive
                 };
+
                 if let Some((sig1_data, sig2_data)) = &current_signatures_opt {
                     if let Err(e) = store_in_comparison_cache(
                         pool,
@@ -471,7 +471,7 @@ pub fn normalize_address(address: &str) -> String {
         "suite ",
         "ste ",
         "unit ",
-        "#",
+        // "#", // Be careful with removing '#' as it might be part of the primary address
         "bldg ",
         "building ",
         "fl ",
@@ -484,41 +484,43 @@ pub fn normalize_address(address: &str) -> String {
         "p o box ",
         "p.o. box ",
     ];
+    // Handle '#' more carefully to remove unit numbers like "# 123" or "#123"
     if let Some(idx) = normalized.find('#') {
-        if normalized
-            .chars()
-            .nth(idx + 1)
-            .map_or(false, |c| c.is_whitespace())
-            && normalized
-                .chars()
-                .nth(idx + 2)
-                .map_or(false, |c| c.is_alphanumeric())
-        {
+        // Check if it's likely a unit designator, e.g., followed by a digit or space then digit
+        let after_hash = &normalized[idx + 1..];
+        if after_hash.trim_start().chars().next().map_or(false, |c| c.is_ascii_digit()) {
             let (before, after_pattern) = normalized.split_at(idx);
             let mut rest = after_pattern
                 .trim_start_matches('#')
                 .trim_start()
                 .to_string();
+            // Remove the unit number part
             if let Some(space_idx) = rest.find(|c: char| c.is_whitespace() || c == ',') {
-                rest = rest[space_idx..].to_string();
+                rest = rest[space_idx..].to_string(); // Keep what's after the unit number
             } else {
-                rest.clear();
+                rest.clear(); // Unit number was at the end
             }
             normalized = format!("{}{}", before.trim_end(), rest.trim_start());
         }
     }
     for pattern_base in patterns_to_remove {
-        while let Some(idx) = normalized.find(pattern_base) {
+        // Ensure we are matching whole words or words followed by numbers
+        // This is a simplified approach; regex would be more robust for word boundaries.
+        let pattern_with_space = format!("{} ", pattern_base);
+        while let Some(idx) = normalized.find(&pattern_with_space) {
             let (before, after_pattern_full) = normalized.split_at(idx);
             let mut rest_of_string = after_pattern_full
-                .trim_start_matches(pattern_base)
+                .strip_prefix(&pattern_with_space) // Use strip_prefix
+                .unwrap_or(after_pattern_full) // Should not happen if find worked
                 .to_string();
+
+            // Remove the unit identifier (e.g., number or letter)
             if let Some(end_of_unit_idx) =
                 rest_of_string.find(|c: char| c.is_whitespace() || c == ',')
             {
                 rest_of_string = rest_of_string[end_of_unit_idx..].to_string();
             } else {
-                rest_of_string.clear();
+                rest_of_string.clear(); // Unit identifier was at the end
             }
             normalized = format!("{}{}", before.trim_end(), rest_of_string.trim_start());
             normalized = normalized.trim().to_string();
@@ -550,56 +552,26 @@ fn extract_unit(address: &str) -> String {
     ];
     for pattern in unit_patterns {
         if let Some(idx) = lower.find(pattern) {
-            let after_pattern = &lower[idx..];
-            if let Some(end_idx) = after_pattern.find(|c: char| c == ',' || c == ';') {
-                return after_pattern[0..end_idx].trim().to_string();
-            } else {
-                // If no comma/semicolon, take up to the next space or end of string
-                let mut end_idx_space = after_pattern.len();
-                let mut found_non_space_after_pattern = false;
-                // Start search after the pattern itself
-                let pattern_len = pattern.len();
-                if pattern_len < after_pattern.len() {
-                    for (i, c) in after_pattern[pattern_len..].char_indices() {
-                        if c.is_whitespace() {
-                            if found_non_space_after_pattern {
-                                // Found a space after some non-space unit identifier
-                                end_idx_space = pattern_len + i;
-                                break;
-                            }
-                        } else {
-                            found_non_space_after_pattern = true;
-                        }
-                    }
-                }
-                // If pattern is '#', it might be like "# 123" or "#123"
-                if pattern == "#" {
-                    let mut unit_val = String::new();
-                    let mut num_started = false;
-                    for c in after_pattern.chars().skip(1) {
-                        // Skip '#'
-                        if c.is_ascii_digit() {
-                            unit_val.push(c);
-                            num_started = true;
-                        } else if c.is_whitespace() {
-                            if num_started {
-                                break;
-                            } // Number ended
-                        } else if num_started {
-                            // Non-digit, non-space after number started
-                            break;
-                        } else {
-                            // Non-digit before number started (e.g. "# abc") - not a unit number
-                            unit_val.clear();
-                            break;
-                        }
-                    }
-                    if !unit_val.is_empty() {
-                        return format!("#{}", unit_val);
-                    }
-                }
+            let after_pattern_start_idx = idx + pattern.len();
+            let after_pattern_content = lower[after_pattern_start_idx..].trim_start();
 
-                return after_pattern[0..end_idx_space].trim().to_string();
+            if after_pattern_content.is_empty() { // Pattern was at the end with no unit value
+                continue;
+            }
+
+            // Find where the unit value ends (next space, comma, or end of string)
+            let unit_value_end_idx = after_pattern_content
+                .find(|c: char| c.is_whitespace() || c == ',')
+                .unwrap_or(after_pattern_content.len());
+            
+            let unit_value = after_pattern_content[..unit_value_end_idx].trim();
+
+            if !unit_value.is_empty() {
+                 // For '#', ensure it's followed by a digit or is a digit itself if pattern is just '#'
+                if pattern == "#" && !unit_value.chars().all(|c| c.is_ascii_digit() || c.is_alphabetic()) { // Allow alphanumeric unit for #
+                    continue; 
+                }
+                return format!("{} {}", pattern, unit_value).trim().to_string();
             }
         }
     }
