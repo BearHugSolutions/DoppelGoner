@@ -12,6 +12,7 @@ pub mod results;
 pub mod service_cluster_visualization;
 pub mod service_consolidate_clusters;
 pub mod service_matching;
+pub mod signature;
 pub mod utils;
 
 // Re-export common types for easier access
