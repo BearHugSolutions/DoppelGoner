@@ -103,6 +103,14 @@ name = "calculate_signatures"
 path = "src/bin/calculate_signatures.rs"
 
 [[bin]]
+name = "calculate_entity_signatures"
+path = "src/bin/calculate_entity_signatures.rs"
+
+[[bin]]
+name = "calculate_service_signatures"
+path = "src/bin/calculate_service_signatures.rs"
+
+[[bin]]
 name = "backfill_comparison_cache"
 path = "src/bin/backfill_comparison_cache.rs"
 
