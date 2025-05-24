@@ -7,7 +7,7 @@ use chrono::NaiveDateTime; // For human_feedback table
 use log::{debug, error, info, warn};
 use postgres_types::ToSql;
 use std::time::Duration;
-use tokio_postgres::{Config, GenericClient, NoTls, Row as PgRow};
+use tokio_postgres::{Config, GenericClient, NoTls, Row as PgRow, Transaction};
 use uuid::Uuid;
 
 // Assuming these structs are defined in your main models.rs or a shared location.
@@ -321,181 +321,285 @@ pub async fn get_confidence_for_entity_in_group(
     }
 }
 
-// --- New/Refactored DB Functions for V1 RL System ---
+/// Inserts a service_group record within a transaction.
+/// It checks for existing groups and performs an INSERT or UPDATE.
+pub async fn insert_service_group_tx(
+    transaction: &mut Transaction<'_>, // Accept a mutable transaction
+    id: &str,
+    service_id_1: &ServiceId,
+    service_id_2: &ServiceId,
+    confidence_score: f64,
+    pre_rl_confidence_score: f64,
+    method_type: MatchMethodType,
+    match_values: MatchValues,
+) -> Result<()> {
+    let (s1, s2) = if service_id_1.0 < service_id_2.0 {
+        (service_id_1, service_id_2)
+    } else {
+        (service_id_2, service_id_1)
+    };
 
-/// Inserts a snapshot of the match decision details.
-// Modified insert_match_decision_detail function with retry logic
-pub async fn insert_match_decision_detail(
-    pool: &PgPool,
+    let match_values_json =
+        serde_json::to_value(match_values).context("Failed to serialize match values")?;
+
+    let s1_formatted = format!("{}", s1.0.trim());
+    let s2_formatted = format!("{}", s2.0.trim());
+
+    if s1_formatted.len() != 36 || s2_formatted.len() != 36 {
+        return Err(anyhow::anyhow!(
+            "Invalid service ID format: s1='{}' (len={}), s2='{}' (len={})",
+            s1_formatted, s1_formatted.len(), s2_formatted, s2_formatted.len()
+        ));
+    }
+
+    let existing_row = transaction.query_opt(
+        "SELECT id, confirmed_status FROM public.service_group
+         WHERE service_id_1 = $1 AND service_id_2 = $2 AND method_type = $3",
+        &[&s1_formatted, &s2_formatted, &method_type.clone().as_str()],
+    ).await.context("Failed to check existing service_group within transaction")?;
+
+    if let Some(row) = existing_row {
+        let existing_id: String = row.get("id");
+        let existing_status: String = row.get("confirmed_status");
+
+        let new_status = match existing_status.as_str() {
+            "CONFIRMED" | "REJECTED" => existing_status,
+            _ => "PENDING_REVIEW".to_string(),
+        };
+
+        transaction.execute( // Use transaction client
+            "UPDATE public.service_group
+             SET confidence_score = $1, match_values = $2, pre_rl_confidence_score = $3,
+                 confirmed_status = $4, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $5",
+            &[
+                &confidence_score,
+                &match_values_json,
+                &pre_rl_confidence_score,
+                &new_status,
+                &existing_id,
+            ],
+        ).await.context("Failed to update service_group within transaction")?;
+        debug!("Updated service_group id {} within transaction.", existing_id);
+    } else {
+        transaction.execute( // Use transaction client
+            "INSERT INTO public.service_group
+             (id, service_id_1, service_id_2, confidence_score, method_type, match_values,
+              pre_rl_confidence_score, confirmed_status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING_REVIEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            &[
+                &id,
+                &s1_formatted.as_str(),
+                &s2_formatted.as_str(),
+                &confidence_score.to_string().as_str(),
+                &method_type.as_str(),
+                &match_values_json,
+                &pre_rl_confidence_score,
+            ],
+        ).await.context("Failed to insert service_group within transaction")?;
+        debug!("Inserted service_group id {} within transaction.", id);
+    }
+    Ok(())
+}
+
+/// Inserts a service match decision detail record within a transaction.
+pub async fn insert_service_match_decision_detail<'a>(
+    transaction: &mut Transaction<'a>, // Accept a mutable transaction
+    service_group_id: &str,
+    pipeline_run_id: &str,
+    snapshotted_features: serde_json::Value,
+    method_type_at_decision: &str,
+    pre_rl_confidence_at_decision: f64,
+    tuned_confidence_at_decision: f64,
+    confidence_tuner_version_at_decision: Option<i32>,
+) -> Result<Uuid> {
+    const INSERT_SQL: &str = "
+        INSERT INTO clustering_metadata.service_match_decision_details (
+            service_group_id, pipeline_run_id, snapshotted_features,
+            method_type_at_decision, pre_rl_confidence_at_decision,
+            tuned_confidence_at_decision, confidence_tuner_version_at_decision
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id";
+
+    let row = transaction // Use transaction client
+        .query_one(
+            INSERT_SQL,
+            &[
+                &service_group_id,
+                &pipeline_run_id,
+                &snapshotted_features,
+                &method_type_at_decision,
+                &pre_rl_confidence_at_decision,
+                &tuned_confidence_at_decision,
+                &confidence_tuner_version_at_decision,
+            ],
+        )
+        .await
+        .context("Failed to insert service_match_decision_detail within transaction")?;
+
+    let id_str: String = row.get(0);
+    let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
+    debug!("Inserted service_match_decision_detail id {} for group {} within transaction.", id, service_group_id);
+    Ok(id)
+}
+
+/// Inserts or updates an entity_group record within a transaction.
+/// It checks for existing groups and performs an INSERT or UPDATE.
+/// Returns a tuple: (String: The ID of the group, bool: True if a new group was inserted, false if updated).
+pub async fn insert_entity_group_tx(
+    transaction: &mut Transaction<'_>, // Accept a mutable transaction
+    id: &str,                          // The potential new ID if inserting
+    entity_id_1: &EntityId,
+    entity_id_2: &EntityId,
+    confidence_score: f64,
+    pre_rl_confidence_score: f64,
+    method_type: MatchMethodType,
+    match_values: MatchValues,
+) -> Result<(String, bool)> {
+    // Ensure consistent ordering
+    let (e1, e2) = if entity_id_1.0 < entity_id_2.0 {
+        (entity_id_1, entity_id_2)
+    } else {
+        (entity_id_2, entity_id_1)
+    };
+
+    let match_values_json =
+        serde_json::to_value(match_values).context("Failed to serialize match values for entity_group")?;
+
+    // Check for existing group
+    let existing_row = transaction.query_opt(
+        "SELECT id, confirmed_status FROM public.entity_group
+         WHERE entity_id_1 = $1 AND entity_id_2 = $2 AND method_type = $3",
+        &[&e1.0, &e2.0, &method_type.as_str()],
+    ).await.context("Failed to check existing entity_group within transaction")?;
+
+    if let Some(row) = existing_row {
+        // --- UPDATE existing group ---
+        let existing_id: String = row.get("id");
+        let existing_status: Option<String> = row.get("confirmed_status");
+
+        let new_status = match existing_status.as_deref() {
+            Some("CONFIRMED") | Some("REJECTED") => existing_status.unwrap(), // Keep existing if confirmed/rejected
+            _ => "PENDING_REVIEW".to_string(),                               // Default or update others
+        };
+
+        transaction.execute(
+            "UPDATE public.entity_group
+             SET confidence_score = $1, match_values = $2, pre_rl_confidence_score = $3,
+                 confirmed_status = $4, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $5",
+            &[
+                &confidence_score,
+                &match_values_json,
+                &pre_rl_confidence_score,
+                &new_status,
+                &existing_id,
+            ],
+        ).await.context("Failed to update entity_group within transaction")?;
+        debug!("Updated entity_group id {} within transaction.", existing_id);
+        Ok((existing_id, false)) // Return existing ID and false (not new)
+    } else {
+        // --- INSERT new group ---
+        transaction.execute(
+            "INSERT INTO public.entity_group
+             (id, entity_id_1, entity_id_2, confidence_score, method_type, match_values,
+              pre_rl_confidence_score, confirmed_status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING_REVIEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            &[
+                &id,
+                &e1.0,
+                &e2.0,
+                &confidence_score,
+                &method_type.as_str(),
+                &match_values_json,
+                &pre_rl_confidence_score,
+            ],
+        ).await.context("Failed to insert entity_group within transaction")?;
+        debug!("Inserted entity_group id {} within transaction.", id);
+        Ok((id.to_string(), true)) // Return new ID and true (is new)
+    }
+}
+
+/// Inserts an entity match decision detail record within a transaction.
+pub async fn insert_match_decision_detail_tx<'a>(
+    transaction: &mut Transaction<'a>, // Accept a mutable transaction
     entity_group_id: &str,
     pipeline_run_id: &str,
     snapshotted_features: serde_json::Value,
     method_type_at_decision: &str,
     pre_rl_confidence_at_decision: f64,
     tuned_confidence_at_decision: f64,
-    confidence_tuner_version_at_decision: u32,
+    confidence_tuner_version_at_decision: Option<i32>, // Matches service version type
 ) -> Result<Uuid> {
-    use tokio::time::{sleep, Duration};
+    const INSERT_SQL: &str = "
+        INSERT INTO clustering_metadata.match_decision_details (
+            entity_group_id, pipeline_run_id, snapshotted_features,
+            method_type_at_decision, pre_rl_confidence_at_decision,
+            tuned_confidence_at_decision, confidence_tuner_version_at_decision
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id";
 
-    let mut conn = pool
-        .get()
+    let row = transaction // Use transaction client
+        .query_one(
+            INSERT_SQL,
+            &[
+                &entity_group_id,
+                &pipeline_run_id,
+                &snapshotted_features,
+                &method_type_at_decision,
+                &pre_rl_confidence_at_decision,
+                &tuned_confidence_at_decision,
+                &confidence_tuner_version_at_decision,
+            ],
+        )
         .await
-        .context("Failed to get DB connection for insert_match_decision_detail")?;
+        .context("Failed to insert match_decision_detail within transaction")?;
 
-    // Start a transaction for better error handling
-    let tx = conn
-        .transaction()
+    let id_str: String = row.get(0);
+    let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
+    debug!("Inserted match_decision_detail id {} for group {} within transaction.", id, entity_group_id);
+    Ok(id)
+}
+
+/// Inserts a suggested_action record within a transaction.
+pub async fn insert_suggestion_tx(
+    transaction: &mut Transaction<'_>, // Accept a mutable transaction
+    suggestion: &NewSuggestedAction,
+) -> Result<Uuid> {
+    const INSERT_SUGGESTION_SQL: &str = "
+        INSERT INTO clustering_metadata.suggested_actions (
+            pipeline_run_id, action_type, entity_id, group_id_1, group_id_2, cluster_id,
+            triggering_confidence, details, reason_code, reason_message, priority, status,
+            reviewer_id, reviewed_at, review_notes
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING id";
+    let row = transaction
+        .query_one(
+            INSERT_SUGGESTION_SQL,
+            &[
+                &suggestion.pipeline_run_id,
+                &suggestion.action_type,
+                &suggestion.entity_id,
+                &suggestion.group_id_1,
+                &suggestion.group_id_2,
+                &suggestion.cluster_id,
+                &suggestion.triggering_confidence,
+                &suggestion.details,
+                &suggestion.reason_code,
+                &suggestion.reason_message,
+                &suggestion.priority,
+                &suggestion.status,
+                &suggestion.reviewer_id,
+                &suggestion.reviewed_at,
+                &suggestion.review_notes,
+            ],
+        )
         .await
-        .context("Failed to start transaction for match_decision_detail")?;
+        .context("Failed to insert suggested_action within transaction")?;
 
-    // Verify that the entity_group exists with retry logic
-    let mut retry_count = 0;
-    let max_retries = 8; // Increased from 4 to 8 for more retries
-    let mut entity_exists = false;
-    let mut last_error = None;
-
-    while retry_count <= max_retries {
-        match tx
-            .query(
-                "SELECT COUNT(*) FROM public.entity_group WHERE id = $1",
-                &[&entity_group_id],
-            )
-            .await
-        {
-            Ok(rows) => {
-                if rows.is_empty() {
-                    let _ = tx.rollback().await;
-                    return Err(anyhow::anyhow!(
-                    "Failed to verify entity_group_id {} exists: no rows returned from COUNT query",
-                    entity_group_id
-                ));
-                }
-
-                let count: i64 = rows[0].get(0);
-
-                if count == 0 {
-                    // Entity group doesn't exist, retry after waiting
-                    if retry_count < max_retries {
-                        let wait_time = Duration::from_millis(1000); // Increased from 500ms to 1000ms
-                        info!(
-                            "Entity group with id {} not found, waiting {}s before retry {}/{}...",
-                            entity_group_id,
-                            wait_time.as_secs(),
-                            retry_count + 1,
-                            max_retries
-                        );
-                        sleep(wait_time).await;
-                        retry_count += 1;
-                        continue;
-                    } else {
-                        // Exhausted all retries
-                        let _ = tx.rollback().await;
-                        return Err(anyhow::anyhow!(
-                            "Entity group with id {} does not exist after {} retries",
-                            entity_group_id,
-                            max_retries
-                        ));
-                    }
-                } else if count > 1 {
-                    // Multiple entity groups with the same ID - data integrity issue
-                    warn!(
-                    "Data integrity issue: Found {} entity_groups with ID {}. Proceeding with insertion anyway.",
-                    count, entity_group_id
-                );
-                }
-
-                // If we reach here, entity exists or we're proceeding despite duplicates
-                entity_exists = true;
-                break;
-            }
-            Err(e) => {
-                // Error during verification query
-                last_error = Some(e);
-                if retry_count < max_retries {
-                    let wait_time = Duration::from_secs(2); // Increased from 1s to 2s
-                    warn!(
-                        "Error checking entity group {}, waiting {}s before retry {}/{}...",
-                        entity_group_id,
-                        wait_time.as_secs(),
-                        retry_count + 1,
-                        max_retries
-                    );
-                    sleep(wait_time).await;
-                    retry_count += 1;
-                    continue;
-                } else {
-                    // Exhausted all retries
-                    let _ = tx.rollback().await;
-                    return Err(anyhow::anyhow!(
-                    "Database error while verifying entity_group_id {} exists after {} retries: {}",
-                    entity_group_id,
-                    max_retries,
-                    last_error.unwrap()
-                ));
-                }
-            }
-        }
-    }
-    // Entity group exists or we decided to proceed despite issues
-    if entity_exists {
-        const INSERT_SQL: &str = "
-            INSERT INTO clustering_metadata.match_decision_details (
-                entity_group_id, pipeline_run_id, snapshotted_features,
-                method_type_at_decision, pre_rl_confidence_at_decision,
-                tuned_confidence_at_decision, confidence_tuner_version_at_decision
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id";
-
-        match tx
-            .query_one(
-                INSERT_SQL,
-                &[
-                    &entity_group_id,
-                    &pipeline_run_id,
-                    &snapshotted_features,
-                    &method_type_at_decision,
-                    &pre_rl_confidence_at_decision,
-                    &tuned_confidence_at_decision,
-                    &(confidence_tuner_version_at_decision as i32), // Cast u32 to i32 for DB
-                ],
-            )
-            .await
-        {
-            Ok(row) => {
-                // Commit the transaction
-                tx.commit()
-                    .await
-                    .context("Failed to commit match_decision_detail transaction")?;
-
-                // Get the ID as a string first
-                let id_str: String = row.get(0);
-
-                // Parse the string into a Uuid
-                let id = Uuid::parse_str(&id_str)
-                    .context("Failed to parse returned ID string as UUID")?;
-
-                Ok(id)
-            }
-            Err(e) => {
-                // Rollback the transaction
-                let _rollback_result = tx.rollback().await;
-                Err(anyhow::anyhow!(
-                    "Failed to insert match_decision_detail for entity_group_id {}, method {}: {}",
-                    entity_group_id,
-                    method_type_at_decision,
-                    e
-                ))
-            }
-        }
-    } else {
-        // This branch should never be reached due to the returns in the loop above
-        // But keeping it for logical completeness
-        let _ = tx.rollback().await;
-        Err(anyhow::anyhow!(
-            "Failed to verify entity_group_id {} exists after all retries",
-            entity_group_id
-        ))
-    }
+    let id_str: String = row.get(0);
+    let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
+    Ok(id)
 }
 
 /// Inserts a human feedback record.
