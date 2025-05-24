@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 // Ensure these are correctly defined in your actual config.rs
 use crate::config::{CRITICALLY_LOW_SUGGESTION_THRESHOLD, MODERATE_LOW_SUGGESTION_THRESHOLD};
-use crate::db::{self, PgPool}; // db for insert_suggestion
+use crate::db::{self, insert_entity_group_tx, insert_match_decision_detail_tx, insert_suggestion_tx, PgPool}; // db for insert_suggestion
 use crate::models::{
     ActionType, AddressMatchValue, EntityGroupId, EntityId, MatchMethodType, MatchValues,
     NewSuggestedAction, SuggestionStatus,
@@ -31,9 +31,8 @@ const INSERT_ENTITY_GROUP_SQL: &str = "
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING"; // Important for return value logic
 
-// Modified process_pair to return Result<bool> indicating if a new group was created
 async fn process_pair(
-    pool: &PgPool, // Changed to take pool directly
+    pool: &PgPool,
     e1_id: &EntityId,
     e2_id: &EntityId,
     match_values: MatchValues,
@@ -42,71 +41,61 @@ async fn process_pair(
     features_for_snapshot: Option<Vec<f64>>,
     reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    _feature_cache: Option<SharedFeatureCache>, // Keep if orchestrator might use it internally, else mark unused
 ) -> Result<bool> {
-    // Returns true if a new group was created
-    let mut conn = pool
-        .get()
-        .await
-        .context("Address: Failed to get DB connection for process_pair")?;
-    let tx = conn
-        .transaction()
-        .await
-        .context("Address: Failed to start transaction for process_pair")?;
 
-    let new_entity_group_id_val = EntityGroupId(Uuid::new_v4().to_string());
-    let match_values_json = serde_json::to_value(&match_values)?;
+    let new_entity_group_id_str = Uuid::new_v4().to_string(); // Generate potential new ID
 
-    let rows_affected = tx
-        .execute(
-            INSERT_ENTITY_GROUP_SQL,
-            &[
-                &new_entity_group_id_val.0,
-                &e1_id.0,
-                &e2_id.0,
-                &MatchMethodType::Address.as_str(),
-                &match_values_json,
-                &final_confidence_score,
-                &pre_rl_confidence_score,
-            ],
-        )
-        .await
-        .context("Address: Failed to execute insert entity group")?;
+    let mut conn = pool.get().await.context("Address: Failed to get DB connection")?;
+    let mut tx = conn.transaction().await.context("Address: Failed to start transaction")?;
 
-    if rows_affected > 0 {
-        // Only log decision details and suggestions if a new group was actually inserted
-        if let (Some(ro_arc), Some(features)) =
-            (reinforcement_orchestrator_option, &features_for_snapshot)
-        {
-            // Using `db::insert_match_decision_detail` which manages its own connection/transaction
-            if let Err(e) = db::insert_match_decision_detail(
-                pool, // Pass pool here
-                &new_entity_group_id_val.0,
+    let (group_id, was_newly_inserted) = match insert_entity_group_tx(
+        &mut tx,
+        &new_entity_group_id_str, // Pass the potential new ID
+        e1_id,
+        e2_id,
+        final_confidence_score,
+        pre_rl_confidence_score,
+        MatchMethodType::Address,
+        match_values.clone(), // Clone as it's used later if new
+    ).await {
+        Ok(result) => result,
+        Err(e) => {
+            tx.rollback().await.context("Address: Failed to rollback after insert_entity_group_tx error")?;
+            return Err(e.context("Address: insert_entity_group_tx failed"));
+        }
+    };
+
+    // Always try to insert decision details, mirroring the service pattern.
+    // (Or conditionally insert if was_newly_inserted is true, depending on desired logic)
+    // Let's stick to inserting only if new, to preserve original logic.
+    if was_newly_inserted {
+        if let (Some(ro_arc), Some(features)) = (reinforcement_orchestrator_option, &features_for_snapshot) {
+            let version = ro_arc.lock().await.confidence_tuner.version;
+            if let Err(e) = insert_match_decision_detail_tx(
+                &mut tx,
+                &group_id, // Use the actual ID (new or existing)
                 pipeline_run_id,
-                serde_json::to_value(features).unwrap_or(serde_json::Value::Null), // Convert features to Value
+                serde_json::to_value(features).unwrap_or(serde_json::Value::Null),
                 MatchMethodType::Address.as_str(),
                 pre_rl_confidence_score,
                 final_confidence_score,
-                ro_arc.lock().await.confidence_tuner.version, // Access tuner version
-            )
-            .await
-            {
-                warn!(
-                    "Address: Failed to log decision snapshot for new group {}: {}",
-                    new_entity_group_id_val.0, e
-                );
-                // Decide if this error should cause the whole transaction to rollback
+                Some(version as i32),
+            ).await {
+                 warn!("Address: Failed to log decision snapshot for new group {}: {}. Rolling back.", group_id, e);
+                 tx.rollback().await.context("Address: Failed to rollback after decision detail error")?;
+                 return Err(e.context("Address: insert_match_decision_detail_tx failed"));
             }
         }
 
+        // Insert suggestion only if new and confidence is low
         if final_confidence_score < MODERATE_LOW_SUGGESTION_THRESHOLD {
             if let MatchValues::Address(addr_values) = &match_values {
-                let details_json = serde_json::json!({
+                 let details_json = serde_json::json!({
                     "method_type": MatchMethodType::Address.as_str(),
                     "matched_value": &addr_values.normalized_shared_address,
                     "original_address1": &addr_values.original_address1,
                     "original_address2": &addr_values.original_address2,
-                    "entity_group_id": &new_entity_group_id_val.0,
+                    "entity_group_id": &group_id, // Use actual ID
                     "pre_rl_confidence": pre_rl_confidence_score,
                 });
                 let reason_message = format!(
@@ -117,44 +106,35 @@ async fn process_pair(
                     pipeline_run_id: Some(pipeline_run_id.to_string()),
                     action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
                     entity_id: None,
-                    group_id_1: Some(new_entity_group_id_val.0.clone()),
+                    group_id_1: Some(group_id.clone()), // Use actual ID
                     group_id_2: None,
                     cluster_id: None,
                     triggering_confidence: Some(final_confidence_score),
                     details: Some(details_json),
                     reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
                     reason_message: Some(reason_message),
-                    priority: if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD {
-                        2
-                    } else {
-                        1
-                    },
+                    priority: if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 },
                     status: SuggestionStatus::PendingReview.as_str().to_string(),
-                    reviewer_id: None,
-                    reviewed_at: None,
-                    review_notes: None,
+                    reviewer_id: None, reviewed_at: None, review_notes: None,
                 };
-                // Call db::insert_suggestion with the pool, as it manages its own transaction.
-                if let Err(e) = db::insert_suggestion(pool, &suggestion).await {
-                    // Pass pool here
-                    warn!(
-                        "Address: Failed to insert suggestion for new group {}: {}",
-                        new_entity_group_id_val.0, e
-                    );
-                    // Decide if this error should cause rollback
+
+                if let Err(e) = insert_suggestion_tx(&mut tx, &suggestion).await {
+                    warn!("Address: Failed to insert suggestion for new group {}: {}. Rolling back.", group_id, e);
+                    tx.rollback().await.context("Address: Failed to rollback after suggestion error")?;
+                    return Err(e.context("Address: insert_suggestion_tx failed"));
                 }
             }
         }
-        tx.commit()
-            .await
-            .context("Address: Failed to commit transaction (group created)")?;
-        Ok(true)
+        // If we reach here, all inserts for a *new* group succeeded.
+        tx.commit().await.context("Address: Failed to commit transaction (new group)")?;
+        Ok(true) // Indicate a new group was successfully created and processed.
+
     } else {
-        // No new group created (e.g., due to ON CONFLICT DO NOTHING), commit the (potentially empty) transaction.
-        tx.commit()
-            .await
-            .context("Address: Failed to commit transaction (no new group created)")?;
-        Ok(false)
+        // Group already existed and was updated (or not, if no change).
+        // No new details or suggestions are added in this path based on current logic.
+        // We just commit the (potentially empty or just group update) transaction.
+        tx.commit().await.context("Address: Failed to commit transaction (updated/existing group)")?;
+        Ok(false) // Indicate no new group was created.
     }
 }
 
@@ -376,7 +356,6 @@ pub async fn find_matches(
                     features_vec_for_rl,
                     reinforcement_orchestrator_option.as_ref(),
                     pipeline_run_id,
-                    feature_cache.clone(),
                 )
                 .await
                 {

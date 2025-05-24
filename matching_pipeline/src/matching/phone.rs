@@ -8,8 +8,8 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::config;
-use crate::db::PgPool;
+use crate::config::{self, CRITICALLY_LOW_SUGGESTION_THRESHOLD, MODERATE_LOW_SUGGESTION_THRESHOLD};
+use crate::db::{insert_entity_group_tx, insert_match_decision_detail_tx, insert_suggestion_tx, PgPool};
 use crate::models::{
     ActionType, EntityGroupId, EntityId, MatchMethodType, MatchValues, NewSuggestedAction,
     PhoneMatchValue, SuggestionStatus,
@@ -349,179 +349,109 @@ pub async fn find_matches(
 
 /// Creates an entity group entry, logs decision, and adds suggestions if needed.
 /// Ensures entity_id_1 < entity_id_2 in the database.
-#[allow(clippy::too_many_arguments)] // To match existing structure
+#[allow(clippy::too_many_arguments)]
 async fn create_entity_group_entry(
     pool: &PgPool,
-    // These are expected to be pre-ordered by the caller (find_matches)
-    // but the function will re-verify and adjust MatchValues if necessary.
-    entity_id_1_param: &EntityId,
-    entity_id_2_param: &EntityId,
-    match_values_param: &MatchValues, // MatchValues corresponding to (entity_id_1_param, entity_id_2_param)
+    entity_id_1: &EntityId,
+    entity_id_2: &EntityId,
+    match_values: &MatchValues,
     final_confidence_score: f64,
     pre_rl_confidence_score: f64,
-    reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>, // Changed to Option<&Arc<Mutex<...>>>
+    reinforcement_orchestrator_option: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
-    normalized_shared_phone_for_suggestion: &str, // For suggestion details
-    features_for_rl_snapshot: Option<Vec<f64>>,   // Option<Vec<f64>>
-                                                  // _feature_cache: Option<SharedFeatureCache>, // Removed as it was unused and created a lint warning
+    normalized_shared_phone_for_suggestion: &str,
+    features_for_rl_snapshot: Option<Vec<f64>>,
 ) -> Result<bool> {
-    // Returns true if a new group was created
-    let mut conn = pool
-        .get()
-        .await
-        .context("Phone: DB conn for entity group")?;
-    let tx = conn
-        .transaction()
-        .await
-        .context("Phone: Start TX for entity group")?;
 
-    let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
+    let new_entity_group_id_str = Uuid::new_v4().to_string();
 
-    // Ensure entity_id_1 < entity_id_2 for DB insertion
-    let (ordered_id_1, ordered_id_2, final_match_values_for_db) =
-        if entity_id_1_param.0 <= entity_id_2_param.0 {
-            (
-                entity_id_1_param,
-                entity_id_2_param,
-                match_values_param.clone(),
-            )
-        } else {
-            // Swap IDs
-            let temp_id1 = entity_id_2_param;
-            let temp_id2 = entity_id_1_param;
-            // Reconstruct MatchValues if it's Phone type to match new order
-            let reordered_mv = if let MatchValues::Phone(ref pv) = match_values_param {
-                MatchValues::Phone(PhoneMatchValue {
-                    original_phone1: pv.original_phone2.clone(), // Swapped
-                    original_phone2: pv.original_phone1.clone(), // Swapped
-                    normalized_shared_phone: pv.normalized_shared_phone.clone(),
-                    extension1: pv.extension2.clone(), // Swapped
-                    extension2: pv.extension1.clone(), // Swapped
-                })
-            } else {
-                match_values_param.clone() // Should not happen for phone
-            };
-            (temp_id1, temp_id2, reordered_mv)
-        };
+    let mut conn = pool.get().await.context("Phone: Failed to get DB connection")?;
+    let mut tx = conn.transaction().await.context("Phone: Failed to start transaction")?;
 
-    let match_values_json = serde_json::to_value(&final_match_values_for_db)
-        .context("Phone: Failed to serialize final_match_values_for_db")?;
+    let (group_id, was_newly_inserted) = match insert_entity_group_tx(
+        &mut tx,
+        &new_entity_group_id_str,
+        entity_id_1,
+        entity_id_2,
+        final_confidence_score,
+        pre_rl_confidence_score,
+        MatchMethodType::Phone,
+        match_values.clone(),
+    ).await {
+        Ok(result) => result,
+        Err(e) => {
+            tx.rollback().await.context("Phone: Failed to rollback after insert_entity_group_tx error")?;
+            return Err(e.context("Phone: insert_entity_group_tx failed"));
+        }
+    };
 
-    let inserted_group_rows = tx
-        .query(
-            INSERT_ENTITY_GROUP_SQL,
-            &[
-                &new_entity_group_id.0,
-                &ordered_id_1.0,
-                &ordered_id_2.0,
-                &MatchMethodType::Phone.as_str(),
-                &match_values_json,
-                &final_confidence_score,
-                &pre_rl_confidence_score,
-            ],
-        )
-        .await
-        .context("Phone: Insert entity_group failed")?;
+    if was_newly_inserted {
+        let mut version: Option<i32> = None;
 
-    if !inserted_group_rows.is_empty() {
-        // Successfully inserted a new group
-        if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-            let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
-                2
-            } else {
-                1
-            };
+        if let (Some(ro_arc), Some(features_vec)) = (reinforcement_orchestrator_option, features_for_rl_snapshot) {
+            let orchestrator_guard = ro_arc.lock().await;
+            version = Some(orchestrator_guard.confidence_tuner.version as i32);
+            let snapshot_features_json = serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
 
-            // Extract original phones and extensions from final_match_values_for_db for suggestion
-            let (sugg_orig_phone1, sugg_orig_phone2, sugg_ext1, sugg_ext2) =
-                if let MatchValues::Phone(ref pv) = final_match_values_for_db {
-                    (
-                        pv.original_phone1.clone(),
-                        pv.original_phone2.clone(),
-                        pv.extension1.clone(),
-                        pv.extension2.clone(),
-                    )
-                } else {
-                    (String::new(), String::new(), None, None)
-                };
+            if let Err(e) = insert_match_decision_detail_tx(
+                &mut tx,
+                &group_id,
+                pipeline_run_id,
+                snapshot_features_json,
+                MatchMethodType::Phone.as_str(),
+                pre_rl_confidence_score,
+                final_confidence_score,
+                version,
+            ).await {
+                warn!("Phone: Failed to log decision snapshot for new group {}: {}. Rolling back.", group_id, e);
+                tx.rollback().await.context("Phone: Failed to rollback after decision detail error")?;
+                return Err(e.context("Phone: insert_match_decision_detail_tx failed"));
+            }
+        }
+
+        if final_confidence_score < MODERATE_LOW_SUGGESTION_THRESHOLD {
+            let priority = if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 };
+            let (p1, p2, e1, e2) = if let MatchValues::Phone(p) = match_values {
+                (p.original_phone1.clone(), p.original_phone2.clone(), p.extension1.clone(), p.extension2.clone())
+            } else { ("".into(), "".into(), None, None) };
 
             let details_json = serde_json::json!({
                 "method_type": MatchMethodType::Phone.as_str(),
                 "matched_value": normalized_shared_phone_for_suggestion,
-                "original_phone1": sugg_orig_phone1,
-                "original_phone2": sugg_orig_phone2,
-                "extension1": sugg_ext1,
-                "extension2": sugg_ext2,
-                "entity_group_id": &new_entity_group_id.0, // Use the ID of the group just inserted
+                "original_phone1": p1, "original_phone2": p2,
+                "extension1": e1, "extension2": e2,
+                "entity_group_id": &group_id,
                 "pre_rl_confidence": pre_rl_confidence_score,
-                "final_confidence": final_confidence_score,
             });
             let reason_message = format!(
                 "Pair ({}, {}) matched by Phone with low tuned confidence ({:.4}). Pre-RL: {:.2}.",
-                ordered_id_1.0, ordered_id_2.0, final_confidence_score, pre_rl_confidence_score
+                entity_id_1.0, entity_id_2.0, final_confidence_score, pre_rl_confidence_score
             );
+
             let suggestion = NewSuggestedAction {
                 pipeline_run_id: Some(pipeline_run_id.to_string()),
                 action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
-                entity_id: None,
-                group_id_1: Some(new_entity_group_id.0.clone()),
-                group_id_2: None,
-                cluster_id: None,
+                entity_id: None, group_id_1: Some(group_id.clone()), group_id_2: None, cluster_id: None,
                 triggering_confidence: Some(final_confidence_score),
-                details: Some(details_json),
-                reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
-                reason_message: Some(reason_message),
-                priority,
+                details: Some(details_json), reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
+                reason_message: Some(reason_message), priority,
                 status: SuggestionStatus::PendingReview.as_str().to_string(),
-                reviewer_id: None,
-                reviewed_at: None,
-                review_notes: None,
+                reviewer_id: None, reviewed_at: None, review_notes: None,
             };
-            // Pass pool directly to db::insert_suggestion, as it manages its own transaction.
-            crate::db::insert_suggestion(&pool, &suggestion)
-                .await
-                .context("Phone: Insert suggestion failed")?;
+
+            if let Err(e) = insert_suggestion_tx(&mut tx, &suggestion).await {
+                 warn!("Phone: Failed to insert suggestion for new group {}: {}. Rolling back.", group_id, e);
+                 tx.rollback().await.context("Phone: Failed to rollback after suggestion error")?;
+                 return Err(e.context("Phone: insert_suggestion_tx failed"));
+            }
         }
 
-        if let (Some(ro_arc), Some(features_vec)) =
-            (reinforcement_orchestrator_option, features_for_rl_snapshot)
-        {
-            let orchestrator_guard = ro_arc.lock().await; // Correctly lock the Arc<Mutex<...>>
-            let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
-            let snapshot_features_json =
-                serde_json::to_value(&features_vec).unwrap_or(serde_json::Value::Null);
-            const INSERT_DECISION_SQL: &str = "
-                INSERT INTO clustering_metadata.match_decision_details (
-                    entity_group_id, pipeline_run_id, snapshotted_features,
-                    method_type_at_decision, pre_rl_confidence_at_decision,
-                    tuned_confidence_at_decision, confidence_tuner_version_at_decision
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)";
-            tx.execute(
-                INSERT_DECISION_SQL,
-                &[
-                    &new_entity_group_id.0,
-                    &pipeline_run_id,
-                    &snapshot_features_json,
-                    &MatchMethodType::Phone.as_str(),
-                    &pre_rl_confidence_score,
-                    &final_confidence_score,
-                    &(confidence_tuner_ver as i32),
-                ],
-            )
-            .await
-            .context("Phone: Log decision snapshot failed")?;
-        }
-        tx.commit()
-            .await
-            .context("Phone: Commit TX for entity group")?;
-        Ok(true) // New group was created
+        tx.commit().await.context("Phone: Failed to commit transaction (new group)")?;
+        Ok(true)
     } else {
-        // No rows affected, means ON CONFLICT DO NOTHING happened or some other issue.
-        tx.rollback()
-            .await
-            .context("Phone: Rollback TX due to no insert")?; // Rollback if no insert
-        debug!("Phone: No new entity group created for pair ({}, {}), likely due to existing conflict.", ordered_id_1.0, ordered_id_2.0);
-        Ok(false) // No new group was created
+        debug!("Phone: Group for pair ({}, {}) already exists or updated (ID: {}). Skipping.", entity_id_1.0, entity_id_2.0, group_id);
+        tx.commit().await.context("Phone: Failed to commit transaction (existing group)")?;
+        Ok(false)
     }
 }
 

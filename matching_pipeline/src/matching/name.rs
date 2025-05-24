@@ -12,10 +12,10 @@ use strsim::jaro_winkler;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::models::{
+use crate::{config::{CRITICALLY_LOW_SUGGESTION_THRESHOLD, MODERATE_LOW_SUGGESTION_THRESHOLD}, db::{insert_entity_group_tx, insert_match_decision_detail_tx, insert_suggestion_tx}, models::{
     ActionType, Entity, EntityGroupId, EntityId, MatchMethodType, MatchValues, NameMatchValue,
     NewSuggestedAction, OrganizationId, SuggestionStatus,
-};
+}};
 use crate::results::{AnyMatchResult, MatchMethodStats, NameMatchResult};
 use crate::utils::cosine_similarity_candle;
 use crate::{
@@ -1631,176 +1631,97 @@ async fn create_entity_group(
     features_for_snapshot: Option<Vec<f64>>,
     _feature_cache: Option<SharedFeatureCache>,
 ) -> Result<bool> {
-    let mut conn = pool
-        .get()
-        .await
-        .context("Name: Failed to get DB connection for entity group creation")?;
-    let tx = conn
-        .transaction()
-        .await
-        .context("Name: Failed to start transaction for entity group creation")?;
 
-    let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
+    let new_entity_group_id_str = Uuid::new_v4().to_string();
 
-    let (ordered_id_1, ordered_id_2, ordered_match_values) =
-        if original_entity_id_1.0 <= original_entity_id_2.0 {
-            (
-                original_entity_id_1,
-                original_entity_id_2,
-                match_values.clone(),
-            )
-        } else {
-            let new_mv = if let MatchValues::Name(name_match) = match_values {
-                MatchValues::Name(NameMatchValue {
-                    original_name1: name_match.original_name2.clone(),
-                    original_name2: name_match.original_name1.clone(),
-                    normalized_name1: name_match.normalized_name2.clone(),
-                    normalized_name2: name_match.normalized_name1.clone(),
-                    pre_rl_match_type: name_match.pre_rl_match_type.clone(),
-                })
-            } else {
-                match_values.clone()
-            };
-            (original_entity_id_2, original_entity_id_1, new_mv)
-        };
+    let mut conn = pool.get().await.context("Name: Failed to get DB connection")?;
+    let mut tx = conn.transaction().await.context("Name: Failed to start transaction")?;
 
-    let match_values_json = serde_json::to_value(&ordered_match_values)
-        .context("Name: Failed to serialize match values")?;
+    let (group_id, was_newly_inserted) = match insert_entity_group_tx(
+        &mut tx,
+        &new_entity_group_id_str,
+        original_entity_id_1,
+        original_entity_id_2,
+        final_confidence_score,
+        pre_rl_confidence_score,
+        MatchMethodType::Name,
+        match_values.clone(),
+    ).await {
+        Ok(result) => result,
+        Err(e) => {
+            tx.rollback().await.context("Name: Failed to rollback after insert_entity_group_tx error")?;
+            return Err(e.context("Name: insert_entity_group_tx failed"));
+        }
+    };
 
-    let rows_affected = tx
-        .execute(
-            INSERT_ENTITY_GROUP_SQL,
-            &[
-                &new_entity_group_id.0,
-                &ordered_id_1.0,
-                &ordered_id_2.0,
-                &MatchMethodType::Name.as_str(),
-                &match_values_json,
-                &final_confidence_score,
-                &pre_rl_confidence_score,
-            ],
-        )
-        .await?;
+    if was_newly_inserted {
+        let mut version: Option<i32> = None;
 
-    if rows_affected > 0 {
-        if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-            let priority = if final_confidence_score < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
-                2
-            } else {
-                1
-            };
+        if let (Some(ro_arc), Some(features_vec)) = (reinforcement_orchestrator, features_for_snapshot.as_ref()) {
+            let orchestrator_guard = ro_arc.lock().await;
+            version = Some(orchestrator_guard.confidence_tuner.version as i32);
+            let snapshot_features_json = serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
 
-            let (
-                sugg_orig_name1,
-                sugg_orig_name2,
-                sugg_norm_name1,
-                sugg_norm_name2,
-                sugg_pre_rl_match_type,
-            ) = if let MatchValues::Name(n) = &ordered_match_values {
-                (
-                    n.original_name1.clone(),
-                    n.original_name2.clone(),
-                    n.normalized_name1.clone(),
-                    n.normalized_name2.clone(),
-                    n.pre_rl_match_type.clone().unwrap_or_default(),
-                )
-            } else {
-                (
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                )
-            };
+            if let Err(e) = insert_match_decision_detail_tx(
+                &mut tx,
+                &group_id,
+                pipeline_run_id,
+                snapshot_features_json,
+                MatchMethodType::Name.as_str(),
+                pre_rl_confidence_score,
+                final_confidence_score,
+                version,
+            ).await {
+                warn!("Name: Failed to log decision snapshot for new group {}: {}. Rolling back.", group_id, e);
+                tx.rollback().await.context("Name: Failed to rollback after decision detail error")?;
+                return Err(e.context("Name: insert_match_decision_detail_tx failed"));
+            }
+        }
+
+        if final_confidence_score < MODERATE_LOW_SUGGESTION_THRESHOLD {
+            let priority = if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 };
+            let (n1, n2, norm1, norm2, m_type) = if let MatchValues::Name(n) = match_values {
+                (n.original_name1.clone(), n.original_name2.clone(), n.normalized_name1.clone(), n.normalized_name2.clone(), n.pre_rl_match_type.clone().unwrap_or_default())
+            } else { ("".into(), "".into(), "".into(), "".into(), "".into()) };
 
             let details_json = serde_json::json!({
                 "method_type": MatchMethodType::Name.as_str(),
-                "original_name1": sugg_orig_name1,
-                "original_name2": sugg_orig_name2,
-                "normalized_name1": sugg_norm_name1,
-                "normalized_name2": sugg_norm_name2,
-                "pre_rl_score": pre_rl_confidence_score,
-                "pre_rl_match_type": sugg_pre_rl_match_type,
-                "entity_group_id": &new_entity_group_id.0,
+                "original_name1": n1, "original_name2": n2,
+                "normalized_name1": norm1, "normalized_name2": norm2,
+                "pre_rl_score": pre_rl_confidence_score, "pre_rl_match_type": m_type,
+                "entity_group_id": &group_id,
             });
             let reason_message = format!(
                 "Pair ({}, {}) matched by Name with low tuned confidence ({:.4}). Pre-RL: {:.2} ({}).",
-                ordered_id_1.0, ordered_id_2.0, final_confidence_score, pre_rl_confidence_score, sugg_pre_rl_match_type
+                original_entity_id_1.0, original_entity_id_2.0, final_confidence_score, pre_rl_confidence_score, m_type
             );
-            const INSERT_SUGGESTION_SQL: &str = "
-                INSERT INTO clustering_metadata.suggested_actions (
-                    pipeline_run_id, action_type, entity_id, group_id_1, group_id_2, cluster_id,
-                    triggering_confidence, details, reason_code, reason_message, priority, status,
-                    reviewer_id, reviewed_at, review_notes
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                RETURNING id";
-            if let Err(e) = tx
-                .query_one(
-                    INSERT_SUGGESTION_SQL,
-                    &[
-                        &Some(pipeline_run_id.to_string()),
-                        &ActionType::ReviewEntityInGroup.as_str(),
-                        &None::<String>,
-                        &Some(new_entity_group_id.0.clone()),
-                        &None::<String>,
-                        &None::<String>,
-                        &Some(final_confidence_score),
-                        &Some(details_json),
-                        &Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
-                        &Some(reason_message),
-                        &(priority as i32),
-                        &SuggestionStatus::PendingReview.as_str(),
-                        &None::<String>,
-                        &None::<NaiveDateTime>,
-                        &None::<String>,
-                    ],
-                )
-                .await
-            {
-                warn!("Name: Failed to create suggestion: {}", e);
+
+            let suggestion = NewSuggestedAction {
+                pipeline_run_id: Some(pipeline_run_id.to_string()),
+                action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
+                entity_id: None, group_id_1: Some(group_id.clone()), group_id_2: None, cluster_id: None,
+                triggering_confidence: Some(final_confidence_score),
+                details: Some(details_json), reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
+                reason_message: Some(reason_message), priority,
+                status: SuggestionStatus::PendingReview.as_str().to_string(),
+                reviewer_id: None, reviewed_at: None, review_notes: None,
+            };
+
+            if let Err(e) = insert_suggestion_tx(&mut tx, &suggestion).await {
+                 warn!("Name: Failed to insert suggestion for new group {}: {}. Rolling back.", group_id, e);
+                 tx.rollback().await.context("Name: Failed to rollback after suggestion error")?;
+                 return Err(e.context("Name: insert_suggestion_tx failed"));
             }
         }
 
-        if let (Some(ro_arc), Some(features_vec)) =
-            (reinforcement_orchestrator, features_for_snapshot.as_ref())
-        {
-            let orchestrator_guard = ro_arc.lock().await;
-            let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
-            let snapshot_features_json =
-                serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
-            const INSERT_DECISION_SQL: &str = "
-                INSERT INTO clustering_metadata.match_decision_details (
-                    entity_group_id, pipeline_run_id, snapshotted_features,
-                    method_type_at_decision, pre_rl_confidence_at_decision,
-                    tuned_confidence_at_decision, confidence_tuner_version_at_decision
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id";
-            if let Err(e) = tx
-                .query_one(
-                    INSERT_DECISION_SQL,
-                    &[
-                        &new_entity_group_id.0,
-                        &pipeline_run_id,
-                        &snapshot_features_json,
-                        &MatchMethodType::Name.as_str(),
-                        &pre_rl_confidence_score,
-                        &final_confidence_score,
-                        &(confidence_tuner_ver as i32),
-                    ],
-                )
-                .await
-            {
-                warn!("Name: Failed to log decision snapshot: {}", e);
-            }
-        }
-        tx.commit().await?;
+        tx.commit().await.context("Name: Failed to commit transaction (new group)")?;
         Ok(true)
     } else {
-        tx.commit().await?;
+        debug!("Name: Group for pair ({}, {}) already exists or updated (ID: {}). Skipping.", original_entity_id_1.0, original_entity_id_2.0, group_id);
+        tx.commit().await.context("Name: Failed to commit transaction (existing group)")?;
         Ok(false)
     }
 }
-
 #[derive(Debug, Clone)]
 struct TokenStats {
     token: String,

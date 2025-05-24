@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::config::{CRITICALLY_LOW_SUGGESTION_THRESHOLD, MODERATE_LOW_SUGGESTION_THRESHOLD};
 // Removed: use crate::config::MIN_CONFIDENCE_FOR_GROUPING_THRESHOLD_STRICT;
 
-use crate::db::{self, PgPool}; // db for insert_suggestion if used
+use crate::db::{self, insert_entity_group_tx, insert_match_decision_detail_tx, insert_suggestion_tx, PgPool}; // db for insert_suggestion if used
 use crate::models::{
     ActionType, EmailMatchValue, EntityGroupId, EntityId, MatchMethodType, MatchValues,
     NewSuggestedAction, SuggestionStatus,
@@ -33,7 +33,6 @@ const INSERT_ENTITY_GROUP_SQL: &str = "
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (entity_id_1, entity_id_2, method_type) DO NOTHING"; // Important for return value logic
 
-// create_entity_group in email.rs already returns Result<bool>
 async fn create_entity_group(
     pool: &PgPool,
     entity_id_1: &EntityId,
@@ -45,75 +44,56 @@ async fn create_entity_group(
     reinforcement_orchestrator: Option<&Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
     normalized_shared_email: &str, // Used in logging and suggestions
-                                   // _feature_cache: Option<SharedFeatureCache>, // Not directly used if features are passed
-) -> Result<bool> {
-    // Returns true if a new group was created
-    let mut conn = pool
-        .get()
-        .await
-        .context("Email: Failed to get DB connection for entity group creation")?;
-    let tx = conn
-        .transaction()
-        .await
-        .context("Email: Failed to start transaction for entity group creation")?;
-    let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
-    let match_values_json =
-        serde_json::to_value(match_values).context("Email: Failed to serialize match values")?;
+) -> Result<bool> { // Returns true if a new group was created and processed
 
-    let rows_affected = tx
-        .execute(
-            INSERT_ENTITY_GROUP_SQL,
-            &[
-                &new_entity_group_id.0,
-                &entity_id_1.0,
-                &entity_id_2.0,
-                &MatchMethodType::Email.as_str(),
-                &match_values_json,
-                &final_confidence_score,
-                &pre_rl_confidence_score,
-            ],
-        )
-        .await
-        .context("Email: Failed to execute insert entity group")?;
+    let new_entity_group_id_str = Uuid::new_v4().to_string();
 
-    if rows_affected > 0 {
+    let mut conn = pool.get().await.context("Email: Failed to get DB connection")?;
+    let mut tx = conn.transaction().await.context("Email: Failed to start transaction")?;
+
+    let (group_id, was_newly_inserted) = match insert_entity_group_tx(
+        &mut tx,
+        &new_entity_group_id_str,
+        entity_id_1,
+        entity_id_2,
+        final_confidence_score,
+        pre_rl_confidence_score,
+        MatchMethodType::Email,
+        match_values.clone(),
+    ).await {
+        Ok(result) => result,
+        Err(e) => {
+            tx.rollback().await.context("Email: Failed to rollback after insert_entity_group_tx error")?;
+            return Err(e.context("Email: insert_entity_group_tx failed"));
+        }
+    };
+
+    if was_newly_inserted {
         info!(
-            "Email: Created group for pair ({}, {}) with shared email '{}', confidence: {:.4}",
-            entity_id_1.0, entity_id_2.0, normalized_shared_email, final_confidence_score
+            "Email: Created group {} for pair ({}, {}) with email '{}', conf: {:.4}",
+            group_id, entity_id_1.0, entity_id_2.0, normalized_shared_email, final_confidence_score
         );
 
-        if let (Some(orch_arc), Some(features_vec)) =
-            (reinforcement_orchestrator, &features_for_snapshot)
-        {
+        let mut version: Option<i32> = None;
+
+        if let (Some(orch_arc), Some(features_vec)) = (reinforcement_orchestrator, &features_for_snapshot) {
             let orchestrator_guard = orch_arc.lock().await;
-            let snapshot_features_json =
-                serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
-            let confidence_tuner_ver = orchestrator_guard.confidence_tuner.version;
-            const INSERT_DECISION_SQL_EMAIL: &str = "
-                INSERT INTO clustering_metadata.match_decision_details (
-                    entity_group_id, pipeline_run_id, snapshotted_features,
-                    method_type_at_decision, pre_rl_confidence_at_decision,
-                    tuned_confidence_at_decision, confidence_tuner_version_at_decision
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id";
-            if let Err(e) = tx
-                .query_one(
-                    INSERT_DECISION_SQL_EMAIL,
-                    &[
-                        &new_entity_group_id.0,
-                        &pipeline_run_id,
-                        &snapshot_features_json,
-                        &MatchMethodType::Email.as_str(),
-                        &pre_rl_confidence_score,
-                        &final_confidence_score,
-                        &(confidence_tuner_ver as i32),
-                    ],
-                )
-                .await
-            {
-                warn!(
-                    "Email: Failed to log decision snapshot for new group {}: {}",
-                    new_entity_group_id.0, e
-                );
+            version = Some(orchestrator_guard.confidence_tuner.version as i32);
+            let snapshot_features_json = serde_json::to_value(features_vec).unwrap_or(serde_json::Value::Null);
+
+            if let Err(e) = insert_match_decision_detail_tx(
+                &mut tx,
+                &group_id,
+                pipeline_run_id,
+                snapshot_features_json,
+                MatchMethodType::Email.as_str(),
+                pre_rl_confidence_score,
+                final_confidence_score,
+                version,
+            ).await {
+                warn!("Email: Failed to log decision snapshot for new group {}: {}. Rolling back.", group_id, e);
+                tx.rollback().await.context("Email: Failed to rollback after decision detail error")?;
+                return Err(e.context("Email: insert_match_decision_detail_tx failed"));
             }
         }
 
@@ -123,7 +103,7 @@ async fn create_entity_group(
                 "matched_value": normalized_shared_email,
                 "original_email1": match match_values { MatchValues::Email(e) => &e.original_email1, _ => "" },
                 "original_email2": match match_values { MatchValues::Email(e) => &e.original_email2, _ => "" },
-                "entity_group_id": &new_entity_group_id.0,
+                "entity_group_id": &group_id,
                 "pre_rl_confidence": pre_rl_confidence_score,
             });
             let reason_message = format!(
@@ -134,50 +114,31 @@ async fn create_entity_group(
                 pipeline_run_id: Some(pipeline_run_id.to_string()),
                 action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
                 entity_id: None,
-                group_id_1: Some(new_entity_group_id.0.clone()),
-                group_id_2: None,
-                cluster_id: None,
+                group_id_1: Some(group_id.clone()),
+                group_id_2: None, cluster_id: None,
                 triggering_confidence: Some(final_confidence_score),
                 details: Some(details_json),
                 reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
                 reason_message: Some(reason_message),
-                priority: if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD {
-                    2
-                } else {
-                    1
-                },
+                priority: if final_confidence_score < CRITICALLY_LOW_SUGGESTION_THRESHOLD { 2 } else { 1 },
                 status: SuggestionStatus::PendingReview.as_str().to_string(),
-                reviewer_id: None,
-                reviewed_at: None,
-                review_notes: None,
+                reviewer_id: None, reviewed_at: None, review_notes: None,
             };
-            // Using direct query as in original email.rs to keep consistency for this part:
-            if let Err(e) = tx.query_one(
-                        "INSERT INTO clustering_metadata.suggested_actions (
-                            pipeline_run_id, action_type, entity_id, group_id_1, group_id_2, cluster_id,
-                            triggering_confidence, details, reason_code, reason_message, priority, status,
-                            reviewer_id, reviewed_at, review_notes
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                        RETURNING id",
-                        &[
-                            &suggestion.pipeline_run_id, &suggestion.action_type, &suggestion.entity_id, &suggestion.group_id_1,
-                            &suggestion.group_id_2, &suggestion.cluster_id, &suggestion.triggering_confidence, &suggestion.details,
-                            &suggestion.reason_code, &suggestion.reason_message, &(suggestion.priority as i32), &suggestion.status,
-                            &suggestion.reviewer_id, &suggestion.reviewed_at, &suggestion.review_notes,
-                        ]
-                    ).await {
-                        warn!("Email: Failed to create suggestion for entity group {}: {}", new_entity_group_id.0, e);
-                    }
+
+            if let Err(e) = insert_suggestion_tx(&mut tx, &suggestion).await {
+                warn!("Email: Failed to insert suggestion for new group {}: {}. Rolling back.", group_id, e);
+                tx.rollback().await.context("Email: Failed to rollback after suggestion error")?;
+                return Err(e.context("Email: insert_suggestion_tx failed"));
+            }
         }
-        tx.commit()
-            .await
-            .context("Email: Failed to commit transaction (group created)")?;
-        Ok(true)
+
+        tx.commit().await.context("Email: Failed to commit transaction (new group)")?;
+        Ok(true) // New group created and processed.
+
     } else {
-        tx.commit()
-            .await
-            .context("Email: Failed to commit transaction (no new group created)")?;
-        Ok(false)
+        debug!("Email: Group for pair ({}, {}) already exists or updated (ID: {}). Skipping details/suggestions.", entity_id_1.0, entity_id_2.0, group_id);
+        tx.commit().await.context("Email: Failed to commit transaction (existing group)")?;
+        Ok(false) // No new group created.
     }
 }
 
