@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::db::{insert_service_group, PgPool};
+use crate::db::{insert_service_group, insert_service_group_tx, insert_service_match_decision_detail, PgPool};
 use crate::models::{EmailMatchValue, MatchMethodType, MatchValues, ServiceId};
 use crate::reinforcement::service::service_feature_cache_service::SharedServiceFeatureCache;
 use crate::reinforcement::service::service_orchestrator::ServiceMatchingOrchestrator;
@@ -37,12 +37,7 @@ pub async fn find_matches_in_cluster(
         ));
     }
 
-    let mut groups_created = 0;
-    let mut confidence_sum = 0.0;
-    let mut distinct_services_processed_count = 0;
-
     let mut email_map: HashMap<String, Vec<(ServiceId, String)>> = HashMap::new();
-
     for (service_id, email) in services_in_cluster {
         let normalized_email = normalize_email(&email);
         if !normalized_email.is_empty() {
@@ -52,17 +47,16 @@ pub async fn find_matches_in_cluster(
                 .push((service_id, email));
         }
     }
-    distinct_services_processed_count = email_map
+    let distinct_services_processed_count = email_map
         .values()
         .flat_map(|v| v.iter().map(|(id, _)| id))
         .collect::<HashSet<_>>()
         .len();
 
-    info!(
-        "Built email map with {} unique normalized emails for cluster_id: {}",
-        email_map.len(),
-        cluster_id
-    );
+
+    let mut groups_created = 0;
+    let mut confidence_sum = 0.0;
+
 
     for (normalized_email, services_with_same_email) in email_map {
         if services_with_same_email.len() < 2 {
@@ -80,7 +74,6 @@ pub async fn find_matches_in_cluster(
 
                 let pre_rl_confidence = 0.95;
 
-                // Extract features once for both tuning and logging
                 let features = if let Some(cache) = &feature_cache {
                     let mut cache_guard = cache.lock().await;
                     cache_guard
@@ -88,23 +81,22 @@ pub async fn find_matches_in_cluster(
                         .await?
                 } else {
                     ServiceMatchingOrchestrator::extract_pair_context_features(
-                        pool,
-                        service1_id,
-                        service2_id,
-                    )
-                    .await?
+                        pool, service1_id, service2_id,
+                    ).await?
                 };
 
-                let tuned_confidence = if let Some(orchestrator_arc) = &service_orchestrator {
+                let (tuned_confidence, version) = if let Some(orchestrator_arc) = &service_orchestrator {
                     let orchestrator = orchestrator_arc.lock().await;
-                    orchestrator.get_tuned_confidence(
-                        &MatchMethodType::ServiceEmailMatch,
-                        pre_rl_confidence,
-                        &features,
-                    )?
+                    let conf = orchestrator.get_tuned_confidence(
+                        &MatchMethodType::ServiceEmailMatch, pre_rl_confidence, &features,
+                    )?;
+                    // Assuming we can get version, or set to None
+                    let ver = Some(orchestrator.confidence_tuner.version as i32); // Example
+                    (conf, ver)
                 } else {
-                    pre_rl_confidence
+                    (pre_rl_confidence, None)
                 };
+
 
                 if tuned_confidence >= 0.85 {
                     let match_values = EmailMatchValue {
@@ -112,53 +104,57 @@ pub async fn find_matches_in_cluster(
                         original_email2: original_email2.clone(),
                         normalized_shared_email: normalized_email.clone(),
                     };
-
-                    // Generate service_group_id BEFORE inserting the group
                     let service_group_id = Uuid::new_v4().to_string();
 
-                    // Attempt to insert the service group
-                    let result = insert_service_group(
-                        pool,
-                        &service_group_id,
-                        service1_id,
-                        service2_id,
-                        tuned_confidence,
-                        pre_rl_confidence,
-                        MatchMethodType::ServiceEmailMatch,
-                        MatchValues::ServiceEmail(match_values),
-                    )
-                    .await;
+                    // --- Transaction Management ---
+                    let mut conn = pool.get().await.context("Failed to get DB connection")?;
+                    let mut transaction = conn.transaction().await.context("Failed to start transaction")?;
 
-                    if result.is_ok() {
-                        groups_created += 1;
-                        confidence_sum += tuned_confidence;
-                        debug!(
-                            "Cluster_id: {}. Created service group for matched emails. ID: {}, s1: {}, s2: {}, confidence: {:.3}",
-                           cluster_id, service_group_id, service1_id.0, service2_id.0, tuned_confidence
-                        );
+                    let result: Result<()> = async {
+                        insert_service_group_tx(
+                            &mut transaction,
+                            &service_group_id,
+                            service1_id,
+                            service2_id,
+                            tuned_confidence,
+                            pre_rl_confidence,
+                            MatchMethodType::ServiceEmailMatch,
+                            MatchValues::ServiceEmail(match_values.clone()), // Clone match_values
+                        ).await?;
 
-                        // Log the decision snapshot ONLY if the service group was successfully inserted
-                        if let Some(orchestrator_arc) = &service_orchestrator {
-                            let orchestrator = orchestrator_arc.lock().await;
-                            let _ = orchestrator
-                                .log_decision_snapshot(
-                                    pool,
-                                    &service_group_id, // Use the SAME ID that was just inserted
-                                    pipeline_run_id,
-                                    &features, // Use the already extracted features
-                                    &MatchMethodType::ServiceEmailMatch,
-                                    pre_rl_confidence,
-                                    tuned_confidence,
-                                )
-                                .await;
+                        insert_service_match_decision_detail(
+                            &mut transaction,
+                            &service_group_id,
+                            pipeline_run_id,
+                            serde_json::to_value(&features).context("Failed to serialize features")?,
+                            MatchMethodType::ServiceEmailMatch.as_str(),
+                            pre_rl_confidence,
+                            tuned_confidence,
+                            version,
+                        ).await?;
+
+                        Ok(())
+                    }.await;
+
+                    match result {
+                        Ok(_) => {
+                            transaction.commit().await.context("Failed to commit transaction")?;
+                            groups_created += 1;
+                            confidence_sum += tuned_confidence;
+                            debug!(
+                                "Cluster_id: {}. Committed service group & decision. ID: {}, s1: {}, s2: {}, conf: {:.3}",
+                                cluster_id, service_group_id, service1_id.0, service2_id.0, tuned_confidence
+                            );
                         }
-                    } else {
-                        warn!(
-                            "Failed to insert service group for email match in cluster {}: {:?}",
-                            cluster_id,
-                            result.err()
-                        );
+                        Err(e) => {
+                            transaction.rollback().await.context("Failed to rollback transaction")?;
+                            warn!(
+                                "Failed transaction for email match in cluster {}: {:?}. Rolled back.",
+                                cluster_id, e
+                            );
+                        }
                     }
+                    // --- End Transaction Management ---
                 }
             }
         }
@@ -178,7 +174,7 @@ pub async fn find_matches_in_cluster(
     let method_stats = MatchMethodStats {
         method_type: MatchMethodType::ServiceEmailMatch,
         groups_created,
-        entities_matched: distinct_services_processed_count,
+        entities_matched: distinct_services_processed_count, // Use the count here
         avg_confidence,
         avg_group_size: 2.0,
     };

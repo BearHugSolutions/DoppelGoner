@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::confidence_tuner::ConfidenceTuner;
 use super::feature_cache_service::SharedFeatureCache;
-use crate::db::{insert_match_decision_detail, PgPool};
+use crate::db::PgPool;
 use crate::models::{EntityId, MatchMethodType};
 use crate::reinforcement::entity::feedback_processor;
 
@@ -117,48 +117,6 @@ impl MatchingOrchestrator {
             tuned_confidence
         );
         Ok(tuned_confidence)
-    }
-
-    /// Logs the details of a match decision (after an entity_group is created).
-    pub async fn log_decision_snapshot(
-        &self,
-        pool: &PgPool,
-        entity_group_id: &str,
-        pipeline_run_id: &str,
-        snapshotted_features: &Vec<f64>,
-        method_type_at_decision: &MatchMethodType,
-        pre_rl_confidence_at_decision: f64,
-        tuned_confidence_at_decision: f64,
-    ) -> Result<()> {
-        let snapshot_features_json =
-            serde_json::to_value(snapshotted_features).unwrap_or(serde_json::Value::Null);
-
-        let confidence_tuner_ver = self.confidence_tuner.version;
-
-        match insert_match_decision_detail(
-            pool,
-            entity_group_id,
-            pipeline_run_id,
-            snapshot_features_json,
-            method_type_at_decision.as_str(),
-            pre_rl_confidence_at_decision,
-            tuned_confidence_at_decision,
-            confidence_tuner_ver,
-        )
-        .await
-        {
-            Ok(_) => {
-                debug!(
-                "Orchestrator: Logged decision snapshot for entity_group_id: {}, method: {}, pre-RL conf: {:.3}, tuned conf: {:.3}, tuner_v: {}",
-                entity_group_id, method_type_at_decision.as_str(), pre_rl_confidence_at_decision, tuned_confidence_at_decision, confidence_tuner_ver
-            );
-            }
-            Err(e) => {
-                warn!("Failed to insert match decision detail: {}. This is non-critical and the pipeline will continue.", e);
-            }
-        }
-
-        Ok(())
     }
 
     /// Saves the ConfidenceTuner model to the database.

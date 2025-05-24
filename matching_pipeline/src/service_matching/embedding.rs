@@ -2,13 +2,13 @@
 
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
-use pgvector::Vector as PgVector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::db::{insert_service_group, PgPool};
+// Import the new transactional DB functions and PgPool
+use crate::db::{insert_service_group_tx, insert_service_match_decision_detail, PgPool};
 use crate::models::{MatchMethodType, MatchValues, ServiceEmbeddingMatchValue, ServiceId};
 use crate::reinforcement::service::service_feature_cache_service::SharedServiceFeatureCache;
 use crate::reinforcement::service::service_orchestrator::ServiceMatchingOrchestrator;
@@ -63,14 +63,13 @@ pub async fn find_matches_in_cluster(
                 continue;
             }
 
-            let similarity =
-                match cosine_similarity_candle(embedding1, embedding2) {
-                    Ok(sim) => sim,
-                    Err(e) => {
-                        warn!("Cluster {}: Failed to calculate cosine similarity between {} and {}: {}", cluster_id, service1_id.0, service2_id.0, e);
-                        continue;
-                    }
-                };
+            let similarity = match cosine_similarity_candle(embedding1, embedding2) {
+                Ok(sim) => sim,
+                Err(e) => {
+                    warn!("Cluster {}: Failed to calculate cosine similarity between {} and {}: {}", cluster_id, service1_id.0, service2_id.0, e);
+                    continue;
+                }
+            };
 
             if similarity < 0.8 {
                 continue;
@@ -78,7 +77,6 @@ pub async fn find_matches_in_cluster(
 
             let pre_rl_confidence = similarity;
 
-            // Extract features once for both tuning and logging
             let features = if let Some(cache) = &feature_cache {
                 let mut cache_guard = cache.lock().await;
                 cache_guard
@@ -86,22 +84,19 @@ pub async fn find_matches_in_cluster(
                     .await?
             } else {
                 ServiceMatchingOrchestrator::extract_pair_context_features(
-                    pool,
-                    service1_id,
-                    service2_id,
-                )
-                .await?
+                    pool, service1_id, service2_id,
+                ).await?
             };
 
-            let tuned_confidence = if let Some(orchestrator_arc) = &service_orchestrator {
+            let (tuned_confidence, version) = if let Some(orchestrator_arc) = &service_orchestrator {
                 let orchestrator = orchestrator_arc.lock().await;
-                orchestrator.get_tuned_confidence(
-                    &MatchMethodType::ServiceEmbeddingSimilarity,
-                    pre_rl_confidence,
-                    &features,
-                )?
+                let conf = orchestrator.get_tuned_confidence(
+                    &MatchMethodType::ServiceEmbeddingSimilarity, pre_rl_confidence, &features,
+                )?;
+                let ver = Some(orchestrator.confidence_tuner.version as i32);
+                (conf, ver)
             } else {
-                pre_rl_confidence
+                (pre_rl_confidence, None)
             };
 
             if tuned_confidence >= 0.85 {
@@ -110,53 +105,57 @@ pub async fn find_matches_in_cluster(
                     name2: name2.clone(),
                     embedding_similarity: similarity,
                 };
-
-                // Generate service_group_id BEFORE inserting the group
                 let service_group_id = Uuid::new_v4().to_string();
 
-                // Attempt to insert the service group
-                let result = insert_service_group(
-                    pool,
-                    &service_group_id,
-                    service1_id,
-                    service2_id,
-                    tuned_confidence,
-                    pre_rl_confidence,
-                    MatchMethodType::ServiceEmbeddingSimilarity,
-                    MatchValues::ServiceEmbedding(match_values),
-                )
-                .await;
+                // --- Transaction Management ---
+                let mut conn = pool.get().await.context("Failed to get DB connection")?;
+                let mut transaction = conn.transaction().await.context("Failed to start transaction")?;
 
-                if result.is_ok() {
-                    groups_created += 1;
-                    confidence_sum += tuned_confidence;
-                    debug!(
-                        "Cluster_id: {}. Created service group for embedding similarity. ID: {}, s1: {}, s2: {}, similarity: {:.3}, confidence: {:.3}",
-                        cluster_id, service_group_id, service1_id.0, service2_id.0, similarity, tuned_confidence
-                    );
+                let result: Result<()> = async {
+                    insert_service_group_tx(
+                        &mut transaction,
+                        &service_group_id,
+                        service1_id,
+                        service2_id,
+                        tuned_confidence,
+                        pre_rl_confidence,
+                        MatchMethodType::ServiceEmbeddingSimilarity,
+                        MatchValues::ServiceEmbedding(match_values.clone()),
+                    ).await?;
 
-                    // Log the decision snapshot ONLY if the service group was successfully inserted
-                    if let Some(orchestrator_arc) = &service_orchestrator {
-                        let orchestrator = orchestrator_arc.lock().await;
-                        let _ = orchestrator
-                            .log_decision_snapshot(
-                                pool,
-                                &service_group_id, // Use the SAME ID that was just inserted
-                                pipeline_run_id,
-                                &features, // Use the already extracted features
-                                &MatchMethodType::ServiceEmbeddingSimilarity,
-                                pre_rl_confidence,
-                                tuned_confidence,
-                            )
-                            .await;
+                    insert_service_match_decision_detail(
+                        &mut transaction,
+                        &service_group_id,
+                        pipeline_run_id,
+                        serde_json::to_value(&features).context("Failed to serialize features")?,
+                        MatchMethodType::ServiceEmbeddingSimilarity.as_str(),
+                        pre_rl_confidence,
+                        tuned_confidence,
+                        version,
+                    ).await?;
+
+                    Ok(())
+                }.await;
+
+                match result {
+                    Ok(_) => {
+                        transaction.commit().await.context("Failed to commit transaction")?;
+                        groups_created += 1;
+                        confidence_sum += tuned_confidence;
+                        debug!(
+                            "Cluster_id: {}. Committed embedding group & decision. ID: {}, s1: {}, s2: {}, sim: {:.3}, conf: {:.3}",
+                            cluster_id, service_group_id, service1_id.0, service2_id.0, similarity, tuned_confidence
+                        );
                     }
-                } else {
-                    warn!(
-                        "Failed to insert service group for embedding match in cluster {}: {:?}",
-                        cluster_id,
-                        result.err()
-                    );
+                    Err(e) => {
+                        transaction.rollback().await.context("Failed to rollback transaction")?;
+                        warn!(
+                            "Failed transaction for embedding match in cluster {}: {:?}. Rolled back.",
+                            cluster_id, e
+                        );
+                    }
                 }
+                // --- End Transaction Management ---
             }
         }
     }
