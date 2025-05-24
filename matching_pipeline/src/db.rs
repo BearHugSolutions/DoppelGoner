@@ -3,44 +3,77 @@
 use anyhow::{Context, Result};
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use chrono::NaiveDateTime; // For human_feedback table
+use chrono::{NaiveDateTime, DateTime, Utc}; // Added DateTime, Utc
 use log::{debug, error, info, warn};
 use postgres_types::ToSql;
+use serde_json::Value as JsonValue; // For snapshotted_features
 use std::time::Duration;
 use tokio_postgres::{Config, GenericClient, NoTls, Row as PgRow, Transaction};
 use uuid::Uuid;
 
-// Assuming these structs are defined in your main models.rs or a shared location.
-// If not, they would need to be defined or imported appropriately.
 use crate::{models::{
     EntityId, MatchValues, NewClusterFormationEdge, NewSuggestedAction, ServiceId
-    // Add other necessary model imports here
 }, MatchMethodType};
-// For RL specific data structures that might be passed to/from these DB functions.
-// We'll define simple structs here for clarity if they aren't part of the main models.
 
 pub type PgPool = Pool<PostgresConnectionManager<NoTls>>;
 
-// Represents a row fetched from clustering_metadata.human_feedback for processing
 #[derive(Debug)]
 pub struct HumanFeedbackDbRecord {
     pub id: String,
     pub entity_group_id: String,
     pub is_match_correct: bool,
-    // Add other fields if needed by the processing logic, e.g., reviewer_id, feedback_timestamp
 }
 
-// Struct for inserting a new human feedback record
-// This would typically be called by the part of your system handling HITL frontend interactions.
 #[derive(Debug)]
 pub struct NewHumanFeedback<'a> {
     pub entity_group_id: &'a str,
     pub reviewer_id: &'a str,
     pub is_match_correct: bool,
     pub notes: Option<&'a str>,
-    match_decision_id: &'a str,
-    // feedback_timestamp is defaulted by DB
+    pub match_decision_id: &'a str, // Corrected: was missing pub
 }
+
+// --- Structs for Service Comparison Cache and Signatures ---
+
+/// Represents a retrieved entry from pipeline_state.service_comparison_cache
+#[derive(Debug, Clone)]
+pub struct ServiceComparisonCacheEntry {
+    pub service_id_1: String,
+    pub service_id_2: String,
+    pub signature_1: String,
+    pub signature_2: String,
+    pub method_type: String,
+    pub pipeline_run_id: Option<String>,
+    pub comparison_result: String, // 'MATCH' or 'NO_MATCH'
+    pub confidence_score: Option<f64>,
+    pub snapshotted_features: Option<JsonValue>,
+    pub cached_at: DateTime<Utc>,
+}
+
+/// Used for inserting a new entry into pipeline_state.service_comparison_cache
+#[derive(Debug, Clone)]
+pub struct NewServiceComparisonCacheEntry<'a> {
+    pub service_id_1: &'a str,
+    pub service_id_2: &'a str,
+    pub signature_1: &'a str,
+    pub signature_2: &'a str,
+    pub method_type: &'a str,
+    pub pipeline_run_id: Option<&'a str>,
+    pub comparison_result: &'a str, // 'MATCH' or 'NO_MATCH'
+    pub confidence_score: Option<f64>,
+    pub snapshotted_features: Option<JsonValue>,
+}
+
+/// Represents a retrieved entry from pipeline_state.service_data_signatures
+#[derive(Debug, Clone)]
+pub struct ServiceDataSignature {
+    pub service_id: String,
+    pub signature: String,
+    pub relevant_attributes_snapshot: Option<JsonValue>,
+    pub source_data_last_updated_at: Option<DateTime<Utc>>,
+    pub signature_calculated_at: DateTime<Utc>,
+}
+
 
 /// Reads environment variables and constructs a PostgreSQL config.
 fn build_pg_config() -> Config {
@@ -76,13 +109,12 @@ pub async fn connect() -> Result<PgPool> {
     let pool = Pool::builder()
         .max_size(60)
         .min_idle(Some(2))
-        .idle_timeout(Some(Duration::from_secs(180))) // e.g., 3 minutes
+        .idle_timeout(Some(Duration::from_secs(180)))
         .connection_timeout(Duration::from_secs(15))
         .build(manager)
         .await
         .context("Failed to build database connection pool")?;
 
-    // Test connection
     let conn = pool
         .get()
         .await
@@ -94,7 +126,6 @@ pub async fn connect() -> Result<PgPool> {
     Ok(pool.clone())
 }
 
-/// Loads environment variables from a .env file.
 pub fn load_env_from_file(file_path: &str) -> Result<()> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -113,9 +144,8 @@ pub fn load_env_from_file(file_path: &str) -> Result<()> {
                 }
                 if let Some(idx) = line.find('=') {
                     let key = line[..idx].trim();
-                    let value = line[idx + 1..].trim().trim_matches('"'); // Trim quotes
+                    let value = line[idx + 1..].trim().trim_matches('"');
                     if std::env::var(key).is_err() {
-                        // Set only if not already set
                         std::env::set_var(key, value);
                         debug!(
                             "Set env var from file: {} = {}",
@@ -136,14 +166,11 @@ pub fn load_env_from_file(file_path: &str) -> Result<()> {
                 "Could not open env file '{}': {}. Proceeding with system environment variables.",
                 file_path, e
             );
-            // Not returning an error, as .env file is optional.
         }
     }
     Ok(())
 }
 
-/// Creates an initial pipeline_run record with default values.
-/// This ensures the pipeline_run record exists before any references are made to it.
 pub async fn create_initial_pipeline_run(
     pool: &PgPool,
     run_id: &str,
@@ -155,8 +182,6 @@ pub async fn create_initial_pipeline_run(
         .await
         .context("Failed to get DB connection for create_initial_pipeline_run")?;
 
-    // Initial record with zero counts and timing
-    // This will be updated at the end of the pipeline
     const INSERT_SQL: &str = "
         INSERT INTO clustering_metadata.pipeline_run (
             id, run_timestamp, description,
@@ -175,7 +200,6 @@ pub async fn create_initial_pipeline_run(
     Ok(())
 }
 
-// Modified to take PgPool directly for independent transaction management
 pub async fn insert_suggestion(pool: &PgPool, suggestion: &NewSuggestedAction) -> Result<Uuid> {
     let mut conn = pool
         .get()
@@ -243,7 +267,6 @@ pub async fn update_suggestion_review(
          SET status = $1, reviewer_id = $2, reviewed_at = CURRENT_TIMESTAMP, review_notes = $3
          WHERE id = $4";
 
-    // Convert UUID to string for the query
     let suggestion_id_str = suggestion_id.to_string();
 
     conn.execute(
@@ -254,7 +277,6 @@ pub async fn update_suggestion_review(
     .context("Failed to update suggested_action review")
 }
 
-// Modified to take PgPool directly for independent transaction management
 pub async fn insert_cluster_formation_edge(
     pool: &PgPool,
     edge: &NewClusterFormationEdge,
@@ -300,7 +322,7 @@ pub async fn insert_cluster_formation_edge(
 
 pub async fn get_confidence_for_entity_in_group(
     conn: &impl GenericClient,
-    _entity_id_to_check: &EntityId, // Parameter not used in the simplified query
+    _entity_id_to_check: &EntityId,
     pair_group_id: &str,
 ) -> Result<Option<f64>> {
     const SELECT_CONFIDENCE_SQL: &str = "
@@ -321,10 +343,8 @@ pub async fn get_confidence_for_entity_in_group(
     }
 }
 
-/// Inserts a service_group record within a transaction.
-/// It checks for existing groups and performs an INSERT or UPDATE.
 pub async fn insert_service_group_tx(
-    transaction: &mut Transaction<'_>, // Accept a mutable transaction
+    transaction: &mut Transaction<'_>,
     id: &str,
     service_id_1: &ServiceId,
     service_id_2: &ServiceId,
@@ -367,7 +387,7 @@ pub async fn insert_service_group_tx(
             _ => "PENDING_REVIEW".to_string(),
         };
 
-        transaction.execute( // Use transaction client
+        transaction.execute(
             "UPDATE public.service_group
              SET confidence_score = $1, match_values = $2, pre_rl_confidence_score = $3,
                  confirmed_status = $4, updated_at = CURRENT_TIMESTAMP
@@ -382,7 +402,7 @@ pub async fn insert_service_group_tx(
         ).await.context("Failed to update service_group within transaction")?;
         debug!("Updated service_group id {} within transaction.", existing_id);
     } else {
-        transaction.execute( // Use transaction client
+        transaction.execute(
             "INSERT INTO public.service_group
              (id, service_id_1, service_id_2, confidence_score, method_type, match_values,
               pre_rl_confidence_score, confirmed_status, created_at, updated_at)
@@ -391,7 +411,7 @@ pub async fn insert_service_group_tx(
                 &id,
                 &s1_formatted.as_str(),
                 &s2_formatted.as_str(),
-                &confidence_score.to_string().as_str(),
+                &confidence_score, // Keep as f64, postgres rust driver handles it
                 &method_type.as_str(),
                 &match_values_json,
                 &pre_rl_confidence_score,
@@ -402,9 +422,8 @@ pub async fn insert_service_group_tx(
     Ok(())
 }
 
-/// Inserts a service match decision detail record within a transaction.
 pub async fn insert_service_match_decision_detail<'a>(
-    transaction: &mut Transaction<'a>, // Accept a mutable transaction
+    transaction: &mut Transaction<'a>,
     service_group_id: &str,
     pipeline_run_id: &str,
     snapshotted_features: serde_json::Value,
@@ -421,7 +440,7 @@ pub async fn insert_service_match_decision_detail<'a>(
         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id";
 
-    let row = transaction // Use transaction client
+    let row = transaction
         .query_one(
             INSERT_SQL,
             &[
@@ -443,12 +462,9 @@ pub async fn insert_service_match_decision_detail<'a>(
     Ok(id)
 }
 
-/// Inserts or updates an entity_group record within a transaction.
-/// It checks for existing groups and performs an INSERT or UPDATE.
-/// Returns a tuple: (String: The ID of the group, bool: True if a new group was inserted, false if updated).
 pub async fn insert_entity_group_tx(
-    transaction: &mut Transaction<'_>, // Accept a mutable transaction
-    id: &str,                          // The potential new ID if inserting
+    transaction: &mut Transaction<'_>,
+    id: &str,
     entity_id_1: &EntityId,
     entity_id_2: &EntityId,
     confidence_score: f64,
@@ -456,7 +472,6 @@ pub async fn insert_entity_group_tx(
     method_type: MatchMethodType,
     match_values: MatchValues,
 ) -> Result<(String, bool)> {
-    // Ensure consistent ordering
     let (e1, e2) = if entity_id_1.0 < entity_id_2.0 {
         (entity_id_1, entity_id_2)
     } else {
@@ -466,7 +481,6 @@ pub async fn insert_entity_group_tx(
     let match_values_json =
         serde_json::to_value(match_values).context("Failed to serialize match values for entity_group")?;
 
-    // Check for existing group
     let existing_row = transaction.query_opt(
         "SELECT id, confirmed_status FROM public.entity_group
          WHERE entity_id_1 = $1 AND entity_id_2 = $2 AND method_type = $3",
@@ -474,13 +488,12 @@ pub async fn insert_entity_group_tx(
     ).await.context("Failed to check existing entity_group within transaction")?;
 
     if let Some(row) = existing_row {
-        // --- UPDATE existing group ---
         let existing_id: String = row.get("id");
         let existing_status: Option<String> = row.get("confirmed_status");
 
         let new_status = match existing_status.as_deref() {
-            Some("CONFIRMED") | Some("REJECTED") => existing_status.unwrap(), // Keep existing if confirmed/rejected
-            _ => "PENDING_REVIEW".to_string(),                               // Default or update others
+            Some("CONFIRMED") | Some("REJECTED") => existing_status.unwrap(),
+            _ => "PENDING_REVIEW".to_string(),
         };
 
         transaction.execute(
@@ -497,9 +510,8 @@ pub async fn insert_entity_group_tx(
             ],
         ).await.context("Failed to update entity_group within transaction")?;
         debug!("Updated entity_group id {} within transaction.", existing_id);
-        Ok((existing_id, false)) // Return existing ID and false (not new)
+        Ok((existing_id, false))
     } else {
-        // --- INSERT new group ---
         transaction.execute(
             "INSERT INTO public.entity_group
              (id, entity_id_1, entity_id_2, confidence_score, method_type, match_values,
@@ -516,20 +528,19 @@ pub async fn insert_entity_group_tx(
             ],
         ).await.context("Failed to insert entity_group within transaction")?;
         debug!("Inserted entity_group id {} within transaction.", id);
-        Ok((id.to_string(), true)) // Return new ID and true (is new)
+        Ok((id.to_string(), true))
     }
 }
 
-/// Inserts an entity match decision detail record within a transaction.
 pub async fn insert_match_decision_detail_tx<'a>(
-    transaction: &mut Transaction<'a>, // Accept a mutable transaction
+    transaction: &mut Transaction<'a>,
     entity_group_id: &str,
     pipeline_run_id: &str,
     snapshotted_features: serde_json::Value,
     method_type_at_decision: &str,
     pre_rl_confidence_at_decision: f64,
     tuned_confidence_at_decision: f64,
-    confidence_tuner_version_at_decision: Option<i32>, // Matches service version type
+    confidence_tuner_version_at_decision: Option<i32>,
 ) -> Result<Uuid> {
     const INSERT_SQL: &str = "
         INSERT INTO clustering_metadata.match_decision_details (
@@ -539,7 +550,7 @@ pub async fn insert_match_decision_detail_tx<'a>(
         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id";
 
-    let row = transaction // Use transaction client
+    let row = transaction
         .query_one(
             INSERT_SQL,
             &[
@@ -561,9 +572,8 @@ pub async fn insert_match_decision_detail_tx<'a>(
     Ok(id)
 }
 
-/// Inserts a suggested_action record within a transaction.
 pub async fn insert_suggestion_tx(
-    transaction: &mut Transaction<'_>, // Accept a mutable transaction
+    transaction: &mut Transaction<'_>,
     suggestion: &NewSuggestedAction,
 ) -> Result<Uuid> {
     const INSERT_SUGGESTION_SQL: &str = "
@@ -602,16 +612,14 @@ pub async fn insert_suggestion_tx(
     Ok(id)
 }
 
-/// Inserts a human feedback record.
-/// This function would typically be called by the backend service handling HITL frontend requests.
 pub async fn insert_human_feedback(
     conn: &impl GenericClient,
     feedback: &NewHumanFeedback<'_>,
 ) -> Result<Uuid> {
     const INSERT_SQL: &str = "
         INSERT INTO clustering_metadata.human_feedback
-            (entity_group_id, reviewer_id, is_match_correct, notes)
-        VALUES ($1, $2, $3, $4)
+            (entity_group_id, reviewer_id, is_match_correct, notes, match_decision_id)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING id";
     let row = conn
         .query_one(
@@ -621,23 +629,19 @@ pub async fn insert_human_feedback(
                 &feedback.reviewer_id,
                 &feedback.is_match_correct,
                 &feedback.notes,
+                &feedback.match_decision_id,
             ],
         )
         .await
         .context("Failed to insert human_feedback")?;
 
-    // Get the ID as a string first
     let id_str: String = row.get(0);
-
-    // Parse the string into a Uuid
     let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
-
     Ok(id)
 }
 
-/// Fetches unprocessed human feedback items for the ConfidenceTuner.
 pub async fn fetch_unprocessed_human_feedback(
-    client: &impl GenericClient, // Can be a direct connection or transaction
+    client: &impl GenericClient,
     batch_size: u32,
 ) -> Result<Vec<HumanFeedbackDbRecord>> {
     let rows = client
@@ -647,7 +651,7 @@ pub async fn fetch_unprocessed_human_feedback(
              WHERE processed_for_tuner_update_at IS NULL
              ORDER BY feedback_timestamp ASC
              LIMIT $1",
-            &[&(batch_size as i64)], // LIMIT expects i64
+            &[&(batch_size as i64)],
         )
         .await
         .context("Failed to fetch unprocessed human feedback items from DB")?;
@@ -668,12 +672,10 @@ pub async fn fetch_unprocessed_human_feedback(
     Ok(items)
 }
 
-/// Marks a human feedback item as processed by the ConfidenceTuner.
 pub async fn mark_human_feedback_as_processed(
     client: &impl GenericClient,
     feedback_id: String,
 ) -> Result<u64> {
-    // Convert UUID to string for the query
     let feedback_id_str = feedback_id.to_string();
 
     let rows_affected = client
@@ -702,8 +704,6 @@ pub async fn mark_human_feedback_as_processed(
     Ok(rows_affected)
 }
 
-/// Batch insert cluster formation edges for better performance
-// Modified to take PgPool directly for independent transaction management
 pub async fn insert_cluster_formation_edges_batch(
     pool: &PgPool,
     edges: &[NewClusterFormationEdge],
@@ -771,8 +771,6 @@ pub async fn insert_cluster_formation_edges_batch(
     Ok(ids)
 }
 
-/// Batch insert suggestions for better performance
-// Modified to take PgPool directly for independent transaction management
 pub async fn insert_suggestions_batch(
     pool: &PgPool,
     suggestions: &[NewSuggestedAction],
@@ -861,7 +859,6 @@ pub async fn insert_suggestions_batch(
     Ok(ids)
 }
 
-// Make this function visible within the service_matching module
 pub async fn insert_service_group(
     pool: &PgPool,
     id: &str,
@@ -876,50 +873,45 @@ pub async fn insert_service_group(
         .get()
         .await
         .context("Failed to get database connection for insert_service_group")?;
-    
+
     let (s1, s2) = if service_id_1.0 < service_id_2.0 {
         (service_id_1, service_id_2)
     } else {
         (service_id_2, service_id_1)
     };
-    
+
     let match_values_json =
         serde_json::to_value(match_values).context("Failed to serialize match values")?;
 
-    // Ensure UUIDs are properly formatted (36 characters)
     let s1_formatted = format!("{}", s1.0.trim());
     let s2_formatted = format!("{}", s2.0.trim());
-    
-    // Validate UUID format
+
     if s1_formatted.len() != 36 || s2_formatted.len() != 36 {
         return Err(anyhow::anyhow!(
-            "Invalid service ID format: s1='{}' (len={}), s2='{}' (len={})", 
+            "Invalid service ID format: s1='{}' (len={}), s2='{}' (len={})",
             s1_formatted, s1_formatted.len(), s2_formatted, s2_formatted.len()
         ));
     }
 
-    // First, check if a group already exists for this service pair and method
     let existing_row = conn.query_opt(
-        "SELECT id, confirmed_status FROM public.service_group 
+        "SELECT id, confirmed_status FROM public.service_group
          WHERE service_id_1 = $1 AND service_id_2 = $2 AND method_type = $3",
         &[&s1_formatted, &s2_formatted, &method_type.as_str()],
     ).await.context("Failed to check existing service_group")?;
 
     if let Some(row) = existing_row {
-        // Update existing record
         let existing_id: String = row.get("id");
         let existing_status: String = row.get("confirmed_status");
-        
-        // Don't override CONFIRMED or REJECTED status
+
         let new_status = match existing_status.as_str() {
             "CONFIRMED" | "REJECTED" => existing_status,
             _ => "PENDING_REVIEW".to_string(),
         };
 
         let update_result = conn.execute(
-            "UPDATE public.service_group 
-             SET confidence_score = $1, 
-                 match_values = $2, 
+            "UPDATE public.service_group
+             SET confidence_score = $1,
+                 match_values = $2,
                  pre_rl_confidence_score = $3,
                  confirmed_status = $4,
                  updated_at = CURRENT_TIMESTAMP
@@ -944,10 +936,9 @@ pub async fn insert_service_group(
             }
         }
     } else {
-        // Insert new record
         let insert_result = conn.execute(
             "INSERT INTO public.service_group
-             (id, service_id_1, service_id_2, confidence_score, method_type, match_values, 
+             (id, service_id_1, service_id_2, confidence_score, method_type, match_values,
               pre_rl_confidence_score, confirmed_status, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING_REVIEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             &[
@@ -974,7 +965,141 @@ pub async fn insert_service_group(
     }
 }
 
-// The old `Workspace_recent_feedback_items` that used `FeedbackItem` and `view_rl_feedback_items`
-// is now replaced by `Workspace_unprocessed_human_feedback` which uses the new tables and a simpler struct.
-// If `FeedbackItem` from `reinforcement::types` is still needed elsewhere, it should be adjusted or
-// the new `HumanFeedbackDataForTuner` should be used.
+
+// --- New functions for Service Comparison Cache and Signatures ---
+
+/// Fetches a specific entry from the service_comparison_cache.
+pub async fn get_service_comparison_cache_entry(
+    pool: &PgPool,
+    service_id_1: &str,
+    service_id_2: &str,
+    signature_1: &str,
+    signature_2: &str,
+    method_type: &str,
+) -> Result<Option<ServiceComparisonCacheEntry>> {
+    let conn = pool.get().await.context("Failed to get DB connection for service comparison cache lookup")?;
+
+    // Ensure canonical order for lookup
+    let (s1, s2, sig1, sig2) = if service_id_1 < service_id_2 {
+        (service_id_1, service_id_2, signature_1, signature_2)
+    } else {
+        (service_id_2, service_id_1, signature_2, signature_1)
+    };
+
+    let row_opt = conn.query_opt(
+        "SELECT service_id_1, service_id_2, signature_1, signature_2, method_type,
+                pipeline_run_id, comparison_result, confidence_score,
+                snapshotted_features, cached_at
+         FROM pipeline_state.service_comparison_cache
+         WHERE service_id_1 = $1 AND service_id_2 = $2
+           AND signature_1 = $3 AND signature_2 = $4
+           AND method_type = $5",
+        &[&s1, &s2, &sig1, &sig2, &method_type],
+    ).await.context("Failed to query service_comparison_cache")?;
+
+    if let Some(row) = row_opt {
+        Ok(Some(ServiceComparisonCacheEntry {
+            service_id_1: row.get("service_id_1"),
+            service_id_2: row.get("service_id_2"),
+            signature_1: row.get("signature_1"),
+            signature_2: row.get("signature_2"),
+            method_type: row.get("method_type"),
+            pipeline_run_id: row.get("pipeline_run_id"),
+            comparison_result: row.get("comparison_result"),
+            confidence_score: row.get("confidence_score"),
+            snapshotted_features: row.get("snapshotted_features"),
+            cached_at: row.get("cached_at"),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Inserts or updates an entry in the service_comparison_cache.
+pub async fn insert_service_comparison_cache_entry(
+    pool: &PgPool,
+    entry: NewServiceComparisonCacheEntry<'_>,
+) -> Result<()> {
+    let conn = pool.get().await.context("Failed to get DB connection for inserting service comparison cache entry")?;
+
+    // Ensure canonical order for storage
+    let (s1, s2, sig1, sig2) = if entry.service_id_1 < entry.service_id_2 {
+        (entry.service_id_1, entry.service_id_2, entry.signature_1, entry.signature_2)
+    } else {
+        (entry.service_id_2, entry.service_id_1, entry.signature_2, entry.signature_1)
+    };
+
+    conn.execute(
+        "INSERT INTO pipeline_state.service_comparison_cache
+         (service_id_1, service_id_2, signature_1, signature_2, method_type,
+          pipeline_run_id, comparison_result, confidence_score, snapshotted_features, cached_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+         ON CONFLICT (service_id_1, service_id_2, signature_1, signature_2, method_type)
+         DO UPDATE SET
+            pipeline_run_id = EXCLUDED.pipeline_run_id,
+            comparison_result = EXCLUDED.comparison_result,
+            confidence_score = EXCLUDED.confidence_score,
+            snapshotted_features = EXCLUDED.snapshotted_features,
+            cached_at = CURRENT_TIMESTAMP",
+        &[
+            &s1, &s2, &sig1, &sig2, &entry.method_type,
+            &entry.pipeline_run_id, &entry.comparison_result, &entry.confidence_score,
+            &entry.snapshotted_features,
+        ],
+    ).await.context("Failed to insert or update service_comparison_cache entry")?;
+    debug!("Inserted/Updated service comparison cache entry for ({}, {}) method {}", s1, s2, entry.method_type);
+    Ok(())
+}
+
+/// Retrieves the signature for a given service ID.
+pub async fn get_service_signature(
+    pool: &PgPool,
+    service_id: &str,
+) -> Result<Option<ServiceDataSignature>> {
+    let conn = pool.get().await.context("Failed to get DB connection for getting service signature")?;
+    let row_opt = conn.query_opt(
+        "SELECT service_id, signature, relevant_attributes_snapshot,
+                source_data_last_updated_at, signature_calculated_at
+         FROM pipeline_state.service_data_signatures
+         WHERE service_id = $1",
+        &[&service_id],
+    ).await.context("Failed to query service_data_signatures")?;
+
+    if let Some(row) = row_opt {
+        Ok(Some(ServiceDataSignature {
+            service_id: row.get("service_id"),
+            signature: row.get("signature"),
+            relevant_attributes_snapshot: row.get("relevant_attributes_snapshot"),
+            source_data_last_updated_at: row.get("source_data_last_updated_at"),
+            signature_calculated_at: row.get("signature_calculated_at"),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Inserts or updates a service signature.
+pub async fn upsert_service_signature(
+    pool: &PgPool,
+    service_id: &str,
+    signature: &str,
+    relevant_attributes_snapshot: Option<JsonValue>,
+    source_data_last_updated_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let conn = pool.get().await.context("Failed to get DB connection for upserting service signature")?;
+    conn.execute(
+        "INSERT INTO pipeline_state.service_data_signatures
+         (service_id, signature, relevant_attributes_snapshot, source_data_last_updated_at, signature_calculated_at)
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+         ON CONFLICT (service_id)
+         DO UPDATE SET
+            signature = EXCLUDED.signature,
+            relevant_attributes_snapshot = EXCLUDED.relevant_attributes_snapshot,
+            source_data_last_updated_at = EXCLUDED.source_data_last_updated_at,
+            signature_calculated_at = CURRENT_TIMESTAMP",
+        &[&service_id, &signature, &relevant_attributes_snapshot, &source_data_last_updated_at],
+    ).await.context("Failed to upsert service_data_signature")?;
+    debug!("Upserted service signature for service_id: {}", service_id);
+    Ok(())
+}
+
