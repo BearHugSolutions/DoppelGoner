@@ -1,7 +1,7 @@
 // src/bin/from_phase4.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::future::try_join_all;
+use futures::future::join_all; // Changed to join_all
 use log::{debug, info, warn};
 use std::{
     collections::HashMap,
@@ -9,7 +9,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, Semaphore}, // Added Semaphore
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 use dedupe_lib::{
@@ -17,7 +20,6 @@ use dedupe_lib::{
     db::{self, PgPool},
     models::{self, *},
     reinforcement::{
-        self,
         entity::{
             feature_cache_service::{create_shared_cache, SharedFeatureCache},
             orchestrator::MatchingOrchestrator,
@@ -33,9 +35,12 @@ use dedupe_lib::{
             service_orchestrator::{self, ServiceMatchingOrchestrator},
         },
     },
-    results::{self, AnyMatchResult, MatchMethodStats, PipelineStats, ServiceMatchResult},
+    results::{self, MatchMethodStats, PipelineStats, ServiceMatchResult},
     service_cluster_visualization, service_consolidate_clusters, service_matching,
 };
+
+// Define the concurrency limit for matching tasks
+const MAX_CONCURRENT_MATCHING_TASKS: usize = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -116,7 +121,7 @@ async fn run_pipeline_from_phase4(
     let current_state = load_pipeline_state(pool).await?;
 
     let mut stats = results::PipelineStats {
-        run_id,
+        run_id, // run_id is moved here
         run_timestamp,
         description: Some("Pipeline run from Phase 4 onwards".to_string()),
 
@@ -151,19 +156,19 @@ async fn run_pipeline_from_phase4(
         stats.total_entities, stats.total_groups
     );
 
-    // Initialize the ML reinforcement orchestrator
-    info!("Initializing ML-guided matching reinforcement orchestrator");
-    let reinforcement_orchestrator_instance = MatchingOrchestrator::new(pool)
+    // Initialize the ML reinforcement orchestrator for entities
+    info!("Initializing ML-guided entity matching reinforcement orchestrator");
+    let entity_reinforcement_orchestrator_instance = MatchingOrchestrator::new(pool)
         .await
-        .context("Failed to initialize ML reinforcement orchestrator")?;
-    let reinforcement_orchestrator = Arc::new(Mutex::new(reinforcement_orchestrator_instance));
+        .context("Failed to initialize entity ML reinforcement orchestrator")?;
+    let entity_reinforcement_orchestrator = Arc::new(Mutex::new(entity_reinforcement_orchestrator_instance));
 
-    // Create and set entity feature cache on the orchestrator
+    // Create and set entity feature cache on the orchestrator (though not used in this partial run directly for matching)
     let entity_feature_cache: SharedFeatureCache = create_shared_cache();
     {
-        let mut orchestrator = reinforcement_orchestrator.lock().await;
+        let mut orchestrator = entity_reinforcement_orchestrator.lock().await;
         orchestrator.set_feature_cache(entity_feature_cache.clone());
-        info!("Entity feature cache attached to RL orchestrator");
+        info!("Entity feature cache attached to entity RL orchestrator (for potential future use in consolidation)");
     }
 
     info!("Starting from Phase 4...");
@@ -172,7 +177,7 @@ async fn run_pipeline_from_phase4(
     info!("Phase 4: Cluster consolidation");
     let phase4_start = Instant::now();
     stats.total_clusters =
-        consolidate_clusters_helper(pool, reinforcement_orchestrator, run_id_clone.clone()).await?;
+        consolidate_clusters_helper(pool, entity_reinforcement_orchestrator, run_id_clone.clone()).await?; // Pass run_id_clone
     let phase4_duration = phase4_start.elapsed();
     phase_times.insert("cluster_consolidation".to_string(), phase4_duration);
     stats.clustering_time = phase4_duration.as_secs_f64();
@@ -206,8 +211,8 @@ async fn run_pipeline_from_phase4(
         );
     } else {
         info!("No new clusters formed or existing clusters merged in Phase 4, and visualization edges already exist for this run. Skipping Phase 5 (Visualization Edge Calculation).");
-        stats.total_visualization_edges = 0; // Explicitly set to 0 as it's skipped
-        stats.visualization_edge_calculation_time = 0.0; // Explicitly set to 0
+        stats.total_visualization_edges = 0;
+        stats.visualization_edge_calculation_time = 0.0;
     }
     info!("Pipeline progress: [2/5] phases from Phase 4 (40%)");
 
@@ -231,12 +236,10 @@ async fn run_pipeline_from_phase4(
     info!("Phase 5.5: Service Context Feature Extraction and Cache Pre-warming");
     let phase5_5_start = Instant::now();
 
-    // Extract and store individual service features
     let service_features_count =
         extract_and_store_all_service_features_and_prewarm_cache(pool, &service_feature_cache)
             .await?;
 
-    // Pre-warm service pair features cache
     let max_service_pairs = 100;
     match prewarm_service_pair_features_cache(pool, &service_feature_cache, max_service_pairs).await {
         Ok(pairs_count) => info!(
@@ -259,15 +262,16 @@ async fn run_pipeline_from_phase4(
         "Extracted and pre-warmed context features for {} services in {:.2?}. Phase 5.5 complete.",
         service_features_count, phase5_5_duration
     );
+    info!("Pipeline progress: [2.5/5] phases from Phase 4 (~50%)");
+
 
     // PHASE 6: Service matching
     info!("Phase 6: Service matching");
     let phase6_start = Instant::now();
 
-    // Run the service matching pipeline
     let service_match_result = run_service_matching_pipeline(
         pool,
-        &run_id_clone,
+        &run_id_clone, // Use run_id_clone
         service_orchestrator.clone(),
         service_feature_cache.clone(),
     )
@@ -280,7 +284,6 @@ async fn run_pipeline_from_phase4(
         .extend(service_match_result.method_stats.clone());
 
     if stats.service_stats.is_none() {
-        // Create basic service stats from the result
         stats.service_stats = Some(results::ServiceMatchStats {
             total_matches: service_match_result.groups_created,
             avg_similarity: service_match_result.stats.avg_confidence,
@@ -315,27 +318,26 @@ async fn run_pipeline_from_phase4(
     );
     info!("Pipeline progress: [3/5] phases from Phase 4 (60%)");
 
+    // Phase 7: Service cluster consolidation
     info!("Phase 7: Service cluster consolidation");
     let phase7_start = Instant::now();
 
-    // Ensure consolidation tables exist before processing
     service_consolidate_clusters::ensure_consolidation_tables_exist(pool)
         .await
         .context("Failed to ensure consolidation tables exist")?;
 
-    // Custom config with performance optimizations
     let consolidation_config = service_consolidate_clusters::ConsolidationConfig {
-        similarity_threshold: 0.5, // Lower threshold for more broad clustering
-        embedding_batch_size: 200, // Larger batches if memory allows
-        db_batch_size: 100,        // Larger DB batches for I/O efficiency
-        max_cache_size: 15000,     // Larger cache for better hit rates
-        min_cluster_size: 3,       // Only consolidate clusters with 3+ services
-        embedding_cache_duration_secs: 3600, // Explicitly set or use default (adjust as needed)
+        similarity_threshold: 0.5,
+        embedding_batch_size: 200,
+        db_batch_size: 100,
+        max_cache_size: 15000,
+        min_cluster_size: 3,
+        embedding_cache_duration_secs: 3600,
     };
 
     match service_consolidate_clusters::consolidate_service_clusters(
         pool,
-        &run_id_clone,
+        &run_id_clone, // Use run_id_clone
         Some(consolidation_config),
     )
     .await
@@ -349,7 +351,7 @@ async fn run_pipeline_from_phase4(
         }
         Err(e) => {
             warn!("Service cluster consolidation encountered an error: {}. Continuing with existing clusters.", e);
-            stats.total_service_clusters = 0; // Or fetch current cluster count
+            stats.total_service_clusters = 0;
         }
     }
 
@@ -360,14 +362,14 @@ async fn run_pipeline_from_phase4(
         "Service cluster consolidation phase completed in {:.2?}. Phase 7 complete.",
         phase7_duration
     );
-    info!("Pipeline progress: [7/8] phases (87%)");
+    info!("Pipeline progress: [4/5] phases from Phase 4 (80%)");
 
     // Phase 8: Service Visualization Edge Calculation
     info!("Phase 8: Calculating service relationship edges for cluster visualization");
     let phase8_start = Instant::now();
     service_cluster_visualization::ensure_visualization_tables_exist(pool).await?;
     stats.total_service_visualization_edges =
-        service_cluster_visualization::calculate_visualization_edges(pool, &run_id_clone).await?;
+        service_cluster_visualization::calculate_visualization_edges(pool, &run_id_clone).await?; // Use run_id_clone
     let phase8_duration = phase8_start.elapsed();
     phase_times.insert(
         "service_visualization_edge_calculation".to_string(),
@@ -380,7 +382,6 @@ async fn run_pipeline_from_phase4(
     );
     info!("Pipeline progress: [5/5] phases from Phase 4 (100%)");
 
-    // Calculate total processing time for phases run
     stats.total_processing_time = stats.clustering_time
         + stats.visualization_edge_calculation_time
         + stats.service_context_feature_extraction_time
@@ -400,14 +401,12 @@ struct PipelineState {
 async fn load_pipeline_state(pool: &PgPool) -> Result<PipelineState> {
     let conn = pool.get().await.context("Failed to get DB connection")?;
 
-    // Get total entities count
     let entities_row = conn
         .query_one("SELECT COUNT(*) FROM public.entity", &[])
         .await
         .context("Failed to count entities")?;
     let total_entities: i64 = entities_row.get(0);
 
-    // Get total entity groups (pairwise links) count
     let groups_row = conn
         .query_one("SELECT COUNT(*) FROM public.entity_group", &[])
         .await
@@ -427,19 +426,10 @@ async fn load_pipeline_state(pool: &PgPool) -> Result<PipelineState> {
 
 async fn consolidate_clusters_helper(
     pool: &PgPool,
-    reinforcement_orchestrator: Arc<Mutex<MatchingOrchestrator>>,
-    run_id: String,
+    _reinforcement_orchestrator: Arc<Mutex<MatchingOrchestrator>>, // Keep for potential future use
+    run_id: String, // run_id is passed as String
 ) -> Result<usize> {
-    // Get the unassigned group count before we start
     let conn = pool.get().await.context("Failed to get DB connection")?;
-
-    // Parse the run_id into a UUID type to fix the type mismatch
-    let run_id_uuid = match Uuid::parse_str(&run_id) {
-        Ok(uuid) => uuid,
-        Err(e) => {
-            return Err(anyhow::anyhow!("Failed to parse run_id as UUID: {}", e));
-        }
-    };
 
     let unassigned_query =
         "SELECT COUNT(*) FROM public.entity_group WHERE group_cluster_id IS NULL";
@@ -456,15 +446,12 @@ async fn consolidate_clusters_helper(
 
     if unassigned_groups == 0 {
         info!("No groups require clustering. Skipping consolidation.");
-        return Ok(0); // No clusters created
+        return Ok(0);
     };
 
-    // Call the actual implementation
-    let clusters_created = consolidate_clusters::process_clusters(pool, &run_id)
+    consolidate_clusters::process_clusters(pool, &run_id) // Pass run_id as &str
         .await
-        .context("Failed to process clusters")?;
-
-    Ok(clusters_created)
+        .context("Failed to process clusters")
 }
 
 async fn run_service_matching_pipeline(
@@ -473,23 +460,27 @@ async fn run_service_matching_pipeline(
     service_orchestrator: Arc<Mutex<ServiceMatchingOrchestrator>>,
     feature_cache: SharedServiceFeatureCache,
 ) -> Result<results::ServiceMatchResult> {
-    info!("Starting cluster-scoped service matching pipeline...");
+    info!(
+        "Starting cluster-scoped service matching pipeline with concurrency limit of {}...",
+        MAX_CONCURRENT_MATCHING_TASKS
+    );
     let start_time = Instant::now();
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MATCHING_TASKS));
 
-    // 1. Get all cluster IDs
-    let conn = pool
+    let conn_for_clusters = pool
         .get()
         .await
         .context("Failed to get DB connection for clusters")?;
-    let cluster_rows = conn
+    let cluster_rows = conn_for_clusters
         .query(
             "SELECT id FROM public.entity_group_cluster WHERE id IS NOT NULL",
             &[],
         )
         .await
         .context("Failed to query group_cluster IDs")?;
-
+    
     let cluster_ids: Vec<String> = cluster_rows.into_iter().map(|row| row.get("id")).collect();
+    drop(conn_for_clusters); // Release connection early
 
     if cluster_ids.is_empty() {
         info!("No entity clusters found. Service matching will be skipped.");
@@ -506,15 +497,20 @@ async fn run_service_matching_pipeline(
         });
     }
     info!(
-        "Found {} entity clusters for cluster-scoped service matching. Processing each...",
-        cluster_ids.len()
+        "Found {} entity clusters for cluster-scoped service matching. Processing each with concurrency limit {}...",
+        cluster_ids.len(),
+        MAX_CONCURRENT_MATCHING_TASKS
     );
 
     let mut all_tasks: Vec<JoinHandle<Result<ServiceMatchResult, anyhow::Error>>> = Vec::new();
 
     for cluster_id_str in cluster_ids {
-        // 2. For each cluster_id, get its services' relevant details
-        let service_detail_rows = conn
+        let mut conn_for_service_details = pool.get().await.context(format!(
+            "Failed to get DB connection for service details in cluster {}",
+            cluster_id_str
+        ))?;
+
+        let service_detail_rows = conn_for_service_details
             .query(
                 "WITH cluster_entities AS (
                 SELECT entity_id_1 AS entity_id FROM public.entity_group WHERE group_cluster_id = $1
@@ -539,6 +535,8 @@ async fn run_service_matching_pipeline(
                 "Failed to query services for cluster {}",
                 cluster_id_str
             ))?;
+        drop(conn_for_service_details);
+
 
         if service_detail_rows.is_empty() {
             debug!(
@@ -548,7 +546,6 @@ async fn run_service_matching_pipeline(
             continue;
         }
 
-        // Prepare data for each matching method
         let mut services_for_name_matcher: Vec<(ServiceId, String)> = Vec::new();
         let mut services_for_url_matcher: Vec<(ServiceId, String)> = Vec::new();
         let mut services_for_email_matcher: Vec<(ServiceId, String)> = Vec::new();
@@ -589,24 +586,18 @@ async fn run_service_matching_pipeline(
             }
         }
 
-        // Spawn matching tasks for each method type
         if !services_for_name_matcher.is_empty() {
-            let task_pool: PgPool = pool.clone();
-            let task_orchestrator: Arc<Mutex<ServiceMatchingOrchestrator>> =
-                service_orchestrator.clone();
-            let task_run_id: String = pipeline_run_id.to_string();
-            let task_feature_cache: SharedServiceFeatureCache = feature_cache.clone();
-            let task_cluster_id: String = cluster_id_str.clone();
-
+            let task_pool = pool.clone();
+            let task_orchestrator = service_orchestrator.clone();
+            let task_run_id = pipeline_run_id.to_string();
+            let task_feature_cache = feature_cache.clone();
+            let task_cluster_id = cluster_id_str.clone();
+            let sem_clone = semaphore.clone();
             all_tasks.push(tokio::spawn(async move {
+                let permit = sem_clone.acquire_owned().await.context("Permit acq failed (name)")?;
+                let _p_guard = permit;
                 service_matching::name::find_matches_in_cluster(
-                    &task_pool,
-                    Some(task_orchestrator),
-                    &task_run_id,
-                    Some(task_feature_cache),
-                    services_for_name_matcher,
-                    task_cluster_id,
-                )
+                    &task_pool, Some(task_orchestrator), &task_run_id, Some(task_feature_cache), services_for_name_matcher, task_cluster_id)
                 .await
             }));
         }
@@ -617,16 +608,12 @@ async fn run_service_matching_pipeline(
             let task_run_id = pipeline_run_id.to_string();
             let task_feature_cache = feature_cache.clone();
             let task_cluster_id = cluster_id_str.clone();
-
+            let sem_clone = semaphore.clone();
             all_tasks.push(tokio::spawn(async move {
+                let permit = sem_clone.acquire_owned().await.context("Permit acq failed (url)")?;
+                let _p_guard = permit;
                 service_matching::url::find_matches_in_cluster(
-                    &task_pool,
-                    Some(task_orchestrator),
-                    &task_run_id,
-                    Some(task_feature_cache),
-                    services_for_url_matcher,
-                    task_cluster_id,
-                )
+                    &task_pool, Some(task_orchestrator), &task_run_id, Some(task_feature_cache), services_for_url_matcher, task_cluster_id)
                 .await
             }));
         }
@@ -637,16 +624,12 @@ async fn run_service_matching_pipeline(
             let task_run_id = pipeline_run_id.to_string();
             let task_feature_cache = feature_cache.clone();
             let task_cluster_id = cluster_id_str.clone();
-
+            let sem_clone = semaphore.clone();
             all_tasks.push(tokio::spawn(async move {
+                let permit = sem_clone.acquire_owned().await.context("Permit acq failed (email)")?;
+                let _p_guard = permit;
                 service_matching::email::find_matches_in_cluster(
-                    &task_pool,
-                    Some(task_orchestrator),
-                    &task_run_id,
-                    Some(task_feature_cache),
-                    services_for_email_matcher,
-                    task_cluster_id,
-                )
+                    &task_pool, Some(task_orchestrator), &task_run_id, Some(task_feature_cache), services_for_email_matcher, task_cluster_id)
                 .await
             }));
         }
@@ -657,31 +640,26 @@ async fn run_service_matching_pipeline(
             let task_run_id = pipeline_run_id.to_string();
             let task_feature_cache = feature_cache.clone();
             let task_cluster_id = cluster_id_str.clone();
-
+            let sem_clone = semaphore.clone();
             all_tasks.push(tokio::spawn(async move {
+                let permit = sem_clone.acquire_owned().await.context("Permit acq failed (embed)")?;
+                let _p_guard = permit;
                 service_matching::embedding::find_matches_in_cluster(
-                    &task_pool,
-                    Some(task_orchestrator),
-                    &task_run_id,
-                    Some(task_feature_cache),
-                    services_for_embedding_matcher,
-                    task_cluster_id,
-                )
+                    &task_pool, Some(task_orchestrator), &task_run_id, Some(task_feature_cache), services_for_embedding_matcher, task_cluster_id)
                 .await
             }));
         }
     }
 
-    // Aggregate results from all tasks
     let mut total_groups_created_all_methods = 0;
     let mut aggregated_method_stats: HashMap<String, MatchMethodStats> = HashMap::new();
 
-    let task_results = futures::future::try_join_all(all_tasks).await;
+    let task_join_results = join_all(all_tasks).await; // Changed to join_all
 
-    match task_results {
-        Ok(individual_task_results) => {
-            for task_result in individual_task_results {
-                match task_result {
+    for join_result in task_join_results {
+        match join_result {
+            Ok(task_outcome_result) => {
+                match task_outcome_result {
                     Ok(service_match_result_for_method_in_cluster) => {
                         total_groups_created_all_methods +=
                             service_match_result_for_method_in_cluster.groups_created;
@@ -697,14 +675,15 @@ async fn run_service_matching_pipeline(
                                         avg_confidence: 0.0,
                                         avg_group_size: 2.0,
                                     });
-                            let total_confidence_points =
+                            let total_confidence_points_before =
                                 entry.avg_confidence * entry.groups_created as f64;
                             let current_confidence_points =
                                 stat.avg_confidence * stat.groups_created as f64;
+                            
                             entry.groups_created += stat.groups_created;
                             entry.entities_matched += stat.entities_matched;
                             if entry.groups_created > 0 {
-                                entry.avg_confidence = (total_confidence_points
+                                entry.avg_confidence = (total_confidence_points_before
                                     + current_confidence_points)
                                     / entry.groups_created as f64;
                             } else {
@@ -713,26 +692,28 @@ async fn run_service_matching_pipeline(
                         }
                     }
                     Err(e) => {
-                        warn!("A service matching task failed: {:?}", e);
+                        warn!("A service matching task returned an error: {:?}", e);
                     }
                 }
             }
-        }
-        Err(join_err) => {
-            warn!(
-                "A service matching task failed to join (e.g., panicked): {:?}",
-                join_err
-            );
-            return Err(anyhow::Error::from(join_err)
-                .context("A service matching task panicked or was cancelled"));
+            Err(join_err) => {
+                warn!(
+                    "A service matching task failed to join (e.g., panicked): {:?}",
+                    join_err
+                );
+            }
         }
     }
 
-    // Process feedback and save models
     info!("Processing human feedback for service confidence tuner");
     let mut orchestrator = service_orchestrator.lock().await;
-    let _ = orchestrator.process_feedback_and_update_tuner(pool).await;
-    let _ = orchestrator.save_models(pool).await;
+    if let Err(e) = orchestrator.process_feedback_and_update_tuner(pool).await {
+         warn!("Failed to process feedback and update tuner: {}",e);
+    }
+    if let Err(e) = orchestrator.save_models(pool).await {
+        warn!("Failed to save models: {}",e);
+    }
+
 
     if let Some((hits, misses, ind_hits, ind_misses)) = orchestrator.get_feature_cache_stats().await
     {
@@ -779,7 +760,7 @@ async fn run_service_matching_pipeline(
                 .map(|s| s.entities_matched)
                 .sum::<usize>(),
             avg_confidence,
-            avg_group_size: 2.0,
+            avg_group_size: if total_groups_created_all_methods > 0 { 2.0 } else {0.0}, // Default for pairwise
         }
     } else {
         results::MatchMethodStats {
@@ -787,7 +768,7 @@ async fn run_service_matching_pipeline(
             groups_created: 0,
             entities_matched: 0,
             avg_confidence: 0.0,
-            avg_group_size: 2.0,
+            avg_group_size: 0.0,
         }
     };
 

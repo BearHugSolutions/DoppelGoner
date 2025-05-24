@@ -1,7 +1,7 @@
 // src/bin/from_phase5_5.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::future::try_join_all;
+use futures::future::join_all; // Changed to join_all to handle results individually
 use log::{debug, info, warn};
 use std::{
     collections::HashMap,
@@ -9,7 +9,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, Semaphore}, // Added Semaphore
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 use dedupe_lib::{
@@ -23,9 +26,12 @@ use dedupe_lib::{
         service_feature_cache_service::{create_shared_service_cache, SharedServiceFeatureCache},
         service_orchestrator::{self, ServiceMatchingOrchestrator},
     },
-    results::{self, AnyMatchResult, MatchMethodStats, PipelineStats, ServiceMatchResult},
+    results::{self, MatchMethodStats, PipelineStats, ServiceMatchResult},
     service_cluster_visualization, service_consolidate_clusters, service_matching,
 };
+
+// Define the concurrency limit for matching tasks
+const MAX_CONCURRENT_MATCHING_TASKS: usize = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -171,7 +177,7 @@ async fn run_pipeline_from_phase5_5(
             .await?;
 
     // Pre-warm service pair features cache
-    let max_service_pairs = 100;
+    let max_service_pairs = 100; // Example value, adjust as needed
     match prewarm_service_pair_features_cache(pool, &service_feature_cache, max_service_pairs).await {
         Ok(pairs_count) => info!(
             "Successfully pre-warmed service pair features cache for {} likely service pairs.",
@@ -237,7 +243,7 @@ async fn run_pipeline_from_phase5_5(
                 .filter(|s| s.avg_confidence < 0.8)
                 .map(|s| s.groups_created)
                 .sum(),
-            clusters_with_matches: 0,
+            clusters_with_matches: 0, // This might need more sophisticated calculation based on results
         });
     }
 
@@ -250,6 +256,7 @@ async fn run_pipeline_from_phase5_5(
     );
     info!("Pipeline progress: [2/4] phases from Phase 5.5 (50%)");
 
+    // Phase 7: Service cluster consolidation
     info!("Phase 7: Service cluster consolidation");
     let phase7_start = Instant::now();
 
@@ -284,7 +291,8 @@ async fn run_pipeline_from_phase5_5(
         }
         Err(e) => {
             warn!("Service cluster consolidation encountered an error: {}. Continuing with existing clusters.", e);
-            stats.total_service_clusters = 0; // Or fetch current cluster count
+            // Optionally, fetch current cluster count if consolidation fails
+            stats.total_service_clusters = 0;
         }
     }
 
@@ -406,15 +414,26 @@ async fn run_service_matching_pipeline(
         });
     }
     info!(
-        "Found {} entity clusters for cluster-scoped service matching. Processing each...",
-        cluster_ids.len()
+        "Found {} entity clusters for cluster-scoped service matching. Processing each with a concurrency limit of {}...",
+        cluster_ids.len(),
+        MAX_CONCURRENT_MATCHING_TASKS
     );
 
+    // Create a semaphore to limit concurrent tasks
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MATCHING_TASKS));
     let mut all_tasks: Vec<JoinHandle<Result<ServiceMatchResult, anyhow::Error>>> = Vec::new();
 
     for cluster_id_str in cluster_ids {
         // 2. For each cluster_id, get its services' relevant details
-        let service_detail_rows = conn
+        // It's important to get a new connection here or ensure the previous one is released
+        // if the loop is long-running or if connection pooling is tight.
+        // For simplicity, we'll re-acquire a connection from the pool for this query.
+        let mut conn_for_service_details = pool
+            .get()
+            .await
+            .context(format!("Failed to get DB connection for services in cluster {}", cluster_id_str))?;
+
+        let service_detail_rows = conn_for_service_details
             .query(
                 "WITH cluster_entities AS (
                 SELECT entity_id_1 AS entity_id FROM public.entity_group WHERE group_cluster_id = $1
@@ -489,7 +508,7 @@ async fn run_service_matching_pipeline(
             }
         }
 
-        // Spawn matching tasks for each method type
+        // Spawn matching tasks for each method type, respecting the semaphore
         if !services_for_name_matcher.is_empty() {
             let task_pool: PgPool = pool.clone();
             let task_orchestrator: Arc<Mutex<ServiceMatchingOrchestrator>> =
@@ -497,9 +516,17 @@ async fn run_service_matching_pipeline(
             let task_run_id: String = pipeline_run_id.to_string();
             let task_feature_cache: SharedServiceFeatureCache = feature_cache.clone();
             let task_cluster_id: String = cluster_id_str.clone();
+            let semaphore_clone = semaphore.clone(); // Clone Arc for the new task
 
             all_tasks.push(tokio::spawn(async move {
-                service_matching::name::find_matches_in_cluster(
+                let permit = semaphore_clone
+                    .acquire_owned()
+                    .await
+                    .context("Failed to acquire semaphore permit for name matching")?;
+                // Permit is held by _permit_guard and released when it goes out of scope
+                let _permit_guard = permit;
+
+                let result = service_matching::name::find_matches_in_cluster(
                     &task_pool,
                     Some(task_orchestrator),
                     &task_run_id,
@@ -507,7 +534,8 @@ async fn run_service_matching_pipeline(
                     services_for_name_matcher,
                     task_cluster_id,
                 )
-                .await
+                .await;
+                result // Return the Result<ServiceMatchResult, anyhow::Error>
             }));
         }
 
@@ -517,9 +545,16 @@ async fn run_service_matching_pipeline(
             let task_run_id = pipeline_run_id.to_string();
             let task_feature_cache = feature_cache.clone();
             let task_cluster_id = cluster_id_str.clone();
+            let semaphore_clone = semaphore.clone();
 
             all_tasks.push(tokio::spawn(async move {
-                service_matching::url::find_matches_in_cluster(
+                let permit = semaphore_clone
+                    .acquire_owned()
+                    .await
+                    .context("Failed to acquire semaphore permit for URL matching")?;
+                let _permit_guard = permit;
+
+                let result = service_matching::url::find_matches_in_cluster(
                     &task_pool,
                     Some(task_orchestrator),
                     &task_run_id,
@@ -527,7 +562,8 @@ async fn run_service_matching_pipeline(
                     services_for_url_matcher,
                     task_cluster_id,
                 )
-                .await
+                .await;
+                result
             }));
         }
 
@@ -537,9 +573,16 @@ async fn run_service_matching_pipeline(
             let task_run_id = pipeline_run_id.to_string();
             let task_feature_cache = feature_cache.clone();
             let task_cluster_id = cluster_id_str.clone();
+            let semaphore_clone = semaphore.clone();
 
             all_tasks.push(tokio::spawn(async move {
-                service_matching::email::find_matches_in_cluster(
+                let permit = semaphore_clone
+                    .acquire_owned()
+                    .await
+                    .context("Failed to acquire semaphore permit for email matching")?;
+                let _permit_guard = permit;
+
+                let result = service_matching::email::find_matches_in_cluster(
                     &task_pool,
                     Some(task_orchestrator),
                     &task_run_id,
@@ -547,7 +590,8 @@ async fn run_service_matching_pipeline(
                     services_for_email_matcher,
                     task_cluster_id,
                 )
-                .await
+                .await;
+                result
             }));
         }
 
@@ -557,9 +601,16 @@ async fn run_service_matching_pipeline(
             let task_run_id = pipeline_run_id.to_string();
             let task_feature_cache = feature_cache.clone();
             let task_cluster_id = cluster_id_str.clone();
+            let semaphore_clone = semaphore.clone();
 
             all_tasks.push(tokio::spawn(async move {
-                service_matching::embedding::find_matches_in_cluster(
+                let permit = semaphore_clone
+                    .acquire_owned()
+                    .await
+                    .context("Failed to acquire semaphore permit for embedding matching")?;
+                let _permit_guard = permit;
+
+                let result = service_matching::embedding::find_matches_in_cluster(
                     &task_pool,
                     Some(task_orchestrator),
                     &task_run_id,
@@ -567,7 +618,8 @@ async fn run_service_matching_pipeline(
                     services_for_embedding_matcher,
                     task_cluster_id,
                 )
-                .await
+                .await;
+                result
             }));
         }
     }
@@ -576,16 +628,16 @@ async fn run_service_matching_pipeline(
     let mut total_groups_created_all_methods = 0;
     let mut aggregated_method_stats: HashMap<String, MatchMethodStats> = HashMap::new();
 
-    let task_results = futures::future::try_join_all(all_tasks).await;
+    // Use join_all to wait for all tasks and collect their results
+    let task_join_results = join_all(all_tasks).await;
 
-    match task_results {
-        Ok(individual_task_results) => {
-            for task_result in individual_task_results {
-                match task_result {
-                    Ok(service_match_result_for_method_in_cluster) => {
-                        total_groups_created_all_methods +=
-                            service_match_result_for_method_in_cluster.groups_created;
-                        for stat in service_match_result_for_method_in_cluster.method_stats {
+    for join_result in task_join_results {
+        match join_result {
+            Ok(task_outcome_result) => { // Task completed its execution (didn't panic)
+                match task_outcome_result { // Check the Result from the task's async block
+                    Ok(service_match_result) => {
+                        total_groups_created_all_methods += service_match_result.groups_created;
+                        for stat in service_match_result.method_stats {
                             let method_key = stat.method_type.as_str().to_string();
                             let entry =
                                 aggregated_method_stats
@@ -595,44 +647,56 @@ async fn run_service_matching_pipeline(
                                         groups_created: 0,
                                         entities_matched: 0,
                                         avg_confidence: 0.0,
-                                        avg_group_size: 2.0,
+                                        avg_group_size: 2.0, // Default for pairwise
                                     });
-                            let total_confidence_points =
+                            // Correctly update average confidence
+                            let total_confidence_points_before =
                                 entry.avg_confidence * entry.groups_created as f64;
                             let current_confidence_points =
                                 stat.avg_confidence * stat.groups_created as f64;
+
                             entry.groups_created += stat.groups_created;
-                            entry.entities_matched += stat.entities_matched;
+                            entry.entities_matched += stat.entities_matched; // Assuming this is additive
+
                             if entry.groups_created > 0 {
-                                entry.avg_confidence = (total_confidence_points
+                                entry.avg_confidence = (total_confidence_points_before
                                     + current_confidence_points)
                                     / entry.groups_created as f64;
                             } else {
-                                entry.avg_confidence = 0.0;
+                                entry.avg_confidence = 0.0; // Avoid division by zero
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("A service matching task failed: {:?}", e);
+                        // An error occurred within the task's logic (e.g., DB error, permit error)
+                        warn!("A service matching task returned an error: {:?}", e);
                     }
                 }
             }
-        }
-        Err(join_err) => {
-            warn!(
-                "A service matching task failed to join (e.g., panicked): {:?}",
-                join_err
-            );
-            return Err(anyhow::Error::from(join_err)
-                .context("A service matching task panicked or was cancelled"));
+            Err(join_err) => {
+                // The task panicked or was cancelled
+                warn!(
+                    "A service matching task failed to join (e.g., panicked or was cancelled): {:?}",
+                    join_err
+                );
+                // Depending on requirements, you might want to propagate this as a fatal error for the pipeline
+                // For now, we log and continue aggregating other results.
+                // return Err(anyhow::Error::from(join_err)
+                //     .context("A service matching task panicked or was cancelled"));
+            }
         }
     }
+
 
     // Process feedback and save models
     info!("Processing human feedback for service confidence tuner");
     let mut orchestrator = service_orchestrator.lock().await;
-    let _ = orchestrator.process_feedback_and_update_tuner(pool).await;
-    let _ = orchestrator.save_models(pool).await;
+    if let Err(e) = orchestrator.process_feedback_and_update_tuner(pool).await {
+        warn!("Failed to process feedback and update tuner: {}", e);
+    }
+    if let Err(e) = orchestrator.save_models(pool).await {
+        warn!("Failed to save RL models: {}", e);
+    }
 
     if let Some((hits, misses, ind_hits, ind_misses)) = orchestrator.get_feature_cache_stats().await
     {
@@ -674,12 +738,18 @@ async fn run_service_matching_pipeline(
         results::MatchMethodStats {
             method_type: MatchMethodType::Custom("service_combined_all_clusters".to_string()),
             groups_created: total_groups_created_all_methods,
-            entities_matched: final_method_stats
+            entities_matched: final_method_stats // Sum of entities matched by each method
                 .iter()
                 .map(|s| s.entities_matched)
                 .sum::<usize>(),
             avg_confidence,
-            avg_group_size: 2.0,
+            avg_group_size: if total_groups_created_all_methods > 0 {
+                 // A more accurate avg_group_size would require tracking individual group sizes
+                 // For now, using 2.0 as a placeholder if groups were created.
+                2.0
+            } else {
+                0.0
+            },
         }
     } else {
         results::MatchMethodStats {
@@ -687,7 +757,7 @@ async fn run_service_matching_pipeline(
             groups_created: 0,
             entities_matched: 0,
             avg_confidence: 0.0,
-            avg_group_size: 2.0,
+            avg_group_size: 0.0,
         }
     };
 

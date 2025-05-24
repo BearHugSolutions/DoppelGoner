@@ -1,27 +1,28 @@
 // src/main.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::future::try_join_all;
+use futures::future::join_all; // Changed to join_all
 use log::{debug, info, warn};
 use std::{
-    // any::Any, // Appears unused
     collections::HashMap,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, Semaphore}, // Added Semaphore
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 use dedupe_lib::{
-    cluster_visualization, // config, // 'config' seems unused in this file
+    cluster_visualization,
     consolidate_clusters,
     db::{self, PgPool},
     entity_organizations,
     matching,
-    models::{self, *}, // Imports all from models
+    models::{self, *},
     reinforcement::{
-        // self as reinforcement_root, // Alias if needed, but direct use is fine
         entity::{
             feature_cache_prewarmer::{
                 extract_and_store_all_entity_features_and_prewarm_cache,
@@ -38,23 +39,15 @@ use dedupe_lib::{
             service_feature_cache_service::{
                 create_shared_service_cache, SharedServiceFeatureCache,
             },
-            service_orchestrator::{self, ServiceMatchingOrchestrator}, // service_orchestrator alias might be confusing
+            service_orchestrator::{self, ServiceMatchingOrchestrator},
         },
     },
-    results::{
-        self,           // AddressMatchResult, // Unused directly
-        AnyMatchResult, // EmailMatchResult, // Unused directly
-        // GeospatialMatchResult, // Unused directly
-        MatchMethodStats, // NameMatchResult, // Unused directly
-        // PhoneMatchResult, // Unused directly
-        PipelineStats,
-        ServiceMatchResult,
-        // UrlMatchResult, // Unused directly
-    },
-    service_cluster_visualization,
-    service_consolidate_clusters,
-    service_matching,
+    results::{self, AnyMatchResult, MatchMethodStats, PipelineStats, ServiceMatchResult},
+    service_cluster_visualization, service_consolidate_clusters, service_matching,
 };
+
+// Define the concurrency limit for matching tasks
+const MAX_CONCURRENT_MATCHING_TASKS: usize = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -200,11 +193,10 @@ async fn run_pipeline(
     // Phase 3: Entity matching
     let phase3_start = Instant::now();
     let (total_groups, method_stats_match) = run_entity_matching_pipeline(
-        // Renamed for clarity
         pool,
         entity_matching_orchestrator.clone(),
         stats.run_id.clone(),
-        entity_feature_cache.clone(), // Pass the entity feature cache
+        entity_feature_cache.clone(),
     )
     .await?;
     stats.total_groups = total_groups;
@@ -221,7 +213,7 @@ async fn run_pipeline(
     // Phase 4: Cluster consolidation
     let phase4_start = Instant::now();
     stats.total_clusters =
-        consolidate_clusters_helper(pool, entity_matching_orchestrator, stats.run_id.clone())
+        consolidate_clusters_helper(pool, entity_matching_orchestrator, stats.run_id.clone()) // Pass entity orchestrator
             .await?;
     let phase4_duration = phase4_start.elapsed();
     phase_times.insert("cluster_consolidation".to_string(), phase4_duration);
@@ -233,7 +225,7 @@ async fn run_pipeline(
     info!("Pipeline progress: [4/8] phases (50%)");
 
     // Phase 5: Visualization edge calculation
-    let clusters_changed = stats.total_clusters > 0; // Simplified condition
+    let clusters_changed = stats.total_clusters > 0;
     let existing_viz_edges =
         cluster_visualization::visualization_edges_exist(pool, &stats.run_id).await?;
     if clusters_changed || !existing_viz_edges {
@@ -262,7 +254,7 @@ async fn run_pipeline(
     let mut service_orchestrator_instance = ServiceMatchingOrchestrator::new(pool)
         .await
         .context("Failed to initialize ServiceMatchingOrchestrator")?;
-    let service_feature_vector_cache = create_shared_service_cache(); // Cache for *feature vectors*
+    let service_feature_vector_cache = create_shared_service_cache();
     service_orchestrator_instance.set_feature_cache(service_feature_vector_cache.clone());
     let service_matching_orchestrator = Arc::new(Mutex::new(service_orchestrator_instance));
 
@@ -274,7 +266,7 @@ async fn run_pipeline(
         &service_feature_vector_cache,
     )
     .await?;
-    let max_service_pairs = 100; // Configuration for prewarming
+    let max_service_pairs = 100;
     match prewarm_service_pair_features_cache(
         pool,
         &service_feature_vector_cache,
@@ -295,6 +287,7 @@ async fn run_pipeline(
     );
     stats.service_context_feature_extraction_time = phase5_5_duration.as_secs_f64();
     info!("Service Context Feature Extraction/Pre-warming complete in {:.2?} ({} services). Phase 5.5 complete.", phase5_5_duration, service_features_count);
+    info!("Pipeline progress: [5.5/8] phases (~68.75%)"); // Updated progress
 
     // Phase 6: Service matching
     info!("Phase 6: Service matching");
@@ -302,16 +295,16 @@ async fn run_pipeline(
     let service_match_run_result = run_service_matching_pipeline(
         pool,
         &stats.run_id,
-        service_matching_orchestrator.clone(), // Pass the orchestrator
-        service_feature_vector_cache.clone(),  // Pass the feature vector cache explicitly
+        service_matching_orchestrator.clone(),
+        service_feature_vector_cache.clone(),
     )
     .await
     .context("Service matching failed")?;
     stats.total_service_matches = service_match_run_result.groups_created;
     stats
         .method_stats
-        .extend(service_match_run_result.method_stats.clone()); // Add service method stats
-                                                                // Populate service_stats (simplified)
+        .extend(service_match_run_result.method_stats.clone());
+
     if stats.service_stats.is_none() {
         stats.service_stats = Some(results::ServiceMatchStats {
             total_matches: service_match_run_result.groups_created,
@@ -334,7 +327,7 @@ async fn run_pipeline(
                 .filter(|s| s.avg_confidence < 0.8)
                 .map(|s| s.groups_created)
                 .sum(),
-            clusters_with_matches: 0, // This would need more complex tracking if required
+            clusters_with_matches: 0,
         });
     }
     let phase6_duration = phase6_start.elapsed();
@@ -350,7 +343,7 @@ async fn run_pipeline(
     info!("Phase 7: Service cluster consolidation");
     let phase7_start = Instant::now();
     service_consolidate_clusters::ensure_consolidation_tables_exist(pool).await?;
-    let consolidation_config = service_consolidate_clusters::ConsolidationConfig::default(); // Using default
+    let consolidation_config = service_consolidate_clusters::ConsolidationConfig::default();
     match service_consolidate_clusters::consolidate_service_clusters(
         pool,
         &stats.run_id,
@@ -359,7 +352,7 @@ async fn run_pipeline(
     .await
     {
         Ok(merged_clusters) => {
-            stats.total_service_clusters = merged_clusters; // This is count of *merged pairs*, not total final clusters
+            stats.total_service_clusters = merged_clusters;
             info!(
                 "Successfully consolidated/merged {} service cluster pairs.",
                 merged_clusters
@@ -394,7 +387,6 @@ async fn run_pipeline(
     );
     info!("Pipeline progress: [8/8] phases (100%)");
 
-    // Calculate total processing time
     stats.total_processing_time = phase_times.values().map(|d| d.as_secs_f64()).sum();
     Ok(stats)
 }
@@ -436,23 +428,32 @@ async fn identify_entities(pool: &PgPool) -> Result<usize> {
     Ok(total_entities_count as usize)
 }
 
-// Renamed to avoid conflict with the service matching pipeline runner
 async fn run_entity_matching_pipeline(
     pool: &PgPool,
     entity_matching_orchestrator: Arc<Mutex<MatchingOrchestrator>>,
     run_id: String,
-    entity_feature_cache: SharedFeatureCache, // For entity features
+    entity_feature_cache: SharedFeatureCache,
 ) -> Result<(usize, Vec<MatchMethodStats>)> {
-    info!("Initializing entity matching pipeline with feature caching...");
+    info!(
+        "Initializing entity matching pipeline with feature caching and concurrency limit of {}...",
+        MAX_CONCURRENT_MATCHING_TASKS
+    );
     let start_time_matching = Instant::now();
     let mut tasks: Vec<JoinHandle<Result<AnyMatchResult, anyhow::Error>>> = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MATCHING_TASKS));
 
     // --- Spawn Email Matching Task (Entity) ---
     let pool_clone_email = pool.clone();
     let orchestrator_clone_email = entity_matching_orchestrator.clone();
     let run_id_clone_email = run_id.clone();
     let feature_cache_clone_email = entity_feature_cache.clone();
+    let semaphore_clone_email = semaphore.clone();
     tasks.push(tokio::spawn(async move {
+        let permit = semaphore_clone_email
+            .acquire_owned()
+            .await
+            .context("Failed to acquire semaphore permit for entity email matching")?;
+        let _permit_guard = permit;
         matching::email::find_matches(
             &pool_clone_email,
             Some(orchestrator_clone_email),
@@ -468,7 +469,13 @@ async fn run_entity_matching_pipeline(
     let orchestrator_clone_phone = entity_matching_orchestrator.clone();
     let run_id_clone_phone = run_id.clone();
     let feature_cache_clone_phone = entity_feature_cache.clone();
+    let semaphore_clone_phone = semaphore.clone();
     tasks.push(tokio::spawn(async move {
+        let permit = semaphore_clone_phone
+            .acquire_owned()
+            .await
+            .context("Failed to acquire semaphore permit for entity phone matching")?;
+        let _permit_guard = permit;
         matching::phone::find_matches(
             &pool_clone_phone,
             Some(orchestrator_clone_phone),
@@ -484,7 +491,13 @@ async fn run_entity_matching_pipeline(
     let orchestrator_clone_url = entity_matching_orchestrator.clone();
     let run_id_clone_url = run_id.clone();
     let feature_cache_clone_url = entity_feature_cache.clone();
+    let semaphore_clone_url = semaphore.clone();
     tasks.push(tokio::spawn(async move {
+        let permit = semaphore_clone_url
+            .acquire_owned()
+            .await
+            .context("Failed to acquire semaphore permit for entity URL matching")?;
+        let _permit_guard = permit;
         matching::url::find_matches(
             &pool_clone_url,
             Some(orchestrator_clone_url),
@@ -500,7 +513,13 @@ async fn run_entity_matching_pipeline(
     let orchestrator_clone_address = entity_matching_orchestrator.clone();
     let run_id_clone_address = run_id.clone();
     let feature_cache_clone_address = entity_feature_cache.clone();
+    let semaphore_clone_address = semaphore.clone();
     tasks.push(tokio::spawn(async move {
+        let permit = semaphore_clone_address
+            .acquire_owned()
+            .await
+            .context("Failed to acquire semaphore permit for entity address matching")?;
+        let _permit_guard = permit;
         matching::address::find_matches(
             &pool_clone_address,
             Some(orchestrator_clone_address),
@@ -516,7 +535,13 @@ async fn run_entity_matching_pipeline(
     let orchestrator_clone_name = entity_matching_orchestrator.clone();
     let run_id_clone_name = run_id.clone();
     let feature_cache_clone_name = entity_feature_cache.clone();
+    let semaphore_clone_name = semaphore.clone();
     tasks.push(tokio::spawn(async move {
+        let permit = semaphore_clone_name
+            .acquire_owned()
+            .await
+            .context("Failed to acquire semaphore permit for entity name matching")?;
+        let _permit_guard = permit;
         matching::name::find_matches(
             &pool_clone_name,
             Some(orchestrator_clone_name),
@@ -532,7 +557,13 @@ async fn run_entity_matching_pipeline(
     let orchestrator_clone_geo = entity_matching_orchestrator.clone();
     let run_id_clone_geo = run_id.clone();
     let feature_cache_clone_geo = entity_feature_cache.clone();
+    let semaphore_clone_geo = semaphore.clone();
     tasks.push(tokio::spawn(async move {
+        let permit = semaphore_clone_geo
+            .acquire_owned()
+            .await
+            .context("Failed to acquire semaphore permit for entity geo matching")?;
+        let _permit_guard = permit;
         matching::geospatial::find_matches(
             &pool_clone_geo,
             Some(orchestrator_clone_geo),
@@ -543,25 +574,30 @@ async fn run_entity_matching_pipeline(
         .context("Entity geospatial matching failed")
     }));
 
-    let join_handle_results = try_join_all(tasks).await;
+    let join_handle_results = join_all(tasks).await; // Changed to join_all
     let mut total_groups = 0;
     let mut method_stats_vec = Vec::new();
 
-    match join_handle_results {
-        Ok(results_vec) => {
-            // Renamed from results to results_vec to avoid conflict
-            for res in results_vec {
-                match res {
+    for join_result in join_handle_results {
+        match join_result {
+            Ok(task_outcome_result) => {
+                match task_outcome_result {
                     Ok(any_match_result) => {
                         total_groups += any_match_result.groups_created();
                         method_stats_vec.push(any_match_result.stats().clone());
                     }
-                    Err(e) => return Err(e.context("A matching task failed internally")),
+                    Err(e) => {
+                        warn!("An entity matching task returned an error: {:?}", e);
+                        // Optionally, decide if this should be a fatal error for the pipeline
+                        // return Err(e.context("A matching task failed internally"));
+                    }
                 }
             }
-        }
-        Err(e) => {
-            return Err(anyhow::Error::from(e).context("A matching task panicked or was cancelled"))
+            Err(e) => {
+                warn!("An entity matching task failed to join (e.g., panicked): {:?}", e);
+                // Optionally, decide if this should be a fatal error
+                // return Err(anyhow::Error::from(e).context("A matching task panicked or was cancelled"));
+            }
         }
     }
 
@@ -580,7 +616,7 @@ async fn run_entity_matching_pipeline(
             0.0
         };
         info!("Entity Feature Cache - Pair: {} hits, {} misses ({:.2}%). Individual: {} hits, {} misses ({:.2}%).", hits, misses, hit_rate, ind_hits, ind_misses, ind_hit_rate);
-        cache_guard.clear();
+        cache_guard.clear(); // Consider if clearing is always desired here
     }
 
     info!(
@@ -593,7 +629,7 @@ async fn run_entity_matching_pipeline(
 
 async fn consolidate_clusters_helper(
     pool: &PgPool,
-    _reinforcement_orchestrator: Arc<Mutex<MatchingOrchestrator>>, // Orchestrator might be used for advanced consolidation in future
+    _reinforcement_orchestrator: Arc<Mutex<MatchingOrchestrator>>,
     run_id: String,
 ) -> Result<usize> {
     let conn = pool
@@ -616,26 +652,29 @@ async fn consolidate_clusters_helper(
         info!("No groups require clustering. Skipping consolidation.");
         return Ok(0);
     }
-    consolidate_clusters::process_clusters(pool, &run_id)
+    consolidate_clusters::process_clusters(pool, &run_id) // Pass run_id as &str
         .await
         .context("Failed to process clusters")
 }
 
-// This is the main service matching pipeline runner, called from run_pipeline
 async fn run_service_matching_pipeline(
     pool: &PgPool,
     pipeline_run_id: &str,
-    service_orchestrator: Arc<Mutex<ServiceMatchingOrchestrator>>, // Orchestrator for RL
-    feature_cache: SharedServiceFeatureCache, // Cache for *service feature vectors*
+    service_orchestrator: Arc<Mutex<ServiceMatchingOrchestrator>>,
+    feature_cache: SharedServiceFeatureCache,
 ) -> Result<results::ServiceMatchResult> {
-    info!("Starting cluster-scoped service matching pipeline...");
+    info!(
+        "Starting cluster-scoped service matching pipeline with concurrency limit of {}...",
+        MAX_CONCURRENT_MATCHING_TASKS
+    );
     let start_time = Instant::now();
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MATCHING_TASKS));
 
-    let conn = pool
+    let conn_for_clusters = pool // Use a more descriptive variable name
         .get()
         .await
         .context("Failed to get DB connection for clusters")?;
-    let cluster_rows = conn
+    let cluster_rows = conn_for_clusters // Use the new variable
         .query(
             "SELECT id FROM public.entity_group_cluster WHERE id IS NOT NULL",
             &[],
@@ -644,11 +683,12 @@ async fn run_service_matching_pipeline(
         .context("Failed to query entity_group_cluster IDs")?;
     let cluster_ids: Vec<String> = cluster_rows.into_iter().map(|row| row.get("id")).collect();
 
+    // Explicitly drop the connection if it's not needed anymore in this scope.
+    // However, if the loop below is short, it might be fine. For long loops, this is good practice.
+    drop(conn_for_clusters);
+
     if cluster_ids.is_empty() {
         info!("No entity clusters found. Service matching skipped.");
-        // Corrected: Directly initialize ServiceMatchResult for an empty case.
-        // This assumes ServiceMatchResult has a constructor or you define one (e.g., ServiceMatchResult::new_empty).
-        // For now, creating a default one. You might need to adjust this based on your results.rs definition.
         let skipped_method_type = MatchMethodType::Custom("service_combined_skipped".to_string());
         return Ok(ServiceMatchResult {
             groups_created: 0,
@@ -657,15 +697,21 @@ async fn run_service_matching_pipeline(
         });
     }
     info!(
-        "Found {} entity clusters for service matching. Processing...",
-        cluster_ids.len()
+        "Found {} entity clusters for service matching. Processing with concurrency limit {}...",
+        cluster_ids.len(),
+        MAX_CONCURRENT_MATCHING_TASKS
     );
 
     let mut all_tasks: Vec<JoinHandle<Result<ServiceMatchResult, anyhow::Error>>> = Vec::new();
 
     for cluster_id_str in cluster_ids {
-        // Fetch service details for the current cluster
-        let service_detail_rows = conn
+        // Acquire a connection for this specific cluster's service detail query
+        let mut conn_for_service_details = pool.get().await.context(format!(
+            "Failed to get DB connection for service details in cluster {}",
+            cluster_id_str
+        ))?;
+
+        let service_detail_rows = conn_for_service_details // Use the new connection
             .query(
                 "WITH cluster_entities AS (
                 SELECT entity_id_1 AS entity_id FROM public.entity_group WHERE group_cluster_id = $1
@@ -684,6 +730,10 @@ async fn run_service_matching_pipeline(
                 "Failed to query services for cluster {}",
                 cluster_id_str
             ))?;
+        
+        // Drop the connection as soon as it's no longer needed for this cluster's details
+        drop(conn_for_service_details);
+
 
         if service_detail_rows.is_empty() {
             debug!(
@@ -735,15 +785,12 @@ async fn run_service_matching_pipeline(
             let task_fc = feature_cache.clone();
             let task_prid = pipeline_run_id.to_string();
             let task_cid = cluster_id_str.clone();
+            let sem_clone = semaphore.clone();
             all_tasks.push(tokio::spawn(async move {
+                let permit = sem_clone.acquire_owned().await.context("Permit acq failed (svc name)")?;
+                let _p_guard = permit;
                 service_matching::name::find_matches_in_cluster(
-                    &task_pool,
-                    Some(task_orch),
-                    &task_prid,
-                    Some(task_fc),
-                    services_for_name,
-                    task_cid,
-                )
+                    &task_pool, Some(task_orch), &task_prid, Some(task_fc), services_for_name, task_cid)
                 .await
             }));
         }
@@ -753,15 +800,12 @@ async fn run_service_matching_pipeline(
             let task_fc = feature_cache.clone();
             let task_prid = pipeline_run_id.to_string();
             let task_cid = cluster_id_str.clone();
+            let sem_clone = semaphore.clone();
             all_tasks.push(tokio::spawn(async move {
+                let permit = sem_clone.acquire_owned().await.context("Permit acq failed (svc url)")?;
+                let _p_guard = permit;
                 service_matching::url::find_matches_in_cluster(
-                    &task_pool,
-                    Some(task_orch),
-                    &task_prid,
-                    Some(task_fc),
-                    services_for_url,
-                    task_cid,
-                )
+                    &task_pool, Some(task_orch), &task_prid, Some(task_fc), services_for_url, task_cid)
                 .await
             }));
         }
@@ -771,15 +815,12 @@ async fn run_service_matching_pipeline(
             let task_fc = feature_cache.clone();
             let task_prid = pipeline_run_id.to_string();
             let task_cid = cluster_id_str.clone();
+            let sem_clone = semaphore.clone();
             all_tasks.push(tokio::spawn(async move {
+                let permit = sem_clone.acquire_owned().await.context("Permit acq failed (svc email)")?;
+                let _p_guard = permit;
                 service_matching::email::find_matches_in_cluster(
-                    &task_pool,
-                    Some(task_orch),
-                    &task_prid,
-                    Some(task_fc),
-                    services_for_email,
-                    task_cid,
-                )
+                    &task_pool, Some(task_orch), &task_prid, Some(task_fc), services_for_email, task_cid)
                 .await
             }));
         }
@@ -789,15 +830,12 @@ async fn run_service_matching_pipeline(
             let task_fc = feature_cache.clone();
             let task_prid = pipeline_run_id.to_string();
             let task_cid = cluster_id_str.clone();
+            let sem_clone = semaphore.clone();
             all_tasks.push(tokio::spawn(async move {
+                let permit = sem_clone.acquire_owned().await.context("Permit acq failed (svc embed)")?;
+                let _p_guard = permit;
                 service_matching::embedding::find_matches_in_cluster(
-                    &task_pool,
-                    Some(task_orch),
-                    &task_prid,
-                    Some(task_fc),
-                    services_for_embedding,
-                    task_cid,
-                )
+                    &task_pool, Some(task_orch), &task_prid, Some(task_fc), services_for_embedding, task_cid)
                 .await
             }));
         }
@@ -806,24 +844,23 @@ async fn run_service_matching_pipeline(
     let mut total_groups_created_all_methods = 0;
     let mut aggregated_method_stats: HashMap<String, MatchMethodStats> = HashMap::new();
 
-    let task_join_results = try_join_all(all_tasks).await;
-    match task_join_results {
-        Ok(results_per_task) => {
-            for res_task in results_per_task {
-                match res_task {
+    let task_join_results = join_all(all_tasks).await; // Changed to join_all
+    for join_result in task_join_results {
+        match join_result {
+            Ok(task_outcome_result) => {
+                match task_outcome_result {
                     Ok(method_result_in_cluster) => {
                         total_groups_created_all_methods += method_result_in_cluster.groups_created;
                         for stat in method_result_in_cluster.method_stats {
-                            // Corrected: Use default_for as suggested by compiler
                             let entry = aggregated_method_stats
                                 .entry(stat.method_type.as_str().to_string())
                                 .or_insert_with(|| {
                                     MatchMethodStats::default_for(stat.method_type.clone())
                                 });
-                            entry.groups_created += stat.groups_created;
-                            entry.entities_matched += stat.entities_matched;
                             let total_old_confidence_points = entry.avg_confidence
-                                * (entry.groups_created - stat.groups_created) as f64;
+                                * (entry.groups_created) as f64; // Use current groups_created before adding new
+                            entry.groups_created += stat.groups_created;
+                            entry.entities_matched += stat.entities_matched; // Assuming this is additive
                             let current_confidence_points =
                                 stat.avg_confidence * stat.groups_created as f64;
                             if entry.groups_created > 0 {
@@ -835,16 +872,15 @@ async fn run_service_matching_pipeline(
                             }
                         }
                     }
-                    Err(e) => warn!("A service matching task failed: {:?}", e),
+                    Err(e) => warn!("A service matching task returned an error: {:?}", e),
                 }
             }
-        }
-        Err(e) => {
-            return Err(
-                anyhow::Error::from(e).context("Service matching task panicked or was cancelled")
-            )
+            Err(e) => {
+                warn!("A service matching task failed to join (panicked): {:?}", e);
+            }
         }
     }
+
 
     if let Ok(mut orchestrator_guard) = service_orchestrator.try_lock() {
         info!(
@@ -881,7 +917,6 @@ async fn run_service_matching_pipeline(
     let final_method_stats_vec: Vec<MatchMethodStats> =
         aggregated_method_stats.values().cloned().collect();
 
-    // Corrected: Directly calculate combined_stats here
     let combined_stats_method_name = "service_combined_all_clusters";
     let combined_stats = if final_method_stats_vec.is_empty() {
         MatchMethodStats::default_for(MatchMethodType::Custom(format!(
