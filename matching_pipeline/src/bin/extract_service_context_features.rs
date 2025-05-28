@@ -23,7 +23,7 @@ use dedupe_lib::{
 
 // Constants for parallel execution
 const BATCH_SIZE: usize = 100;
-const MAX_CONCURRENT_TASKS: usize = 20; // Adjust based on your hardware/DB capacity
+const MAX_CONCURRENT_TASKS: usize = 5; // Adjust based on your hardware/DB capacity
 
 async fn process_service_batch(
     pool: &db::PgPool,

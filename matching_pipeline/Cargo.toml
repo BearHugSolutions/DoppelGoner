@@ -83,8 +83,8 @@ name = "from_phase4"
 path = "src/bin/from_phase4.rs"
 
 [[bin]]
-name = "from_phase5_5"
-path = "src/bin/from_phase5_5.rs"
+name = "service_matching"
+path = "src/bin/service_matching.rs"
 
 [[bin]]
 name = "identify_entities"

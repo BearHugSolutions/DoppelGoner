@@ -1,7 +1,7 @@
 // src/reinforcement/service/service_feature_cache_prewarmer.rs
 
 use anyhow::{Context, Result};
-use futures::future;
+use futures::{future, stream, StreamExt};
 use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
@@ -21,7 +21,7 @@ use crate::reinforcement::service::service_feature_extraction::{
 };
 
 // Maximum batch size to process at once
-const MAX_BATCH_SIZE: usize = 20;
+const MAX_BATCH_SIZE: usize = 5;
 
 // Calculate number of batches based on CPU cores
 fn calculate_batch_size(pair_count: usize) -> usize {
@@ -75,7 +75,7 @@ pub async fn extract_and_store_all_service_context_features(
     );
 
     // Process in batches
-    let batch_size = 100;
+    let batch_size = 500;
     let mut processed_count = 0;
 
     for chunk in service_ids.chunks(batch_size) {
@@ -124,14 +124,13 @@ pub async fn extract_and_store_all_service_context_features(
 
 pub async fn extract_and_store_all_service_features_and_prewarm_cache(
     pool: &PgPool,
-    feature_cache: &SharedServiceFeatureCache, // The service-specific shared cache
+    feature_cache: &SharedServiceFeatureCache,
 ) -> Result<usize> {
     let conn = pool
         .get()
         .await
         .context("Failed to get DB connection for pre-warming service cache")?;
 
-    // Get all service IDs
     let service_rows = conn
         .query("SELECT id FROM public.service", &[])
         .await
@@ -147,71 +146,54 @@ pub async fn extract_and_store_all_service_features_and_prewarm_cache(
         service_ids.len()
     );
 
-    let batch_size = 100; // Configurable batch size
+    let concurrency_limit_for_prewarm = 70; // <<<< NEW: Set a reasonable limit, e.g., pool_size - 10
     let mut processed_count = 0;
-    let total_services = service_ids.len();
 
-    for chunk in service_ids.chunks(batch_size) {
-        let mut batch_futures: Vec<tokio::task::JoinHandle<Result<usize, anyhow::Error>>> =
-            Vec::new();
-
-        for service_id_in_chunk in chunk {
+    let results: Vec<Result<usize, anyhow::Error>> = stream::iter(service_ids)
+        .map(|service_id| {
             let pool_clone = pool.clone();
             let feature_cache_clone = feature_cache.clone();
-            let service_id_clone = service_id_in_chunk.clone(); // Clone each service_id before moving into async block
-
-            batch_futures.push(tokio::spawn(async move {
-                // Each task gets its own connection from the pool
+            // No need to clone service_id if it's Copy or owned by the closure
+            async move {
                 let conn_task = pool_clone.get().await.context(format!(
                     "Failed to get DB connection for service {}",
-                    service_id_clone.0
+                    service_id.0
                 ))?;
-                match get_stored_service_features(&*conn_task, &service_id_clone).await {
-                    // get_stored_service_features handles DB storage
+                match get_stored_service_features(&*conn_task, &service_id).await {
                     Ok(features) => {
                         let mut cache_guard = feature_cache_clone.lock().await;
                         cache_guard
                             .individual_cache
-                            .put(service_id_clone.0.clone(), features);
-                        Ok(1) // Successfully processed one service
+                            .put(service_id.0.clone(), features);
+                        Ok(1)
                     }
                     Err(e) => {
                         warn!(
                             "Failed to extract/store features for service {}: {}",
-                            service_id_clone.0, e
+                            service_id.0, e
                         );
-                        Ok(0) // Failed to process this service
+                        Ok(0) // Or Err(e) if you want to stop on first error
                     }
                 }
-            }));
-        }
-
-        for handle in batch_futures {
-            match handle.await {
-                Ok(Ok(count_processed_in_task)) => {
-                    processed_count += count_processed_in_task;
-                }
-                Ok(Err(e)) => {
-                    // Error from within the task's logic
-                    warn!(
-                        "A task in service feature pre-warming batch failed: {:?}",
-                        e
-                    );
-                }
-                Err(e) => {
-                    // JoinError, task panicked
-                    warn!(
-                        "A task in service feature pre-warming batch panicked: {:?}",
-                        e
-                    );
-                }
             }
+        })
+        .buffer_unordered(concurrency_limit_for_prewarm) // Process `concurrency_limit_for_prewarm` futures at a time
+        .collect()
+        .await;
+
+    for result in results {
+        match result {
+            Ok(count) => processed_count += count,
+            Err(e) => warn!("A pre-warming task failed: {:?}", e),
         }
-        info!(
-            "Pre-warmed service features cache: Processed {}/{} services",
-            processed_count, total_services
-        );
     }
+
+    info!(
+        "Pre-warmed service features cache: Processed {}/{} services attempts",
+        processed_count,
+        service_rows.len() // Use original count before potential Ok(0) from errors
+    );
+
 
     // Cache statistics for observability
     {
@@ -232,7 +214,7 @@ pub async fn extract_priority_service_pairs(
     max_pairs: usize,
 ) -> Result<ServicePriorityBatches> {
     let mut batches = ServicePriorityBatches::new();
-    let pairs_per_category = (max_pairs / 5).max(100); // Distribute among categories, minimum 100 per category
+    let pairs_per_category = (max_pairs / 5).max(500); // Distribute among categories, minimum 500 per category
 
     // 1. High-confidence existing pairs
     let high_conf_pairs = get_high_confidence_pairs(pool, pairs_per_category).await?;
@@ -656,7 +638,7 @@ pub async fn prewarm_service_pair_features_cache(
 
                         // Update counter
                         let count = counter_clone.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100 == 0 {
+                        if count % 500 == 0 {
                             debug!(
                                 "Service prewarming progress: {}/{} pairs processed",
                                 count, total_pairs

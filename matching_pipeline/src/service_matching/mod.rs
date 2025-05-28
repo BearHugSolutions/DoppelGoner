@@ -1,6 +1,4 @@
-// src/service_matching/mod.rs
-
-pub mod email;
-pub mod embedding;
-pub mod name;
-pub mod url;
+pub mod service_email;
+pub mod service_url;
+pub mod service_name;
+pub mod types;

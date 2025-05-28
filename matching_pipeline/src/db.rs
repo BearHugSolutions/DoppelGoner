@@ -49,14 +49,14 @@ pub struct ServiceComparisonCacheEntry {
 }
 
 #[derive(Debug, Clone)]
-pub struct NewServiceComparisonCacheEntry<'a> {
-    pub service_id_1: &'a str,
-    pub service_id_2: &'a str,
-    pub signature_1: &'a str,
-    pub signature_2: &'a str,
-    pub method_type: &'a str,
-    pub pipeline_run_id: Option<&'a str>,
-    pub comparison_result: &'a str,
+pub struct NewServiceComparisonCacheEntry {
+    pub service_id_1: String,
+    pub service_id_2: String,
+    pub signature_1: String,
+    pub signature_2: String,
+    pub method_type: String,
+    pub pipeline_run_id: Option<String>,
+    pub comparison_result: String,
     pub confidence_score: Option<f64>,
     pub snapshotted_features: Option<JsonValue>,
 }
@@ -68,6 +68,17 @@ pub struct ServiceDataSignature {
     pub relevant_attributes_snapshot: Option<JsonValue>,
     pub source_data_last_updated_at: Option<DateTime<Utc>>,
     pub signature_calculated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewServiceGroup {
+    pub proposed_id: String,
+    pub service_id_1: ServiceId,
+    pub service_id_2: ServiceId,
+    pub confidence_score: f64,
+    pub pre_rl_confidence_score: f64,
+    pub method_type: MatchMethodType,
+    pub match_values: MatchValues,
 }
 
 fn build_pg_config() -> Config {
@@ -100,10 +111,10 @@ pub async fn connect() -> Result<PgPool> {
     let manager = PostgresConnectionManager::new(config, NoTls);
 
     let pool = Pool::builder()
-        .max_size(60)
+        .max_size(90)
         .min_idle(Some(2))
         .idle_timeout(Some(Duration::from_secs(180)))
-        .connection_timeout(Duration::from_secs(15))
+        .connection_timeout(Duration::from_secs(40))
         .build(manager)
         .await
         .context("Failed to build database connection pool")?;
@@ -219,25 +230,12 @@ pub async fn upsert_service_group(
     let match_values_json =
         serde_json::to_value(match_values).context("Failed to serialize match values")?;
 
-    let s1_formatted = format!("{}", s1.0.trim());
-    let s2_formatted = format!("{}", s2.0.trim());
-
-    if s1_formatted.len() != 36 || s2_formatted.len() != 36 {
-        return Err(anyhow::anyhow!(
-            "Invalid service ID format: s1='{}' (len={}), s2='{}' (len={})",
-            s1_formatted,
-            s1_formatted.len(),
-            s2_formatted,
-            s2_formatted.len()
-        ));
-    }
-
     // Check for existing group
     let existing_row = conn
         .query_opt(
             "SELECT id, confirmed_status FROM public.service_group
              WHERE service_id_1 = $1 AND service_id_2 = $2 AND method_type = $3",
-            &[&s1_formatted, &s2_formatted, &method_type.as_str()],
+            &[&s1.0, &s2.0, &method_type.as_str()],
         )
         .await
         .context("Failed to check existing service_group")?;
@@ -276,8 +274,8 @@ pub async fn upsert_service_group(
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING_REVIEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             &[
                 &proposed_id,
-                &s1_formatted.as_str(),
-                &s2_formatted.as_str(),
+                &s1.0,
+                &s2.0,
                 &confidence_score,
                 &method_type.as_str(),
                 &match_values_json,
@@ -340,6 +338,226 @@ pub async fn insert_service_match_decision_detail_direct(
     Ok(id)
 }
 
+/// Batch upsert service groups. If they exist, they're updated. If not, they're inserted.
+/// Returns a vector of the service group IDs (either existing or newly inserted).
+/// Processes the batch using PostgreSQL's ON CONFLICT functionality for efficient upserts.
+pub async fn upsert_service_groups_batch(
+    pool: &PgPool,
+    service_groups: &[NewServiceGroup],
+) -> Result<Vec<String>> {
+    if service_groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for batch upsert service groups")?;
+    
+    let transaction = conn
+        .transaction()
+        .await
+        .context("Failed to start transaction for batch upsert service groups")?;
+
+    let mut all_ids = Vec::with_capacity(service_groups.len());
+
+    // Process in chunks to avoid exceeding parameter limits
+    const CHUNK_SIZE: usize = 1000;
+    
+    for chunk in service_groups.chunks(CHUNK_SIZE) {
+        let mut query = String::from(
+            "INSERT INTO public.service_group (
+                id, service_id_1, service_id_2, confidence_score, method_type, match_values,
+                pre_rl_confidence_score, confirmed_status, created_at, updated_at
+            ) VALUES "
+        );
+
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+        let mut param_groups = Vec::new();
+        let mut ordered_groups: Vec<(
+            &String,        // proposed_id
+            &ServiceId,     // service_id_1
+            &ServiceId,     // service_id_2  
+            &f64,           // confidence_score
+            String,         // method_type (now owned String)
+            serde_json::Value, // match_values_json
+            &f64,           // pre_rl_confidence_score
+        )> = Vec::new();
+
+        // Prepare data with proper ordering and serialization
+        for (i, group) in chunk.iter().enumerate() {
+            let base_idx = i * 7; // Fixed: only 7 parameters
+            param_groups.push(format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, 'PENDING_REVIEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                base_idx + 1,
+                base_idx + 2,
+                base_idx + 3,
+                base_idx + 4,
+                base_idx + 5,
+                base_idx + 6,
+                base_idx + 7
+            ));
+
+            // Ensure consistent ordering of service IDs
+            let (s1, s2) = if group.service_id_1.0 < group.service_id_2.0 {
+                (&group.service_id_1, &group.service_id_2)
+            } else {
+                (&group.service_id_2, &group.service_id_1)
+            };
+
+            let match_values_json = serde_json::to_value(&group.match_values)
+                .context("Failed to serialize match values for batch upsert")?;
+
+            // Store method_type string to avoid temporary value issues
+            let method_type_str = group.method_type.as_str().to_string();
+
+            ordered_groups.push((
+                &group.proposed_id,
+                s1,
+                s2,
+                &group.confidence_score,
+                method_type_str,
+                match_values_json,
+                &group.pre_rl_confidence_score,
+            ));
+        }
+
+        // Add parameters in the same order as the query
+        for (proposed_id, s1, s2, confidence_score, method_type_str, match_values_json, pre_rl_confidence_score) in &ordered_groups {
+            params.push(proposed_id);
+            params.push(&s1.0);
+            params.push(&s2.0);
+            params.push(*confidence_score);
+            params.push(method_type_str); // No need for & since it's already a String
+            params.push(match_values_json);
+            params.push(*pre_rl_confidence_score);
+        }
+
+        query.push_str(&param_groups.join(", "));
+        
+        // Add ON CONFLICT clause to handle upserts
+        query.push_str("
+            ON CONFLICT (service_id_1, service_id_2, method_type)
+            DO UPDATE SET
+                confidence_score = EXCLUDED.confidence_score,
+                match_values = EXCLUDED.match_values,
+                pre_rl_confidence_score = EXCLUDED.pre_rl_confidence_score,
+                confirmed_status = CASE 
+                    WHEN public.service_group.confirmed_status IN ('CONFIRMED', 'REJECTED') 
+                    THEN public.service_group.confirmed_status 
+                    ELSE 'PENDING_REVIEW' 
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING id"
+        );
+
+        let rows = transaction
+            .query(&query, &params[..])
+            .await
+            .context("Failed to batch upsert service_groups")?;
+
+        for row in rows {
+            let id: String = row.get(0);
+            all_ids.push(id);
+        }
+
+        debug!("Batch upserted {} service groups in chunk", chunk.len());
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("Failed to commit transaction for batch upsert service groups")?;
+
+    info!("Successfully batch upserted {} service groups", service_groups.len());
+    Ok(all_ids)
+}
+
+/// Batch insert service match decision details for the upserted service groups
+/// This is a companion function to use after upsert_service_groups_batch
+pub async fn insert_service_match_decision_details_batch(
+    pool: &PgPool,
+    details: &[(String, String, serde_json::Value, String, f64, f64, Option<i32>)], // (service_group_id, pipeline_run_id, features, method_type, pre_rl_conf, tuned_conf, tuner_version)
+) -> Result<Vec<Uuid>> {
+    if details.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for batch insert service match decision details")?;
+    
+    let transaction = conn
+        .transaction()
+        .await
+        .context("Failed to start transaction for batch insert service match decision details")?;
+
+    let mut all_ids = Vec::with_capacity(details.len());
+
+    // Process in chunks to avoid parameter limits
+    const CHUNK_SIZE: usize = 1000;
+    
+    for chunk in details.chunks(CHUNK_SIZE) {
+        let mut query = String::from(
+            "INSERT INTO clustering_metadata.service_match_decision_details (
+                service_group_id, pipeline_run_id, snapshotted_features,
+                method_type_at_decision, pre_rl_confidence_at_decision,
+                tuned_confidence_at_decision, confidence_tuner_version_at_decision
+            ) VALUES "
+        );
+
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+        let mut param_groups = Vec::new();
+
+        for (i, (service_group_id, pipeline_run_id, features, method_type, pre_rl_conf, tuned_conf, tuner_version)) in chunk.iter().enumerate() {
+            let base_idx = i * 7;
+            param_groups.push(format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                base_idx + 1,
+                base_idx + 2,
+                base_idx + 3,
+                base_idx + 4,
+                base_idx + 5,
+                base_idx + 6,
+                base_idx + 7
+            ));
+
+            params.push(service_group_id);
+            params.push(pipeline_run_id);
+            params.push(features);
+            params.push(method_type);
+            params.push(pre_rl_conf);
+            params.push(tuned_conf);
+            params.push(tuner_version);
+        }
+
+        query.push_str(&param_groups.join(", "));
+        query.push_str(" RETURNING id");
+
+        let rows = transaction
+            .query(&query, &params[..])
+            .await
+            .context("Failed to batch insert service_match_decision_details")?;
+
+        for row in rows {
+            let id_str: String = row.get(0);
+            let id = Uuid::parse_str(&id_str)
+                .context("Failed to parse returned ID string as UUID for service_match_decision_detail")?;
+            all_ids.push(id);
+        }
+
+        debug!("Batch inserted {} service match decision details in chunk", chunk.len());
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("Failed to commit transaction for batch insert service match decision details")?;
+
+    info!("Successfully batch inserted {} service match decision details", details.len());
+    Ok(all_ids)
+}
 /// Upserts an entity group. If it exists, it's updated. If not, it's inserted.
 /// Returns the ID of the entity group and a boolean indicating if a new group was inserted.
 pub async fn upsert_entity_group(
@@ -878,131 +1096,6 @@ pub async fn insert_suggestions_batch(
     Ok(ids)
 }
 
-// This is the older insert_service_group. The new `upsert_service_group` is more comprehensive.
-// We can mark this as deprecated or remove if `upsert_service_group` covers all needs.
-// For now, I'll leave it but comment it out to avoid confusion and ensure the new one is used.
-/*
-pub async fn insert_service_group(
-    pool: &PgPool,
-    id: &str,
-    service_id_1: &ServiceId,
-    service_id_2: &ServiceId,
-    confidence_score: f64,
-    pre_rl_confidence_score: f64,
-    method_type: MatchMethodType,
-    match_values: MatchValues,
-) -> Result<()> {
-    let conn = pool
-        .get()
-        .await
-        .context("Failed to get database connection for insert_service_group")?;
-
-    let (s1, s2) = if service_id_1.0 < service_id_2.0 {
-        (service_id_1, service_id_2)
-    } else {
-        (service_id_2, service_id_1)
-    };
-
-    let match_values_json =
-        serde_json::to_value(match_values).context("Failed to serialize match values")?;
-
-    let s1_formatted = format!("{}", s1.0.trim());
-    let s2_formatted = format!("{}", s2.0.trim());
-
-    if s1_formatted.len() != 36 || s2_formatted.len() != 36 {
-        return Err(anyhow::anyhow!(
-            "Invalid service ID format: s1='{}' (len={}), s2='{}' (len={})",
-            s1_formatted,
-            s1_formatted.len(),
-            s2_formatted,
-            s2_formatted.len()
-        ));
-    }
-
-    let existing_row = conn
-        .query_opt(
-            "SELECT id, confirmed_status FROM public.service_group
-         WHERE service_id_1 = $1 AND service_id_2 = $2 AND method_type = $3",
-            &[&s1_formatted, &s2_formatted, &method_type.as_str()],
-        )
-        .await
-        .context("Failed to check existing service_group")?;
-
-    if let Some(row) = existing_row {
-        let existing_id: String = row.get("id");
-        let existing_status: String = row.get("confirmed_status");
-
-        let new_status = match existing_status.as_str() {
-            "CONFIRMED" | "REJECTED" => existing_status,
-            _ => "PENDING_REVIEW".to_string(),
-        };
-
-        let update_result = conn
-            .execute(
-                "UPDATE public.service_group
-             SET confidence_score = $1,
-                 match_values = $2,
-                 pre_rl_confidence_score = $3,
-                 confirmed_status = $4,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $5",
-                &[
-                    &confidence_score,
-                    &match_values_json,
-                    &pre_rl_confidence_score,
-                    &new_status,
-                    &existing_id,
-                ],
-            )
-            .await;
-
-        match update_result {
-            Ok(rows_affected) => {
-                debug!(
-                    "Successfully updated service_group id {}. Rows affected: {}",
-                    existing_id, rows_affected
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to update service_group record: {}", e);
-                Err(anyhow::anyhow!("Database update failed: {}", e))
-            }
-        }
-    } else {
-        let insert_result = conn.execute(
-            "INSERT INTO public.service_group
-             (id, service_id_1, service_id_2, confidence_score, method_type, match_values,
-              pre_rl_confidence_score, confirmed_status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING_REVIEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-            &[
-                &id,
-                &s1_formatted,
-                &s2_formatted,
-                &confidence_score,
-                &method_type.as_str(),
-                &match_values_json,
-                &pre_rl_confidence_score,
-            ],
-        ).await;
-
-        match insert_result {
-            Ok(rows_affected) => {
-                debug!(
-                    "Successfully inserted service_group id {}. Rows affected: {}",
-                    id, rows_affected
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to insert service_group record: {}", e);
-                Err(anyhow::anyhow!("Database insertion failed: {}", e))
-            }
-        }
-    }
-}
-*/
-
 pub async fn get_service_comparison_cache_entry(
     pool: &PgPool,
     service_id_1: &str,
@@ -1056,7 +1149,7 @@ pub async fn get_service_comparison_cache_entry(
 
 pub async fn insert_service_comparison_cache_entry(
     pool: &PgPool,
-    entry: NewServiceComparisonCacheEntry<'_>,
+    entry: NewServiceComparisonCacheEntry,
 ) -> Result<()> {
     let conn = pool
         .get()

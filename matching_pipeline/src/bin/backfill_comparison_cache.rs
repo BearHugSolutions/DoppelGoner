@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 // Configuration for the backfill process
 const BATCH_SIZE_CACHE_OPS: usize = 200; // How many cache store operations to batch
-const MAX_CONCURRENT_DB_OPS: usize = 10; // Max parallel DB tasks
+const MAX_CONCURRENT_DB_OPS: usize = 5; // Max parallel DB tasks
 
 /// Represents the essential data from an entity_group row for backfilling.
 struct MinimalEntityGroup {

@@ -41,7 +41,7 @@ const COMPARISON_TYPE_ENTITY_PREFIX: &str = "ENTITY_";
 
 // Configuration for the backfill process
 pub const BATCH_SIZE_PAIRS: usize = 1000; // How many pairs to process in one logical batch
-pub const MAX_CONCURRENT_DB_OPS: usize = 10; // Max parallel BATCH tasks
+pub const MAX_CONCURRENT_DB_OPS: usize = 5; // Max parallel BATCH tasks
 
 /// Fetches current signatures for a *batch* of entities from `pipeline_state.entity_data_signatures`.
 pub async fn get_signatures_for_batch(

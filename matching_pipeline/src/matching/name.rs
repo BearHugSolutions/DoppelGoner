@@ -44,7 +44,7 @@ const MIN_TOKEN_OVERLAP: usize = 3;
 pub const MIN_TOKEN_LENGTH: usize = 2;
 
 const BATCH_SIZE: usize = 100;
-const MAX_CONCURRENT_BATCHES: usize = 8;
+const MAX_CONCURRENT_BATCHES: usize = 5;
 const MAX_CANDIDATES_PER_ENTITY: usize = 50;
 const MAX_TOTAL_CANDIDATE_PAIRS: usize = 75_000;
 
