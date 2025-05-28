@@ -1,12 +1,12 @@
 "use client"
 
-import { useEffect, useRef, useState, useCallback } from "react"
+import { useEffect, useRef, useState, useCallback, useMemo } from "react"
 import { useEntityResolution } from "@/context/entity-resolution-context"
 import { getVisualizationData } from "@/utils/api-client"
 import type { EntityNode, EntityLink, EntityGroup } from "@/types/entity-resolution"
 import * as d3 from "d3"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import { Info, ZoomIn, ZoomOut, Maximize, Minimize, RefreshCw } from "lucide-react"
+import { Info, ZoomIn, ZoomOut, Maximize, Minimize, RefreshCw, Move, RotateCcw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useResizeObserver } from "@/hooks/use-resize-observer"
@@ -17,6 +17,7 @@ export default function GraphVisualizer() {
 
   const containerRef = useRef<HTMLDivElement>(null)
   const svgRef = useRef<SVGSVGElement>(null)
+  const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null)
   const zoomRef = useRef<d3.ZoomBehavior<Element, unknown> | null>(null)
   const [nodes, setNodes] = useState<EntityNode[]>([])
   const [links, setLinks] = useState<EntityLink[]>([])
@@ -25,24 +26,167 @@ export default function GraphVisualizer() {
   const [hoverLink, setHoverLink] = useState<string | null>(null)
   const [nodeDetails, setNodeDetails] = useState<Record<string, any>>({})
   const [zoomLevel, setZoomLevel] = useState(1)
-  const [fullscreen, setFullscreen] = useState(false)
-  const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
+  const [rawDimensions, setRawDimensions] = useState({ width: 0, height: 0 })
+
+  // Memoize dimensions to prevent unnecessary recreations
+  const dimensions = useMemo(() => ({
+    width: rawDimensions.width,
+    height: rawDimensions.height
+  }), [rawDimensions.width, rawDimensions.height])
 
   // Track reviewed edges - use the actual edge IDs
-  const [reviewedEdges, setReviewedEdges] = useState<Record<string, "ACCEPTED" | "REJECTED">>({})
+  const [reviewedEdges, setReviewedEdges] = useState<Record<string, "CONFIRMED_MATCH" | "CONFIRMED_NON_MATCH">>({})
 
   // D3 simulation reference
   const simulationRef = useRef<d3.Simulation<d3.SimulationNodeDatum, undefined> | null>(null)
+  
+  // Flag to prevent state updates during programmatic zoom changes
+  const isProgrammaticZoomRef = useRef(false)
 
   // Use resize observer to track container dimensions
   useResizeObserver(containerRef, (entry) => {
     if (entry) {
       const { width, height } = entry.contentRect
-      setDimensions({ width, height })
+      // Only update if dimensions actually changed
+      setRawDimensions(prev => {
+        if (prev.width !== width || prev.height !== height) {
+          return { width, height }
+        }
+        return prev
+      })
     }
   })
 
+  // Memoized stable setters to prevent recreation
+  const stableSetSelectedEdgeId = useCallback((id: string) => {
+    setSelectedEdgeId(id)
+  }, [setSelectedEdgeId])
+
+  // Load node details - memoized with stable dependencies
+  const loadNodeDetails = useCallback(async (nodeId: string): Promise<void> => {
+    if (nodeDetails[nodeId]) return;
+
+    try {
+      setNodeDetails((prev) => ({
+        ...prev,
+        [nodeId]: { 
+          id: nodeId, 
+          name: `Node ${nodeId.slice(0, 6)}`,
+          organization: {
+            name: nodes.find(n => n.id === nodeId)?.name || `Node ${nodeId.slice(0, 6)}`,
+            description: null
+          },
+          addresses: [],
+          phones: []
+        },
+      }));
+    } catch (error) {
+      console.error("Failed to load node details:", error);
+    }
+  }, [nodeDetails, nodes]);
+
+  // Helper function to safely apply zoom transform
+  const safeZoomTo = useCallback((transform: d3.ZoomTransform) => {
+    if (!zoomRef.current || !svgRef.current) return
+    
+    // Validate transform values to prevent NaN
+    const safeTransform = d3.zoomIdentity
+      .translate(
+        isFinite(transform.x) ? transform.x : 0,
+        isFinite(transform.y) ? transform.y : 0
+      )
+      .scale(isFinite(transform.k) && transform.k > 0 ? transform.k : 1)
+    
+    d3.select(svgRef.current)
+      .transition()
+      .duration(500)
+      .call(zoomRef.current.transform as any, safeTransform)
+  }, [])
+
+  // Zoom control functions
+  const zoomIn = useCallback(() => {
+    if (!zoomRef.current || !svgRef.current) return
+    d3.select(svgRef.current)
+      .transition()
+      .duration(300)
+      .call(zoomRef.current.scaleBy as any, 1.5)
+  }, [])
+
+  const zoomOut = useCallback(() => {
+    if (!zoomRef.current || !svgRef.current) return
+    d3.select(svgRef.current)
+      .transition()
+      .duration(300)
+      .call(zoomRef.current.scaleBy as any, 1 / 1.5)
+  }, [])
+
+  const resetZoom = useCallback(() => {
+    console.log('[resetZoom] Reset zoom triggered');
+    console.log('[resetZoom] Refs available - zoomRef:', !!zoomRef.current, 'svgRef:', !!svgRef.current, 'gRef:', !!gRef.current);
+    
+    if (!zoomRef.current || !svgRef.current || !gRef.current) {
+      console.error('[resetZoom] Missing required refs');
+      return;
+    }
+    
+    const { width, height } = dimensions;
+    console.log('[resetZoom] Dimensions:', { width, height });
+    
+    if (width === 0 || height === 0) {
+      console.warn('[resetZoom] Invalid dimensions');
+      return;
+    }
+
+    try {
+      // Get the bounds of the graph content
+      const graphBounds = gRef.current.node()?.getBBox();
+      console.log('[resetZoom] Graph bounds:', graphBounds);
+      
+      if (!graphBounds || graphBounds.width === 0 || graphBounds.height === 0) {
+        // Fallback to simple center if no bounds available
+        console.log('[resetZoom] No valid bounds, using fallback center');
+        safeZoomTo(d3.zoomIdentity.translate(width / 2, height / 2).scale(1));
+        return;
+      }
+
+      // Calculate scale to fit the graph with some padding
+      const padding = 50;
+      const scaleX = (width - padding * 2) / graphBounds.width;
+      const scaleY = (height - padding * 2) / graphBounds.height;
+      const scale = Math.min(scaleX, scaleY, 2); // Cap at 2x zoom
+
+      // Calculate translation to center the graph
+      const centerX = graphBounds.x + graphBounds.width / 2;
+      const centerY = graphBounds.y + graphBounds.height / 2;
+      const translateX = width / 2 - scale * centerX;
+      const translateY = height / 2 - scale * centerY;
+
+      const transform = d3.zoomIdentity
+        .translate(translateX, translateY)
+        .scale(scale);
+
+      console.log('[resetZoom] Calculated transform:', {
+        scale,
+        translateX,
+        translateY,
+        centerX,
+        centerY
+      });
+
+      safeZoomTo(transform);
+    } catch (error) {
+      console.warn('[resetZoom] Error in resetZoom, falling back to simple center:', error);
+      safeZoomTo(d3.zoomIdentity.translate(width / 2, height / 2).scale(1));
+    }
+  }, [dimensions, safeZoomTo])
+
+  const centerGraph = useCallback(() => {
+    console.log('[centerGraph] Manual center requested');
+    resetZoom();
+  }, [resetZoom])
+
   async function loadVisualizationData() {
+    if (!selectedClusterId) return
     setLoading(true)
     try {
       const { nodes, links, entityGroups } = await getVisualizationData(selectedClusterId)
@@ -50,18 +194,11 @@ export default function GraphVisualizer() {
       setLinks(links)
       
       // Initialize reviewed edges based on entity groups
-      // We need to map entity groups to their corresponding edges
-      const reviewedEdgesMap: Record<string, 'ACCEPTED' | 'REJECTED'> = {}
+      const reviewedEdgesMap: Record<string, 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH'> = {}
       
-      // Group entity groups by their entities to find corresponding edges
       entityGroups.forEach((group: EntityGroup) => {
-        if (group.confirmed_status === 'ACCEPTED' || group.confirmed_status === 'REJECTED') {
-          // Find the edge that connects the entities in this group
-          // Since entity groups don't directly reference edges, we need to infer this
-          // This is a simplified approach - you may need to adjust based on your data relationships
-          
-          // For now, we'll track by group ID and map it later when we have edge selection
-          // A more robust solution would require the API to provide edge-to-group mappings
+        if (group.confirmed_status === 'CONFIRMED_MATCH' || group.confirmed_status === 'CONFIRMED_NON_MATCH') {
+          // Map entity groups to edges - this may need adjustment based on your data structure
         }
       })
       
@@ -70,7 +207,7 @@ export default function GraphVisualizer() {
       // Calculate review progress based on edge status from the API response
       const totalEdges = links.length
       const reviewedCount = links.filter(link => 
-        link.status === 'ACCEPTED' || link.status === 'REJECTED'
+        link.status === 'CONFIRMED_MATCH' || link.status === 'CONFIRMED_NON_MATCH'
       ).length
       const progress = totalEdges > 0 ? Math.round((reviewedCount / totalEdges) * 100) : 0
       
@@ -100,66 +237,76 @@ export default function GraphVisualizer() {
     loadVisualizationData()
   }, [selectedClusterId, updateReviewProgress, setSelectedEdgeId, refreshTrigger])
 
-  // Load node details
-  const loadNodeDetails = useCallback(async (nodeId: string): Promise<void> => {
-    if (nodeDetails[nodeId]) return
-
-    try {
-      // TODO: Implement node details loading if needed
-      // For now, we'll just set a placeholder
-      setNodeDetails((prev) => ({
-        ...prev,
-        [nodeId]: { 
-          id: nodeId, 
-          name: `Node ${nodeId.slice(0, 6)}`,
-          organization: {
-            name: nodes.find(n => n.id === nodeId)?.name || `Node ${nodeId.slice(0, 6)}`,
-            description: null
-          },
-          addresses: [],
-          phones: []
-        },
-      }))
-    } catch (error) {
-      console.error("Failed to load node details:", error)
-    }
-  }, [nodeDetails, nodes])
-
-  // Initialize and update D3 visualization
+  // Initialize and update D3 visualization - now with proper dependencies
   const updateVisualization = useCallback(() => {
+    console.log('[updateVisualization] Starting visualization update');
+    console.log('[updateVisualization] Conditions:', JSON.stringify({
+      svgRef: !!svgRef.current,
+      nodesLength: nodes.length,
+      linksLength: links.length,
+      dimensions: dimensions
+    }));
+    
     if (
       !svgRef.current ||
       nodes.length === 0 ||
       links.length === 0 ||
       dimensions.width === 0 ||
       dimensions.height === 0
-    )
-      return
-
-    // Clear previous visualization
-    d3.select(svgRef.current).selectAll("*").remove()
-
-    const width = dimensions.width
-    const height = dimensions.height
-
-    // Create SVG container with zoom behavior
-    const svg = d3.select(svgRef.current).attr("width", width).attr("height", height)
-
-    const g = svg.append("g")
-
-    // Initialize or reuse zoom behavior
-    if (!zoomRef.current) {
-      zoomRef.current = d3
-        .zoom()
-        .scaleExtent([0.1, 4])
-        .on("zoom", (event) => {
-          g.attr("transform", event.transform)
-          setZoomLevel(event.transform.k)
-        })
+    ) {
+      console.log('[updateVisualization] Skipping update due to missing requirements');
+      return;
     }
 
+    // Store current transform before clearing
+    const currentTransform = svgRef.current ? d3.zoomTransform(svgRef.current) : d3.zoomIdentity;
+    console.log('[updateVisualization] Preserving current transform:', JSON.stringify({
+      x: currentTransform.x,
+      y: currentTransform.y,
+      k: currentTransform.k
+    }));
+
+    // Clear previous visualization
+    d3.select(svgRef.current).selectAll("*").remove();
+    console.log('[updateVisualization] Cleared previous visualization');
+
+    const width = dimensions.width;
+    const height = dimensions.height;
+
+    // Create SVG container
+    const svg = d3.select(svgRef.current)
+      .attr("width", width)
+      .attr("height", height);
+
+    // Create main group for zooming and panning
+    const g = svg.append("g");
+    gRef.current = g;
+
+    // Initialize zoom behavior
+    zoomRef.current = d3
+      .zoom<Element, unknown>()
+      .scaleExtent([0.1, 4])
+      .on("zoom", (event) => {
+        const transform = event.transform;
+        console.log('[updateVisualization] Zoom event:', {
+          x: transform.x,
+          y: transform.y,
+          k: transform.k,
+          isProgrammatic: isProgrammaticZoomRef.current
+        });
+        // Validate transform before applying
+        if (isFinite(transform.x) && isFinite(transform.y) && isFinite(transform.k) && transform.k > 0) {
+          g.attr("transform", transform.toString());
+          // Only update zoom level state for user-initiated zooms, not programmatic ones
+          if (!isProgrammaticZoomRef.current) {
+            setZoomLevel(transform.k);
+          }
+        }
+      });
+
     // Apply zoom behavior to the SVG
-    svg.call(zoomRef.current as any)
+    svg.call(zoomRef.current as any);
+    console.log('[updateVisualization] Applied zoom behavior');
 
     // Create links
     const link = g
@@ -170,41 +317,29 @@ export default function GraphVisualizer() {
       .append("line")
       .attr("stroke-width", (d) => 1 + d.weight * 3)
       .attr("stroke", (d) => {
-        // Use the status from the link itself (from API response)
-        if (d.status === "ACCEPTED") return "#000"
-        if (d.status === "REJECTED") return "transparent"
-
-        // Color spectrum based on confidence for pending review
+        if (d.status === "CONFIRMED_MATCH") return "#000"
+        if (d.status === "CONFIRMED_NON_MATCH") return "transparent"
         return d3.interpolateRgb("#f87171", "#60a5fa")(d.weight)
       })
       .attr("stroke-opacity", (d) => {
-        if (d.status === "REJECTED") return 0
+        if (d.status === "CONFIRMED_NON_MATCH") return 0
         return 0.6
       })
       .attr("id", (d) => `link-${d.id}`)
       .on("mouseover", (event, d) => {
-        // Clear any existing hover state first
-        setHoverLink(null)
-        // Set after a small delay to prevent flickering
-        setTimeout(() => {
-          setHoverLink(d.id)
-          d3.select(`#link-${d.id}`)
-            .attr("stroke-width", 1 + d.weight * 5)
-            .attr("stroke-opacity", 0.8)
-        }, 50)
+        setHoverLink(d.id);
+        d3.select(`#link-${d.id}`)
+          .attr("stroke-width", 1 + d.weight * 5)
+          .attr("stroke-opacity", 0.8);
       })
       .on("mouseout", (event, d) => {
-        setTimeout(() => {
-          if (hoverLink === d.id) {
-            setHoverLink(null)
-            d3.select(`#link-${d.id}`)
-              .attr("stroke-width", 1 + d.weight * 3)
-              .attr("stroke-opacity", d.status === "REJECTED" ? 0 : 0.6)
-          }
-        }, 100)
+        setHoverLink(null);
+        d3.select(`#link-${d.id}`)
+          .attr("stroke-width", 1 + d.weight * 3)
+          .attr("stroke-opacity", d.status === "CONFIRMED_NON_MATCH" ? 0 : 0.6);
       })
       .on("click", (event, d: EntityLink) => {
-        setSelectedEdgeId(d.id)
+        stableSetSelectedEdgeId(d.id)
         event.stopPropagation()
       })
 
@@ -221,23 +356,13 @@ export default function GraphVisualizer() {
       .attr("stroke-width", 1)
       .attr("id", (d) => `node-${d.id}`)
       .on("mouseover", (event, d) => {
-        // Clear any existing hover state first
-        setHoverNode(null)
-        // Set after a small delay to prevent flickering
-        setTimeout(() => {
-          setHoverNode(d.id)
-          d3.select(`#node-${d.id}`).attr("fill", "#d1d5db").attr("r", 10)
-
-          loadNodeDetails(d.id)
-        }, 50)
+        setHoverNode(d.id);
+        d3.select(`#node-${d.id}`).attr("fill", "#d1d5db").attr("r", 10);
+        loadNodeDetails(d.id);
       })
       .on("mouseout", (event, d) => {
-        setTimeout(() => {
-          if (hoverNode === d.id) {
-            setHoverNode(null)
-            d3.select(`#node-${d.id}`).attr("fill", "#e5e7eb").attr("r", 8)
-          }
-        }, 100)
+        setHoverNode(null);
+        d3.select(`#node-${d.id}`).attr("fill", "#e5e7eb").attr("r", 8);
       })
       .call(d3.drag().on("start", dragstarted).on("drag", dragged).on("end", dragended) as any)
 
@@ -254,8 +379,11 @@ export default function GraphVisualizer() {
       .attr("dy", 3)
       .attr("fill", "#4b5563")
 
+    console.log('[updateVisualization] Created DOM elements');
+
     // Create simulation
     if (simulationRef.current) {
+      console.log('[updateVisualization] Stopping previous simulation');
       simulationRef.current.stop()
     }
 
@@ -283,8 +411,29 @@ export default function GraphVisualizer() {
 
         label.attr("x", (d) => (d as any).x).attr("y", (d) => (d as any).y)
       })
+      .on("end", () => {
+        console.log('[updateVisualization] Simulation ended');
+        // DON'T auto-reset zoom here - this was overriding user zoom actions!
+        // The user can manually reset if they want to center the graph
+      });
 
-    simulationRef.current = simulation
+    simulationRef.current = simulation;
+    console.log('[updateVisualization] Created new simulation');
+
+    // Restore the previous transform if it was meaningful (not identity)
+    if (currentTransform.k !== 1 || currentTransform.x !== 0 || currentTransform.y !== 0) {
+      console.log('[updateVisualization] Restoring previous transform');
+      setTimeout(() => {
+        if (zoomRef.current && svgRef.current) {
+          isProgrammaticZoomRef.current = true;
+          svg.call(zoomRef.current.transform as any, currentTransform);
+          // Reset flag after restore
+          setTimeout(() => {
+            isProgrammaticZoomRef.current = false;
+          }, 100);
+        }
+      }, 100);
+    }
 
     // Highlight selected edge
     if (selectedEdgeId) {
@@ -292,35 +441,6 @@ export default function GraphVisualizer() {
         .attr("stroke-width", 1 + (links.find((l) => l.id === selectedEdgeId)?.weight || 0) * 5)
         .attr("stroke-opacity", 0.8)
     }
-
-    // Auto-fit the graph to the viewport
-    setTimeout(() => {
-      const bounds = g.node()?.getBBox()
-      if (bounds) {
-        const dx = bounds.width
-        const dy = bounds.height
-        const x = bounds.x + dx / 2
-        const y = bounds.y + dy / 2
-
-        // Calculate the scale to fit the graph
-        const scale = 0.9 / Math.max(dx / width, dy / height)
-        const translate = [width / 2 - scale * x, height / 2 - scale * y]
-
-        // Apply the transform using the shared zoom reference
-        if (zoomRef.current) {
-          const transform = d3.zoomIdentity
-            .translate(translate[0], translate[1])
-            .scale(scale);
-          
-          svg
-            .transition()
-            .duration(500)
-            .call(zoomRef.current.transform as any, transform);
-        }
-        
-        setZoomLevel(scale)
-      }
-    }, 500) // Wait for simulation to stabilize
 
     function dragstarted(event: any) {
       if (!event.active) simulation.alphaTarget(0.3).restart()
@@ -338,16 +458,22 @@ export default function GraphVisualizer() {
       event.subject.fx = null
       event.subject.fy = null
     }
-  }, [dimensions, nodes, links, selectedEdgeId, nodeDetails, setSelectedEdgeId, loadNodeDetails])
+  }, [dimensions, nodes, links, selectedEdgeId, stableSetSelectedEdgeId, loadNodeDetails])
 
   // Update visualization when data or dimensions change
   useEffect(() => {
+    console.log('[useEffect] Triggering updateVisualization due to dependency change');
+    console.log('[useEffect] Dependencies changed:', JSON.stringify({
+      hasDimensions: dimensions.width > 0 && dimensions.height > 0,
+      hasNodes: nodes.length > 0,
+      hasLinks: links.length > 0,
+      selectedEdgeId
+    }));
     updateVisualization()
   }, [updateVisualization])
 
-  // Handle edge status updates from external sources (after review submission)
+  // Handle edge status updates from external sources
   useEffect(() => {
-    // Listen for edge status updates
     const handleEdgeStatusUpdate = (event: CustomEvent) => {
       const { edgeId, status } = event.detail
       setReviewedEdges(prev => ({
@@ -357,9 +483,9 @@ export default function GraphVisualizer() {
       
       // Update link appearance
       const linkElement = d3.select(`#link-${edgeId}`)
-      if (status === "ACCEPTED") {
+      if (status === "CONFIRMED_MATCH") {
         linkElement.attr("stroke", "#000").attr("stroke-opacity", 0.8)
-      } else if (status === "REJECTED") {
+      } else if (status === "CONFIRMED_NON_MATCH") {
         linkElement.attr("stroke", "transparent").attr("stroke-opacity", 0)
       }
 
@@ -380,7 +506,6 @@ export default function GraphVisualizer() {
       if (nextUnreviewedEdge) {
         setSelectedEdgeId(nextUnreviewedEdge.id)
       } else if (progress >= 100) {
-        // If all edges are reviewed, clear selection
         setSelectedEdgeId("")
       }
     }
@@ -415,10 +540,7 @@ export default function GraphVisualizer() {
   return (
     <div
       ref={containerRef}
-      className={`relative ${fullscreen ? "fixed inset-0 z-50 bg-white p-4 flex flex-col" : "h-full flex flex-col"}`}
-      style={{
-        height: fullscreen ? "100vh" : "100%",
-      }}
+      className={`relative h-full flex flex-col`}
     >
       {loading ? (
         <div className="flex justify-center items-center h-full">
@@ -430,6 +552,67 @@ export default function GraphVisualizer() {
         </div>
       ) : (
         <>
+          {/* Zoom Toolbar */}
+          <div className="absolute top-4 right-4 z-30 flex flex-col gap-1 bg-white/90 backdrop-blur-sm rounded-lg p-2 shadow-lg border">
+            <TooltipProvider>
+              <div className="flex flex-col gap-1">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={zoomIn}
+                      className="h-8 w-8 p-0"
+                    >
+                      <ZoomIn className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">
+                    <p>Zoom In</p>
+                  </TooltipContent>
+                </Tooltip>
+
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={zoomOut}
+                      className="h-8 w-8 p-0"
+                    >
+                      <ZoomOut className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">
+                    <p>Zoom Out</p>
+                  </TooltipContent>
+                </Tooltip>
+
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={centerGraph}
+                      className="h-8 w-8 p-0"
+                    >
+                      <RotateCcw className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">
+                    <p>Reset & Center</p>
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+            </TooltipProvider>
+
+            {/* Zoom Level Indicator */}
+            <div className="text-xs text-center text-gray-500 mt-1 min-w-0">
+              {Math.round(zoomLevel * 100)}%
+            </div>
+          </div>
+
+          {/* Node Hover Tooltip */}
           {hoverNode && nodeDetails[hoverNode] && (
             <div
               className="absolute bg-white p-3 rounded-md shadow-md border text-sm z-20 pointer-events-none"
@@ -455,18 +638,19 @@ export default function GraphVisualizer() {
             </div>
           )}
 
+          {/* Link Hover Tooltip */}
           {hoverLink && !selectedEdgeId && (
             <div
               className="absolute bg-white p-3 rounded-md shadow-md border text-sm z-20 pointer-events-none"
               style={{
                 left: Math.min(
-                  dimensions.width - 200, // Prevent overflow to the right
+                  dimensions.width - 200,
                   ((d3.select(`#link-${hoverLink}`).node() as any)?.x1.baseVal.value +
                     (d3.select(`#link-${hoverLink}`).node() as any)?.x2.baseVal.value) /
                     2 || 0,
                 ),
                 top: Math.min(
-                  dimensions.height - 100, // Prevent overflow to the bottom
+                  dimensions.height - 100,
                   ((d3.select(`#link-${hoverLink}`).node() as any)?.y1.baseVal.value +
                     (d3.select(`#link-${hoverLink}`).node() as any)?.y2.baseVal.value) /
                     2 || 0,
@@ -489,6 +673,7 @@ export default function GraphVisualizer() {
             </div>
           )}
 
+          {/* Main SVG */}
           <svg
             ref={svgRef}
             className="w-full h-full border rounded-md bg-white"
