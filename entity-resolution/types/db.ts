@@ -1,3 +1,5 @@
+// types/db.ts
+
 import { Pool, PoolConfig } from 'pg';
 
 // Database connection configuration
@@ -41,6 +43,9 @@ export interface ServiceGroup {
   confirmed_status: 'PENDING_REVIEW' | 'CONFIRMED' | 'REJECTED';
   created_at: Date;
   updated_at: Date;
+  group_cluster_id?: string | null;
+  reviewed_at?: Date | null;
+  reviewer_id?: string | null;
 }
 
 export interface NewServiceGroup {
@@ -53,18 +58,21 @@ export interface NewServiceGroup {
   match_values: Record<string, unknown>;
 }
 
-// Entity Group types
+// Entity Group types - Updated to match actual schema
 export interface EntityGroup {
   id: string;
   entity_id_1: string;
   entity_id_2: string;
-  confidence_score: number;
-  pre_rl_confidence_score: number;
+  confidence_score: number | null;
+  pre_rl_confidence_score: number | null;
   method_type: string;
   match_values: Record<string, unknown>;
-  confirmed_status: 'PENDING_REVIEW' | 'CONFIRMED' | 'REJECTED';
-  created_at: Date;
-  updated_at: Date;
+  confirmed_status: 'PENDING_REVIEW' | 'CONFIRMED' | 'DENIED';
+  created_at: Date | null;
+  updated_at: Date | null;
+  group_cluster_id?: string | null;
+  reviewed_at?: Date | null;
+  reviewer_id?: string | null;
 }
 
 export interface NewEntityGroup {
@@ -75,6 +83,68 @@ export interface NewEntityGroup {
   pre_rl_confidence_score: number;
   method_type: string;
   match_values: Record<string, unknown>;
+}
+
+// Entity Group Cluster types
+export interface EntityGroupCluster {
+  id: string;
+  name: string | null;
+  description: string | null;
+  entity_count: number;
+  group_count: number;
+  average_coherence_score: number | null;
+  created_at: Date | null;
+  updated_at: Date | null;
+  source_cluster_id?: string | null;
+  is_user_modified?: boolean;
+}
+
+// Service Group Cluster types
+export interface ServiceGroupCluster {
+  id: string;
+  name: string | null;
+  description: string | null;
+  service_count: number;
+  service_group_count: number;
+  average_coherence_score: number | null;
+  created_at: Date | null;
+  updated_at: Date | null;
+}
+
+// Entity types
+export interface Entity {
+  id: string;
+  organization_id: string;
+  name: string | null;
+  created_at: Date | null;
+  updated_at: Date | null;
+  source_system: string | null;
+  source_id: string | null;
+}
+
+// Entity Edge Visualization types
+export interface EntityEdgeVisualization {
+  id: string;
+  cluster_id: string;
+  entity_id_1: string;
+  entity_id_2: string;
+  edge_weight: number;
+  details: Record<string, unknown> | null;
+  pipeline_run_id: string | null;
+  created_at: Date;
+  updated_at?: Date | null;
+}
+
+// Service Edge Visualization types
+export interface ServiceEdgeVisualization {
+  id: string;
+  service_group_cluster_id: string;
+  service_id_1: string;
+  service_id_2: string;
+  edge_weight: number;
+  details: Record<string, unknown> | null;
+  pipeline_run_id: string;
+  created_at: Date;
 }
 
 // Service Comparison Cache types
