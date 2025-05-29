@@ -13,16 +13,14 @@ export const metadata: Metadata = {
   description: "Review and manage entity clusters.",
 };
 
-
-
 export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className={inter.className}>
+    <html lang="en" suppressHydrationWarning className="h-full">
+      <body className={`${inter.className} h-full`}>
         <AuthProvider>
           <ThemeProvider
             attribute="class"
