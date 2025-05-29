@@ -70,9 +70,9 @@ export interface EntityNode {
 
 export interface EntityLink {
   id: string;
-  source: string;
-  target: string;
-  weight: number;
+  source: string; // entity_id_1
+  target: string; // entity_id_2
+  weight: number; // edge_weight
   status?: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH';
 }
 
@@ -92,12 +92,15 @@ export interface VisualizationEntityEdge {
   };
   pipeline_run_id: string | null;
   created_at: Date;
+  // FIX: Added status and confirmed_status to align with usage in context
+  status?: EntityLink['status'];
+  confirmed_status?: EntityGroup['confirmed_status']; // Or more specific if needed
 }
 
 // Match values structure
 export interface MatchValues {
   type?: string;
-  values: Record<string, any>;
+  values: Record<string, any>; // Consider defining more specific types if possible
 }
 
 // API request/response types
@@ -131,13 +134,13 @@ export interface ClustersResponse {
 
 export interface VisualizationDataResponse {
   nodes: EntityNode[];
-  links: EntityLink[];
-  entityGroups: EntityGroup[];
+  links: EntityLink[]; // Represents the edges in the graph visualization
+  entityGroups: EntityGroup[]; // Underlying groups, potentially for all links in visualization
 }
 
 export interface ConnectionDataResponse {
-  edge: VisualizationEntityEdge;
-  entityGroups: EntityGroup[];
+  edge: VisualizationEntityEdge; // The specific edge being reviewed
+  entityGroups: EntityGroup[]; // EntityGroups specifically related to this edge
   matchDecisions: MatchDecisionDetails[];
   entity1: Entity;
   entity2: Entity;
@@ -165,7 +168,30 @@ export interface SuggestedAction {
   updated_at: Date;
 }
 
-// Service types (for future use)
+// Optimistic Update Queue Types (moved from context file for better organization)
+export interface ReviewOperation {
+  groupId: string;
+  originalGroupStatus: EntityGroup['confirmed_status'];
+}
+
+export interface QueuedReviewBatch {
+  batchId: string;
+  edgeId: string;
+  clusterId: string;
+  decision: EntityGroupReviewDecision;
+  reviewerId: string;
+  operations: ReviewOperation[];
+  originalEdgeStatus: EntityLink['status']; // Status of the edge before optimistic update
+  optimisticEdgeStatus: EntityLink['status']; // Status applied optimistically to the edge
+  optimisticGroupStatus: EntityGroup['confirmed_status']; // Status applied optimistically to groups
+  attempt: number;
+  error?: string;
+  processedOperations: Set<string>; // groupIds that succeeded in this batch
+  failedOperations: Set<string>; // groupIds that failed in the current attempt for this batch
+  isTerminalFailure?: boolean;
+}
+
+// Service types (for future use) - Keep as is if not directly related to errors
 export interface ServiceGroup {
   id: string;
   service_id_1: string;
