@@ -1,20 +1,13 @@
 // app/api/visualization/[clusterId]/route.ts
 import { NextResponse, NextRequest } from 'next/server';
 import { query } from '@/types/db';
-// Import the function to get user schema from session
-import { getUserSchemaFromSession } from '@/utils/auth-db'; // Adjust path if your auth-db.ts is elsewhere
+import { getUserSchemaFromSession } from '@/utils/auth-db';
 
 export async function GET(
   request: NextRequest,
   { params }: { params: { clusterId: string } }
-  // Note: If the error "params should be awaited" persists,
-  // you might need to investigate how `params` is handled in your Next.js version/config.
-  // The typical signature above should make `params.clusterId` directly accessible.
-  // Refer to: https://nextjs.org/docs/messages/sync-dynamic-apis
 ) {
-  // Retrieve the user's schema using the session
   const userSchema = await getUserSchemaFromSession(request);
-
   if (!userSchema) {
     return NextResponse.json(
       { error: 'Unauthorized: User session not found or invalid.' },
@@ -22,12 +15,10 @@ export async function GET(
     );
   }
 
-  const { clusterId } = await params; // Accessing clusterId from params
+  const { clusterId } = await params;
 
   try {
-    // Get nodes (entities) for this cluster.
-    // 'entity' table is in the 'public' schema.
-    // 'entity_group' table is in the user's schema.
+    // Get nodes (entities) for this cluster
     const nodesSql = `
       SELECT 
         e.id,
@@ -35,15 +26,14 @@ export async function GET(
         e.name,
         e.source_system,
         e.source_id
-      FROM public.entity e  -- Corrected: Query 'public.entity'
+      FROM public.entity e
       JOIN "${userSchema}".entity_group eg ON e.id = eg.entity_id_1 OR e.id = eg.entity_id_2
       WHERE eg.group_cluster_id = $1
       GROUP BY e.id, e.organization_id, e.name, e.source_system, e.source_id
     `;
     const nodes = await query(nodesSql, [clusterId]);
 
-    // Get edges (connections between entities).
-    // 'entity_edge_visualization' table is in the user's schema.
+    // Get edges with their review status - SIMPLIFIED!
     const edgesSql = `
       SELECT 
         eev.id,
@@ -51,14 +41,14 @@ export async function GET(
         eev.entity_id_2,
         eev.edge_weight as weight,
         eev.details,
+        eev.confirmed_status,  -- Now directly available!
         eev.created_at
-      FROM "${userSchema}".entity_edge_visualization eev
+      FROM public.entity_edge_visualization eev
       WHERE eev.cluster_id = $1
     `;
     const edges = await query(edgesSql, [clusterId]);
 
-    // Get entity groups for tooltips.
-    // 'entity_group' table is in the user's schema.
+    // Get entity groups for detailed tooltips (still needed for match details)
     const entityGroupsSql = `
       SELECT 
         eg.id,
@@ -79,20 +69,17 @@ export async function GET(
       target: edge.entity_id_2,
       weight: edge.weight,
       details: edge.details,
+      status: edge.confirmed_status,  // Direct from edge table!
       created_at: edge.created_at
     }));
 
-    const responseData = {
+    return NextResponse.json({
       nodes,
       links,
       entityGroups
-    };
-    
-    // console.log('Visualization API Response:', JSON.stringify(responseData, null, 2));
-    return NextResponse.json(responseData);
+    });
   } catch (error) {
     console.error('Error fetching visualization data:', error);
-    console.error(`Error occurred for schema: ${userSchema}, clusterId: ${clusterId}`);
     return NextResponse.json(
       { error: 'Failed to fetch visualization data' },
       { status: 500 }

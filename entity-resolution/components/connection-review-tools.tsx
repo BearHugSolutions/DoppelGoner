@@ -1,10 +1,10 @@
 // components/connection-review-tools.tsx
+
 "use client"
 
 import { useEffect, useState, useCallback } from "react";
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import {
-  getConnectionData,
   postEntityGroupFeedback,
   triggerClusterFinalization
 } from "@/utils/api-client";
@@ -12,9 +12,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { Check, ChevronDown, ChevronUp, X, AlertCircle, Info, Loader2, AlertTriangle } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, X, AlertCircle, Info, Loader2, AlertTriangle, RefreshCw, CheckCircle, XCircle, SkipForward } from "lucide-react";
 import type {
   VisualizationEntityEdge,
   EntityGroup,
@@ -22,7 +21,6 @@ import type {
   Entity,
   EntityGroupReviewDecision,
   EntityGroupReviewApiPayload,
-  MatchValues
 } from "@/types/entity-resolution";
 import { useAuth } from "@/context/auth-context";
 
@@ -101,66 +99,47 @@ const getSuggestedActions = (entityGroups: EntityGroup[]) => {
 export default function ConnectionReviewTools() {
   const { 
     selectedEdgeId, 
-    triggerRefresh, 
     selectedClusterId, 
-    setSelectedEdgeId,
-    setLastReviewedEdgeId
+    currentConnectionData,
+    actions,
+    queries,
   } = useEntityResolution();
   const { currentUser } = useAuth();
 
-  const [loading, setLoading] = useState(false);
-  const [edge, setEdge] = useState<VisualizationEntityEdge | null>(null);
-  const [entityGroups, setEntityGroups] = useState<EntityGroup[]>([]);
-  const [matchDecisions, setMatchDecisions] = useState<MatchDecisionDetails[]>([]);
-  const [entity1, setEntity1] = useState<Entity | null>(null);
-  const [entity2, setEntity2] = useState<Entity | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [isExpanded, setIsExpanded] = useState(true);
-  const [notes, setNotes] = useState("");
   const [feedbackMessage, setFeedbackMessage] = useState<{type: 'error' | 'success' | 'info', text: string} | null>(null);
 
+  // Get edge review status directly
+  const edgeStatus = selectedEdgeId ? queries.getEdgeStatus(selectedEdgeId) : null;
+  const isEdgeReviewed = selectedEdgeId ? queries.isEdgeReviewed(selectedEdgeId) : false;
+
+  // Load connection data when edge changes
   useEffect(() => {
-    if (!selectedEdgeId) {
-      setEdge(null);
-      setEntityGroups([]);
-      setMatchDecisions([]);
-      setEntity1(null);
-      setEntity2(null);
-      setFeedbackMessage(null);
-      setNotes("");
-      setIsExpanded(true);
-      return;
+    if (selectedEdgeId && !currentConnectionData && !queries.isConnectionDataLoading(selectedEdgeId)) {
+      actions.loadConnectionData(selectedEdgeId);
     }
+  }, [selectedEdgeId, currentConnectionData, queries, actions]);
 
-    async function loadConnectionData() {
-      setLoading(true);
-      setFeedbackMessage(null);
-      setNotes("");
-      try {
-        const connectionData = await getConnectionData(selectedEdgeId!);
-        setEdge(connectionData.edge);
-        setEntityGroups(connectionData.entityGroups);
-        setMatchDecisions(connectionData.matchDecisions || []);
-        setEntity1(connectionData.entity1);
-        setEntity2(connectionData.entity2);
-        setIsExpanded(true);
-      } catch (error) {
-        console.error("Failed to load connection data:", error);
-        setFeedbackMessage({type: 'error', text: error instanceof Error ? error.message : "Failed to load connection data."});
-        setEdge(null);
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    loadConnectionData();
+  // Reset UI state when edge changes
+  useEffect(() => {
+    setFeedbackMessage(null);
+    setIsExpanded(true);
   }, [selectedEdgeId]);
 
   const handleSubmitFeedback = async (decision: EntityGroupReviewDecision) => {
-    if (!selectedEdgeId || !edge || !currentUser?.id || !selectedClusterId) {
+    if (!selectedEdgeId || !currentConnectionData?.edge || !currentUser?.id || !selectedClusterId) {
       setFeedbackMessage({type: 'error', text: "Cannot submit feedback: Missing critical data (edge, user, or cluster)."});
       return;
     }
+    
+    // Prevent re-review of already reviewed edges
+    if (isEdgeReviewed) {
+      setFeedbackMessage({type: 'info', text: "This connection has already been reviewed and cannot be changed."});
+      return;
+    }
+    
+    const { edge, entityGroups } = currentConnectionData;
     
     const relevantEntityGroups = entityGroups.filter(group =>
         (group.entity_id_1 === edge.entity_id_1 && group.entity_id_2 === edge.entity_id_2) ||
@@ -169,8 +148,8 @@ export default function ConnectionReviewTools() {
 
     if (relevantEntityGroups.length === 0) {
         setFeedbackMessage({type: 'info', text: "No underlying match groups found for this specific connection. Marking as reviewed and advancing."});
-        setLastReviewedEdgeId(selectedEdgeId);
-        triggerRefresh();
+        actions.setLastReviewedEdgeId(selectedEdgeId);
+        actions.selectNextUnreviewedEdge();
         return;
     }
 
@@ -182,14 +161,17 @@ export default function ConnectionReviewTools() {
         const payload: EntityGroupReviewApiPayload = {
           decision,
           reviewerId: currentUser.id,
-          notes: notes || undefined,
         };
         await postEntityGroupFeedback(group.id, payload);
       }
       
       setFeedbackMessage({type: 'success', text: "Feedback submitted. Finalizing cluster review..."});
 
-      // Attempt to finalize the cluster (this will check if all groups are reviewed)
+      // Invalidate data to force refresh with new edge status
+      actions.invalidateConnectionData(selectedEdgeId);
+      actions.invalidateVisualizationData(selectedClusterId);
+
+      // Attempt to finalize the cluster
       try {
         const finalizationResponse = await triggerClusterFinalization(selectedClusterId);
         console.log('Cluster finalization status:', finalizationResponse);
@@ -200,13 +182,17 @@ export default function ConnectionReviewTools() {
         }
         setFeedbackMessage({type: 'info', text: finalMessage});
       } catch (finalizationError) {
-        // Finalization might fail if not all groups are reviewed yet - this is expected
         console.log('Cluster finalization not ready yet:', finalizationError);
         setFeedbackMessage({type: 'success', text: "Feedback submitted successfully. Continue reviewing other connections in this cluster."});
       }
 
-      setLastReviewedEdgeId(selectedEdgeId);
-      triggerRefresh();
+      // Mark this edge as reviewed and trigger refresh
+      actions.setLastReviewedEdgeId(selectedEdgeId);
+      actions.triggerRefresh(); // This will trigger data refresh
+
+      // IMPORTANT: Only auto-advance after submitting feedback
+      // This replaces the automatic effect that was in the context
+      actions.checkAndAdvanceIfComplete();
 
     } catch (error) {
       console.error("Failed to submit feedback:", error);
@@ -217,7 +203,22 @@ export default function ConnectionReviewTools() {
     }
   };
 
-  if (!selectedEdgeId && !loading) {
+  const handleRetryLoad = useCallback(() => {
+    if (selectedEdgeId) {
+      actions.invalidateConnectionData(selectedEdgeId);
+      actions.loadConnectionData(selectedEdgeId);
+    }
+  }, [selectedEdgeId, actions]);
+
+  const handleSkipToNext = useCallback(() => {
+    actions.selectNextUnreviewedEdge();
+  }, [actions]);
+
+  // Get current loading/error state
+  const isLoading = selectedEdgeId ? queries.isConnectionDataLoading(selectedEdgeId) : false;
+  const error = selectedEdgeId ? queries.getConnectionError(selectedEdgeId) : null;
+
+  if (!selectedEdgeId && !isLoading) {
     return (
       <div className="flex justify-center items-center h-[100px] text-muted-foreground p-4 border rounded-md bg-card shadow">
         Select a connection from the graph to review its details.
@@ -225,7 +226,7 @@ export default function ConnectionReviewTools() {
     );
   }
 
-  if (loading) {
+  if (isLoading) {
     return (
       <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
         <Loader2 className="h-6 w-6 animate-spin text-primary" />
@@ -233,18 +234,28 @@ export default function ConnectionReviewTools() {
     );
   }
   
-  if (!edge && !loading) {
+  if (error || (!currentConnectionData && !isLoading)) {
     return (
       <div className="flex flex-col justify-center items-center h-[150px] text-destructive p-4 border rounded-md bg-card shadow">
         <AlertCircle className="h-6 w-6 mb-2" />
         <p className="font-semibold">Could not load details for the selected connection.</p>
-        {feedbackMessage?.type === 'error' && <p className="text-xs mt-1">{feedbackMessage.text}</p>}
-         <Button variant="outline" size="sm" onClick={() => setSelectedEdgeId(null)} className="mt-3">Clear Selection</Button>
+        {error && <p className="text-xs mt-1">{error}</p>}
+        <div className="flex gap-2 mt-3">
+          <Button variant="outline" size="sm" onClick={handleRetryLoad}>
+            <RefreshCw className="h-4 w-4 mr-1" />
+            Retry
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => actions.setSelectedEdgeId(null)}>
+            Clear Selection
+          </Button>
+        </div>
       </div>
     );
   }
   
-  if (!edge) return null;
+  if (!currentConnectionData) return null;
+
+  const { edge, entityGroups, entity1, entity2 } = currentConnectionData;
 
   const currentEdgeEntityGroups = entityGroups.filter(group =>
     (group.entity_id_1 === edge.entity_id_1 && group.entity_id_2 === edge.entity_id_2) ||
@@ -259,12 +270,36 @@ export default function ConnectionReviewTools() {
     <Collapsible
       open={isExpanded}
       onOpenChange={setIsExpanded}
-      className="space-y-2 max-h-[calc(40vh-2rem)] overflow-auto"
+      className="h-full flex flex-col"
     >
-      <div className="flex justify-between items-center sticky top-0 bg-white z-10 py-1">
+      <div className="flex justify-between items-center flex-shrink-0 pb-2">
         <div className="flex items-center gap-2">
           <h3 className="text-lg font-medium">Connection Review</h3>
-          {suggestedActions.length > 0 && (
+          {/* Show review status badge */}
+          {isEdgeReviewed && (
+            <Badge 
+              variant={edgeStatus === 'CONFIRMED_MATCH' ? 'default' : 'secondary'}
+              className={`
+                ${edgeStatus === 'CONFIRMED_MATCH' 
+                  ? 'bg-green-100 text-green-800 border-green-300' 
+                  : 'bg-red-100 text-red-800 border-red-300'
+                }
+              `}
+            >
+              {edgeStatus === 'CONFIRMED_MATCH' ? (
+                <>
+                  <CheckCircle className="h-3 w-3 mr-1" />
+                  Confirmed Match
+                </>
+              ) : (
+                <>
+                  <XCircle className="h-3 w-3 mr-1" />
+                  Confirmed Non-Match
+                </>
+              )}
+            </Badge>
+          )}
+          {suggestedActions.length > 0 && !isEdgeReviewed && (
             <Badge variant="outline" className="bg-yellow-50 text-yellow-800 border-yellow-300">
               <AlertTriangle className="h-3 w-3 mr-1" />
               {suggestedActions[0].action_type.replace(/_/g, " ")}
@@ -278,28 +313,78 @@ export default function ConnectionReviewTools() {
         </CollapsibleTrigger>
       </div>
 
-      <CollapsibleContent>
-        <div className="space-y-3 pt-1">
-          <div className="flex justify-between">
-            <Button variant="destructive" size="sm" onClick={() => handleSubmitFeedback('REJECTED')} disabled={submitting}>
-              <X className="h-4 w-4 mr-1" />
-              Not a Match
-            </Button>
+      <CollapsibleContent className="flex-1 min-h-0">
+        <div className="h-full overflow-auto space-y-3 pr-2">
+          {/* Show different UI based on review status */}
+          {isEdgeReviewed ? (
+            <div className="space-y-3">
+              <Card className={`border-2 ${
+                edgeStatus === 'CONFIRMED_MATCH' 
+                  ? 'border-green-200 bg-green-50' 
+                  : 'border-red-200 bg-red-50'
+              }`}>
+                <CardContent className="p-4">
+                  <div className="flex items-center gap-3">
+                    {edgeStatus === 'CONFIRMED_MATCH' ? (
+                      <CheckCircle className="h-8 w-8 text-green-600" />
+                    ) : (
+                      <XCircle className="h-8 w-8 text-red-600" />
+                    )}
+                    <div>
+                      <h4 className="font-semibold">
+                        {edgeStatus === 'CONFIRMED_MATCH' ? 'Match Confirmed' : 'Non-Match Confirmed'}
+                      </h4>
+                      <p className="text-sm text-muted-foreground">
+                        This connection has been reviewed and marked as a{' '}
+                        {edgeStatus === 'CONFIRMED_MATCH' ? 'confirmed match' : 'confirmed non-match'}.
+                      </p>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+              
+              <Button 
+                variant="outline" 
+                size="sm" 
+                onClick={handleSkipToNext}
+                className="w-full"
+              >
+                <SkipForward className="h-4 w-4 mr-1" />
+                Continue to Next Unreviewed Connection
+              </Button>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex justify-between">
+                <Button 
+                  variant="destructive" 
+                  size="sm" 
+                  onClick={() => handleSubmitFeedback('REJECTED')} 
+                  disabled={submitting}
+                >
+                  <X className="h-4 w-4 mr-1" />
+                  Not a Match
+                </Button>
 
-            <Button
-              variant="default"
-              size="sm"
-              onClick={() => handleSubmitFeedback('ACCEPTED')}
-              disabled={submitting}
-              className="bg-green-600 hover:bg-green-700"
-            >
-              <Check className="h-4 w-4 mr-1" />
-              Confirm Match
-            </Button>
-          </div>
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => handleSubmitFeedback('ACCEPTED')}
+                  disabled={submitting}
+                  className="bg-green-600 hover:bg-green-700"
+                >
+                  <Check className="h-4 w-4 mr-1" />
+                  Confirm Match
+                </Button>
+              </div>
+              
+              <p className="text-sm text-muted-foreground">
+                Do these records represent the same real-world entity?
+              </p>
+            </div>
+          )}
           
-          <p className="text-sm text-muted-foreground">Do these records represent the same real-world entity?</p>
-          
+          {/* Entity details cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <Card>
               <CardContent className="p-3">
@@ -417,7 +502,9 @@ export default function ConnectionReviewTools() {
               {/* Detailed Entity Groups Information */}
               {currentEdgeEntityGroups.length > 0 && (
                 <div className="space-y-2">
-                  <h5 className="text-xs font-medium text-muted-foreground">Detailed Match Information</h5>
+                  <h5 className="text-xs font-medium text-muted-foreground">
+                    {isEdgeReviewed ? 'Match Details (Reference)' : 'Detailed Match Information'}
+                  </h5>
                   {currentEdgeEntityGroups.map((group) => (
                     <div key={group.id} className="rounded-md border bg-muted/20 p-2">
                       <div className="flex justify-between items-center mb-1">
@@ -466,16 +553,6 @@ export default function ConnectionReviewTools() {
               )}
             </TabsContent>
           </Tabs>
-
-          {/* Notes Section */}
-          <div>
-            <Textarea
-              placeholder="Add notes about this connection review..."
-              className="min-h-[60px] text-sm"
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-            />
-          </div>
 
           {/* Feedback Messages */}
           {feedbackMessage && (
