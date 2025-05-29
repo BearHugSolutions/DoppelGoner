@@ -31,7 +31,7 @@ export async function POST(
   request: NextRequest,
   { params }: { params: { clusterId: string } }
 ) {
-  const originalClusterId = await params.clusterId;
+  const { clusterId: originalClusterId } = await Promise.resolve(params);
 
   if (!originalClusterId) {
     return NextResponse.json({ 

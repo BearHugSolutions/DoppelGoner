@@ -21,7 +21,7 @@ const TABLES_TO_REPLICATE = [
 // Whitelist of emails allowed to register.
 // Emails should be stored in lowercase to ensure case-insensitive comparison.
 const EMAIL_REGISTRATION_WHITELIST = [
-    'david.m.botos@gmail.com',
+    'david.m.botos@gmail.com'
 ];
 
 
