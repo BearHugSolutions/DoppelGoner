@@ -1,4 +1,3 @@
-
 "use client";
 import { useAuth } from "@/context/auth-context";
 import { AuthForms } from "./auth-forms";
@@ -21,12 +20,14 @@ export default function AppContent({ children }: { children: React.ReactNode }) 
     }
   
     return (
-      <>
-        <header className="p-4 bg-gray-800 text-white flex justify-between items-center">
+      <div className="h-screen flex flex-col">
+        <header className="p-4 bg-gray-800 text-white flex justify-between items-center flex-shrink-0">
           <span>Welcome, {currentUser.username}!</span>
           <Button onClick={logout} variant="destructive" size="sm">Logout</Button>
         </header>
-        {children}
-      </>
+        <div className="flex-1 min-h-0">
+          {children}
+        </div>
+      </div>
     );
-  }
+}
