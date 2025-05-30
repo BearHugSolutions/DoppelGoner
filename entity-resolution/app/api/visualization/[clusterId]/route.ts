@@ -30,11 +30,11 @@ export async function GET(
           s.id,
           s.name,
           s.source_system,
-          s.source_id
+          s.contributor_id
         FROM public.service s
         JOIN "${userSchema}".service_group sg ON s.id = sg.service_id_1 OR s.id = sg.service_id_2
         WHERE sg.group_cluster_id = $1
-        GROUP BY s.id, s.name, s.source_system, s.source_id
+        GROUP BY s.id, s.name, s.source_system, s.contributor_id
       `;
       nodes = await query(nodesSql, [clusterId]);
 
@@ -63,7 +63,7 @@ export async function GET(
           sg.service_id_1,
           sg.service_id_2,
           sg.confidence_score,
-          sg.confirmed_status, // This status is important
+          sg.confirmed_status,
           sg.match_values,
           sg.method_type
         FROM "${userSchema}".service_group sg
