@@ -1,174 +1,259 @@
 // utils/api-client.ts
 import type {
-  Cluster,
+  // ResolutionMode, // Not directly used in this file but good for context
+  EntityCluster,
+  ServiceCluster,
   EntityGroup,
+  ServiceGroup,
   EntityNode,
+  ServiceNode,
   EntityLink,
+  ServiceLink,
   VisualizationEntityEdge,
-  MatchDecisionDetails,
+  VisualizationServiceEdge,
+  // MatchDecisionDetails, // Not directly used in current API client functions' return types
   Entity,
+  Service,
   EntityGroupReviewApiPayload,
-  EntityGroupReviewApiResponse,
+  ServiceGroupReviewApiPayload,
+  GroupReviewApiResponse,
   ClusterFinalizationStatusResponse,
-  ConnectionDataResponse,
-  ClustersResponse,
-  VisualizationDataResponse,
+  EntityConnectionDataResponse,
+  ServiceConnectionDataResponse,
+  EntityClustersResponse,
+  ServiceClustersResponse,
+  EntityVisualizationDataResponse,
+  ServiceVisualizationDataResponse,
 } from "@/types/entity-resolution";
 
 const API_BASE_URL = '/api';
 
 /**
- * Fetches a paginated list of clusters from the user's schema.
- * @param page The page number to fetch.
- * @param limit The number of clusters per page.
- * @returns A promise that resolves to the clusters response.
+ * Handles API errors by logging them and throwing a new error.
+ * @param error - The error object.
+ * @param context - Optional context for the error message.
+ * @throws Error with a descriptive message.
  */
-export async function getClusters(page: number = 1, limit: number = 10): Promise<ClustersResponse> {
-  const response = await fetch(`${API_BASE_URL}/clusters?page=${page}&limit=${limit}`);
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ message: 'Failed to fetch clusters and parse error response.' }));
-    console.error("getClusters error:", errorData);
-    throw new Error(errorData.message || 'Failed to fetch clusters');
+function handleApiError(error: unknown, context?: string): never {
+  const contextMsg = context ? ` (${context})` : '';
+  let errorMessage = 'An unknown error occurred';
+  if (error instanceof Error) {
+    errorMessage = error.message;
+  } else if (typeof error === 'string') {
+    errorMessage = error;
   }
-  return response.json();
+  console.error(`API Error${contextMsg}:`, errorMessage, error);
+  throw new Error(errorMessage);
 }
 
 /**
- * Fetches detailed data for a specific connection (edge).
- * @param edgeId The ID of the `entity_edge_visualization` record.
- * @returns A promise that resolves to the connection data.
+ * Validates the HTTP response and parses it as JSON.
+ * @param response - The fetch Response object.
+ * @param context - Optional context for error messages.
+ * @returns Promise resolving to the parsed JSON data.
+ * @throws Error if the response is not ok.
  */
-export async function getConnectionData(edgeId: string): Promise<ConnectionDataResponse> {
-  const response = await fetch(`${API_BASE_URL}/connections/${edgeId}`);
+async function validateResponse<T>(
+  response: Response,
+  context?: string
+): Promise<T> {
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ message: `Failed to fetch connection data for edge ${edgeId} and parse error response.` }));
-    console.error(`getConnectionData error for edge ${edgeId}:`, errorData);
-    throw new Error(errorData.message || `Failed to fetch connection data for edge ${edgeId}`);
+    let errorData;
+    try {
+      errorData = await response.json();
+    } catch (e) {
+      // If response is not JSON, use status text or a generic message
+      errorData = { message: response.statusText || `Request failed with status ${response.status}` };
+    }
+    const errorMessage = errorData.message || errorData.error || `Request failed with status ${response.status}`;
+    const fullContext = context ? `${context}: ${errorMessage}` : errorMessage;
+    console.error(`API Response Error: ${response.status} ${response.statusText}`, errorData);
+    throw new Error(fullContext);
   }
-  return response.json();
+  return response.json() as Promise<T>;
+}
+
+// --- Entity Specific Functions ---
+
+/**
+ * Fetches a paginated list of entity clusters.
+ * @param page - The page number to fetch.
+ * @param limit - The number of items per page.
+ * @returns Promise resolving to EntityClustersResponse.
+ */
+export async function getEntityClusters(page: number = 1, limit: number = 10): Promise<EntityClustersResponse> {
+  const url = `${API_BASE_URL}/clusters?type=entity&page=${page}&limit=${limit}`;
+  try {
+    const response = await fetch(url);
+    return await validateResponse<EntityClustersResponse>(response, 'getEntityClusters');
+  } catch (error) {
+    return handleApiError(error, `getEntityClusters (url: ${url})`);
+  }
 }
 
 /**
- * Fetches nodes and links for visualizing a specific cluster.
- * @param clusterId The ID of the cluster.
- * @returns A promise that resolves to the visualization data.
+ * Fetches detailed data for a specific entity connection (edge).
+ * @param edgeId - The ID of the edge.
+ * @returns Promise resolving to EntityConnectionDataResponse.
  */
-export async function getVisualizationData(clusterId: string): Promise<VisualizationDataResponse> {
-  const response = await fetch(`${API_BASE_URL}/visualization/${clusterId}`);
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ message: `Failed to fetch visualization data for cluster ${clusterId} and parse error response.` }));
-    console.error(`getVisualizationData error for cluster ${clusterId}:`, errorData);
-    throw new Error(errorData.message || `Failed to fetch visualization data for cluster ${clusterId}`);
+export async function getEntityConnectionData(edgeId: string): Promise<EntityConnectionDataResponse> {
+  const url = `${API_BASE_URL}/connections/${edgeId}?type=entity`;
+  try {
+    const response = await fetch(url);
+    return await validateResponse<EntityConnectionDataResponse>(response, `getEntityConnectionData for edge ${edgeId}`);
+  } catch (error) {
+    return handleApiError(error, `getEntityConnectionData (edgeId: ${edgeId})`);
   }
-  return response.json();
 }
 
 /**
- * Submits feedback for a specific entity group.
- * @param groupId The ID of the `entity_group` being reviewed.
- * @param payload The review decision, reviewer ID (from session), and optional notes.
- * @returns A promise that resolves to the API response.
+ * Fetches visualization data (nodes and links) for a specific entity cluster.
+ * @param clusterId - The ID of the cluster.
+ * @returns Promise resolving to EntityVisualizationDataResponse.
+ */
+export async function getEntityVisualizationData(clusterId: string): Promise<EntityVisualizationDataResponse> {
+  const url = `${API_BASE_URL}/visualization/${clusterId}?type=entity`;
+  try {
+    const response = await fetch(url);
+    return await validateResponse<EntityVisualizationDataResponse>(response, `getEntityVisualizationData for cluster ${clusterId}`);
+  } catch (error) {
+    return handleApiError(error, `getEntityVisualizationData (clusterId: ${clusterId})`);
+  }
+}
+
+/**
+ * Submits feedback for an entity group.
+ * @param groupId - The ID of the entity group.
+ * @param payload - The review payload.
+ * @returns Promise resolving to GroupReviewApiResponse.
  */
 export async function postEntityGroupFeedback(
   groupId: string,
   payload: EntityGroupReviewApiPayload
-): Promise<EntityGroupReviewApiResponse> {
-  const response = await fetch(`${API_BASE_URL}/entity-groups/${groupId}/review`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ message: `Failed to submit feedback for group ${groupId} and parse error response.` }));
-    console.error(`postEntityGroupFeedback error for group ${groupId}:`, errorData);
-    throw new Error(errorData.message || `Failed to submit feedback for group ${groupId}`);
+): Promise<GroupReviewApiResponse> {
+  const url = `${API_BASE_URL}/entity-groups/${groupId}/review`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await validateResponse<GroupReviewApiResponse>(response, `postEntityGroupFeedback for group ${groupId}`);
+  } catch (error) {
+    return handleApiError(error, `postEntityGroupFeedback (groupId: ${groupId})`);
   }
-  return response.json();
 }
 
 /**
- * Triggers the backend process to finalize the review of a cluster.
- * This checks if all groups are reviewed and handles potential splits.
- * @param clusterId The ID of the cluster to finalize.
- * @returns A promise that resolves to the status of the finalization process.
+ * Triggers the finalization process for an entity cluster.
+ * @param clusterId - The ID of the cluster to finalize.
+ * @returns Promise resolving to ClusterFinalizationStatusResponse.
  */
-export async function triggerClusterFinalization(
+export async function triggerEntityClusterFinalization(
   clusterId: string
 ): Promise<ClusterFinalizationStatusResponse> {
-  const response = await fetch(`${API_BASE_URL}/clusters/${clusterId}/finalize-review`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    // No body is typically needed if the clusterId is in the URL,
-    // but ensure this matches your backend expectation.
-    // The provided backend route does not expect a body.
-  });
-
-  if (!response.ok) {
-    // Attempt to parse error response, provide a fallback if parsing fails
-    let errorPayload: ClusterFinalizationStatusResponse | { message: string };
-    try {
-      errorPayload = await response.json();
-    } catch (e) {
-      errorPayload = { 
-        status: 'ERROR', // Fallback status
-        message: `Failed to trigger cluster finalization for cluster ${clusterId}. Server responded with ${response.status}.`,
-        originalClusterId: clusterId 
-      };
-    }
-    console.error(`triggerClusterFinalization error for cluster ${clusterId}:`, errorPayload);
-    // Ensure the thrown error has a message property
-    const errorMessage = (errorPayload as any).message || `Failed to trigger cluster finalization for cluster ${clusterId}`;
-    throw new Error(errorMessage);
+  const url = `${API_BASE_URL}/clusters/${clusterId}/finalize-review?type=entity`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // No body needed if the API doesn't expect one for this POST
+    });
+    return await validateResponse<ClusterFinalizationStatusResponse>(response, `triggerEntityClusterFinalization for cluster ${clusterId}`);
+  } catch (error) {
+    return handleApiError(error, `triggerEntityClusterFinalization (clusterId: ${clusterId})`);
   }
-  return response.json() as Promise<ClusterFinalizationStatusResponse>;
+}
+
+
+// --- Service Specific Functions ---
+
+/**
+ * Fetches a paginated list of service clusters.
+ * @param page - The page number to fetch.
+ * @param limit - The number of items per page.
+ * @returns Promise resolving to ServiceClustersResponse.
+ */
+export async function getServiceClusters(page: number = 1, limit: number = 10): Promise<ServiceClustersResponse> {
+  const url = `${API_BASE_URL}/clusters?type=service&page=${page}&limit=${limit}`;
+  try {
+    const response = await fetch(url);
+    return await validateResponse<ServiceClustersResponse>(response, 'getServiceClusters');
+  } catch (error) {
+    return handleApiError(error, `getServiceClusters (url: ${url})`);
+  }
 }
 
 /**
- * Utility function to handle API errors consistently across the application.
- * @param error The error object from a failed API call.
- * @param context Optional context string for debugging.
+ * Fetches detailed data for a specific service connection (edge).
+ * @param edgeId - The ID of the edge.
+ * @returns Promise resolving to ServiceConnectionDataResponse.
  */
-export function handleApiError(error: unknown, context?: string): never {
-  const contextMsg = context ? ` (${context})` : '';
-  
-  if (error instanceof Error) {
-    console.error(`API Error${contextMsg}:`, error.message);
-    throw new Error(error.message);
+export async function getServiceConnectionData(edgeId: string): Promise<ServiceConnectionDataResponse> {
+  const url = `${API_BASE_URL}/connections/${edgeId}?type=service`;
+  try {
+    const response = await fetch(url);
+    return await validateResponse<ServiceConnectionDataResponse>(response, `getServiceConnectionData for edge ${edgeId}`);
+  } catch (error) {
+    return handleApiError(error, `getServiceConnectionData (edgeId: ${edgeId})`);
   }
-  
-  console.error(`Unknown API Error${contextMsg}:`, error);
-  throw new Error('An unknown error occurred');
 }
 
 /**
- * Validates that a response is successful and returns the parsed JSON.
- * @param response The fetch response object.
- * @param context Optional context for error messages.
+ * Fetches visualization data (nodes and links) for a specific service cluster.
+ * @param clusterId - The ID of the cluster.
+ * @returns Promise resolving to ServiceVisualizationDataResponse.
  */
-export async function validateResponse<T>(
-  response: Response, 
-  context?: string
-): Promise<T> {
-  if (!response.ok) {
-    let errorMessage: string;
-    try {
-      const errorData = await response.json();
-      errorMessage = errorData.message || errorData.error || `Request failed with status ${response.status}`;
-    } catch {
-      errorMessage = `Request failed with status ${response.status}`;
-    }
-    
-    if (context) {
-      errorMessage = `${context}: ${errorMessage}`;
-    }
-    
-    throw new Error(errorMessage);
+export async function getServiceVisualizationData(clusterId: string): Promise<ServiceVisualizationDataResponse> {
+  const url = `${API_BASE_URL}/visualization/${clusterId}?type=service`;
+  try {
+    const response = await fetch(url);
+    return await validateResponse<ServiceVisualizationDataResponse>(response, `getServiceVisualizationData for cluster ${clusterId}`);
+  } catch (error) {
+    return handleApiError(error, `getServiceVisualizationData (clusterId: ${clusterId})`);
   }
-  
-  return response.json();
+}
+
+/**
+ * Submits feedback for a service group.
+ * @param groupId - The ID of the service group.
+ * @param payload - The review payload.
+ * @returns Promise resolving to GroupReviewApiResponse.
+ */
+export async function postServiceGroupFeedback(
+  groupId: string,
+  payload: ServiceGroupReviewApiPayload
+): Promise<GroupReviewApiResponse> {
+  const url = `${API_BASE_URL}/service-groups/${groupId}/review`; // Uses the new service-specific endpoint
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await validateResponse<GroupReviewApiResponse>(response, `postServiceGroupFeedback for group ${groupId}`);
+  } catch (error) {
+    return handleApiError(error, `postServiceGroupFeedback (groupId: ${groupId})`);
+  }
+}
+
+/**
+ * Triggers the finalization process for a service cluster.
+ * @param clusterId - The ID of the cluster to finalize.
+ * @returns Promise resolving to ClusterFinalizationStatusResponse.
+ */
+export async function triggerServiceClusterFinalization(
+  clusterId: string
+): Promise<ClusterFinalizationStatusResponse> {
+  const url = `${API_BASE_URL}/clusters/${clusterId}/finalize-review?type=service`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // No body needed if the API doesn't expect one for this POST
+    });
+    return await validateResponse<ClusterFinalizationStatusResponse>(response, `triggerServiceClusterFinalization for cluster ${clusterId}`);
+  } catch (error) {
+    return handleApiError(error, `triggerServiceClusterFinalization (clusterId: ${clusterId})`);
+  }
 }

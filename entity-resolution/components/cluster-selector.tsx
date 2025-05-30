@@ -1,30 +1,28 @@
 // components/cluster-selector.tsx
+"use client";
 
-"use client"
-
-import { useCallback } from "react"
-import { useEntityResolution } from "@/context/entity-resolution-context"
-import { Card, CardContent } from "@/components/ui/card"
-import { Button } from "@/components/ui/button"
-import { CheckCircle, ChevronLeft, ChevronRight, Loader2 } from "lucide-react"
-import { Progress } from "@/components/ui/progress"
+import { useCallback } from "react";
+import { useEntityResolution } from "@/context/entity-resolution-context";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { CheckCircle, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
+import { Progress } from "@/components/ui/progress";
+import type { EntityCluster, ServiceCluster } from "@/types/entity-resolution"; // Import specific cluster types
 
 export default function ClusterSelector() {
   const {
+    resolutionMode, // Get current mode
     selectedClusterId,
-    clusters,
+    clusters, // This will now be ClustersState<EntityCluster | ServiceCluster>
     clusterProgress,
     actions,
     queries,
-  } = useEntityResolution()
+  } = useEntityResolution();
 
-  // Handler for manual cluster selection from the list
   const handleClusterSelection = useCallback(async (clusterId: string) => {
     if (selectedClusterId !== clusterId) {
       actions.setSelectedClusterId(clusterId);
-      // Auto edge selection is handled by the context
     } else if (!queries.isVisualizationDataLoaded(clusterId)) {
-      // If same cluster clicked but data isn't loaded, trigger a refresh
       actions.invalidateVisualizationData(clusterId);
     }
   }, [selectedClusterId, actions, queries]);
@@ -32,7 +30,7 @@ export default function ClusterSelector() {
   const handlePageChange = useCallback((newPage: number) => {
     const { total, limit } = clusters;
     if (newPage >= 1 && newPage <= Math.ceil(total / limit)) {
-      actions.loadClusters(newPage, limit);
+      actions.loadClusters(newPage, limit); // loadClusters is mode-aware
     }
   }, [clusters, actions]);
 
@@ -45,16 +43,21 @@ export default function ClusterSelector() {
 
   const { data: clustersData, loading, error, page, total, limit } = clusters;
 
+  const entityLabel = resolutionMode === 'entity' ? 'Entities' : 'Services';
+  const groupLabel = resolutionMode === 'entity' ? 'Groups' : 'Service Groups';
+
   return (
     <div className="space-y-4 h-full flex flex-col bg-card p-3 rounded-lg shadow">
-      <h3 className="text-lg font-semibold text-card-foreground border-b pb-2">Clusters for Review</h3>
-      
+      <h3 className="text-lg font-semibold text-card-foreground border-b pb-2">
+        {resolutionMode === 'entity' ? 'Entity Clusters' : 'Service Clusters'} for Review
+      </h3>
+
       {error && (
         <div className="text-red-600 text-sm p-2 bg-red-50 rounded border">
           Error: {error}
         </div>
       )}
-      
+
       {loading && clustersData.length === 0 ? (
         <div className="flex justify-center items-center flex-grow">
           <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -76,7 +79,11 @@ export default function ClusterSelector() {
                 totalEdges: 0,
                 reviewedEdges: 0,
               };
-              
+
+              // Type assertion for cluster specific properties
+              const entityCount = resolutionMode === 'entity' ? (cluster as EntityCluster).entity_count : (cluster as ServiceCluster).service_count;
+              const groupCount = resolutionMode === 'entity' ? (cluster as EntityCluster).group_count : (cluster as ServiceCluster).service_group_count;
+
               return (
                 <Card
                   key={cluster.id}
@@ -89,23 +96,23 @@ export default function ClusterSelector() {
                 >
                   <CardContent className="p-3">
                     <div className="flex justify-between items-start mb-1.5">
-                      <div className="font-semibold text-sm text-card-foreground truncate" 
-                           title={cluster.name || `Cluster ${cluster.id.substring(0,8)}...`}>
-                        {cluster.name || `Cluster ${cluster.id.substring(0,8)}...`}
+                      <div className="font-semibold text-sm text-card-foreground truncate"
+                           title={cluster.name || `${resolutionMode === 'entity' ? 'Entity' : 'Service'} Cluster ${cluster.id.substring(0,8)}...`}>
+                        {cluster.name || `${resolutionMode === 'entity' ? 'Entity' : 'Service'} Cluster ${cluster.id.substring(0,8)}...`}
                       </div>
                       <div className="flex items-center gap-1">
-                        {isLoadingViz && 
+                        {isLoadingViz &&
                           <div className="h-2 w-2 bg-blue-500 rounded-full animate-pulse" title="Loading visualization data..." />}
-                        {hasVizData && !isLoadingViz && 
+                        {hasVizData && !isLoadingViz &&
                           <div className="h-2 w-2 bg-green-500 rounded-full" title="Visualization data loaded" />}
-                        {vizError && 
+                        {vizError &&
                           <div className="h-2 w-2 bg-red-500 rounded-full" title={`Error: ${vizError}`} />}
                       </div>
                     </div>
 
                     <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground mb-1.5">
-                      <div>Entities: <span className="font-medium text-card-foreground">{cluster.entity_count}</span></div>
-                      <div>Groups: <span className="font-medium text-card-foreground">{cluster.group_count}</span></div>
+                      <div>{entityLabel}: <span className="font-medium text-card-foreground">{entityCount}</span></div>
+                      <div>{groupLabel}: <span className="font-medium text-card-foreground">{groupCount}</span></div>
                     </div>
 
                     <div className="flex items-center gap-1.5 mb-2 text-xs">
@@ -142,10 +149,10 @@ export default function ClusterSelector() {
 
           {total > limit && (
             <div className="flex justify-between items-center pt-3 border-t mt-auto">
-              <Button 
-                variant="outline" 
-                size="sm" 
-                onClick={() => handlePageChange(page - 1)} 
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => handlePageChange(page - 1)}
                 disabled={page === 1 || loading}
               >
                 <ChevronLeft className="h-4 w-4 mr-1" />
