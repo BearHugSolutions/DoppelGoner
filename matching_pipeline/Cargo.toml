@@ -55,7 +55,7 @@ once_cell = "1.19.0"
 pgvector = { version = "0.4", features = ["postgres"] }
 
 # Graph algorithms
-xgraph = "2.0.0"
+xgraph = { version = "2.0.0", features = ["hgraph"] }
 
 
 # For string similarity calculations
@@ -85,6 +85,10 @@ path = "src/bin/from_phase4.rs"
 [[bin]]
 name = "service_matching"
 path = "src/bin/service_matching.rs"
+
+[[bin]]
+name = "service_cluster_consolidation"
+path = "src/bin/service_cluster_consolidation.rs"
 
 [[bin]]
 name = "identify_entities"
