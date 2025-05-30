@@ -305,8 +305,10 @@ export default function ConnectionReviewTools() {
                       <div key={group.id} className="rounded-md border bg-muted/30 p-2">
                         <div className="flex justify-between items-center mb-1">
                           <span className="text-xs font-medium capitalize">{group.method_type.replace(/_/g, " ")} Match</span>
-                          <Badge variant={group.confirmed_status === 'CONFIRMED_MATCH' ? 'default' : group.confirmed_status === 'CONFIRMED_NON_MATCH' ? 'destructive' : 'outline'} className="text-xs">{group.confirmed_status?.replace(/_/g, " ") ?? 'Pending'}</Badge>
-                          <span className="text-xs text-muted-foreground">{group.confidence_score ? group.confidence_score.toFixed(3) : 'N/A'}</span>
+                          <div className="flex gap-2 items-center">
+                            <Badge variant={group.confirmed_status === 'CONFIRMED_MATCH' ? 'default' : group.confirmed_status === 'CONFIRMED_NON_MATCH' ? 'destructive' : 'outline'} className="text-xs">{group.confirmed_status?.replace(/_/g, " ") ?? 'Pending'}</Badge>
+                            <span className="text-xs text-muted-foreground">{group.confidence_score ? group.confidence_score.toFixed(3) : 'N/A'}</span>
+                          </div>
                         </div>
                         <div className="text-xs text-muted-foreground space-y-0.5">
                           {Object.entries(group.match_values.values).map(([key, val]) => (<div key={key} className="truncate"><span className="font-medium">{key.replace(/original_|_1|_2/gi, '')}:</span> {String(val)}</div>)).slice(0,2)}
