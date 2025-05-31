@@ -85,6 +85,7 @@ export async function getEntityClusters(page: number = 1, limit: number = 10): P
   const url = `${API_BASE_URL}/clusters?type=entity&page=${page}&limit=${limit}`;
   try {
     const response = await fetch(url);
+    console.log("getEntityClusters response:", JSON.stringify(response));
     return await validateResponse<EntityClustersResponse>(response, 'getEntityClusters');
   } catch (error) {
     return handleApiError(error, `getEntityClusters (url: ${url})`);
@@ -115,6 +116,7 @@ export async function getEntityVisualizationData(clusterId: string): Promise<Ent
   const url = `${API_BASE_URL}/visualization/${clusterId}?type=entity`;
   try {
     const response = await fetch(url);
+    // console.log("getEntityVisualizationData response:", JSON.stringify(response));
     return await validateResponse<EntityVisualizationDataResponse>(response, `getEntityVisualizationData for cluster ${clusterId}`);
   } catch (error) {
     return handleApiError(error, `getEntityVisualizationData (clusterId: ${clusterId})`);

@@ -81,8 +81,8 @@ export default function ClusterSelector() {
               };
 
               // Type assertion for cluster specific properties
-              const entityCount = resolutionMode === 'entity' ? (cluster as EntityCluster).entity_count : (cluster as ServiceCluster).service_count;
-              const groupCount = resolutionMode === 'entity' ? (cluster as EntityCluster).group_count : (cluster as ServiceCluster).service_group_count;
+              const entityCount = resolutionMode === 'entity' ? (cluster as EntityCluster).entityCount : (cluster as ServiceCluster).serviceCount;
+              const groupCount = resolutionMode === 'entity' ? (cluster as EntityCluster).groupCount : (cluster as ServiceCluster).serviceGroupCount;
 
               return (
                 <Card
@@ -117,10 +117,10 @@ export default function ClusterSelector() {
 
                     <div className="flex items-center gap-1.5 mb-2 text-xs">
                       <div className="text-muted-foreground">Coherence:</div>
-                      <div className={`h-2.5 w-2.5 rounded-full ${getCoherenceColor(cluster.average_coherence_score)}`}></div>
+                      <div className={`h-2.5 w-2.5 rounded-full ${getCoherenceColor(cluster.averageCoherenceScore)}`}></div>
                       <div className="font-medium text-card-foreground">
-                        {cluster.average_coherence_score !== null
-                          ? (cluster.average_coherence_score * 100).toFixed(0) + "%"
+                        {cluster.averageCoherenceScore !== null
+                          ? (cluster.averageCoherenceScore * 100).toFixed(0) + "%"
                           : "N/A"}
                       </div>
                     </div>

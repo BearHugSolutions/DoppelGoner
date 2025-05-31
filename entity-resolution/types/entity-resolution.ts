@@ -5,248 +5,280 @@ export type ResolutionMode = "entity" | "service";
 // Base entity and cluster types
 export interface Entity {
   id: string;
-  organization_id: string; // Assuming services might also belong to an org or have a similar field
+  organizationId: string | null;
   name: string | null;
-  created_at: Date | null;
-  updated_at: Date | null;
+  createdAt: Date | string | null;
+  updatedAt: Date | string | null;
   source_system: string | null;
   source_id: string | null;
 }
 
-// Service type (new)
 export interface Service {
   id: string;
   name: string | null;
-  // Add other service-specific fields if necessary, e.g., version, endpoint
-  created_at: Date | null;
-  updated_at: Date | null;
-  source_system: string | null; // Assuming services also have a source system
-  source_id: string | null; // Assuming services also have a source ID
+  createdAt: Date | string | null;
+  updatedAt: Date | string | null;
+  source_system: string | null;
+  source_id: string | null;
+}
+
+export interface MatchValues {
+  type?: string;
+  values: Record<string, any>;
 }
 
 export interface EntityGroup {
   id: string;
-  entity_id_1: string;
-  entity_id_2: string;
-  confidence_score: number | null;
-  pre_rl_confidence_score: number | null;
-  method_type: string;
-  match_values: MatchValues;
-  confirmed_status: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH';
-  created_at: Date | null;
-  updated_at: Date | null;
-  group_cluster_id?: string | null;
-  reviewed_at?: Date | null;
-  reviewer_id?: string | null;
+  entityId1: string;
+  entityId2: string;
+  rl_confidence: number | null;
+  pre_rl_confidence: number | null;
+  methodType: string;
+  matchValues: MatchValues | null;
+  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  createdAt: Date | string | null;
+  updatedAt: Date | string | null;
+  groupClusterId?: string | null;
+  reviewedAt?: Date | string | null;
+  reviewerId?: string | null;
+  notes?: string | null;
 }
 
-// ServiceGroup type (new) - based on your schema
 export interface ServiceGroup {
   id: string;
-  service_id_1: string;
-  service_id_2: string;
-  confidence_score: number | null;
-  pre_rl_confidence_score: number | null;
-  method_type: string;
-  match_values: MatchValues; // Assuming similar structure for match_values
-  confirmed_status: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH'; // Consistent status
-  created_at: Date | null;
-  updated_at: Date | null;
-  group_cluster_id?: string | null; // This is service_group_cluster_id in some contexts
-  reviewed_at?: Date | null;
-  reviewer_id?: string | null;
+  serviceId1: string;
+  serviceId2: string;
+  rl_confidence: number | null;
+  pre_rl_confidence: number | null;
+  methodType: string;
+  matchValues: MatchValues | null;
+  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  createdAt: Date | string | null;
+  updatedAt: Date | string | null;
+  groupClusterId?: string | null;
+  reviewedAt?: Date | string | null;
+  reviewerId?: string | null;
+  notes?: string | null;
 }
 
-
-export interface BaseCluster { // Made generic for reuse
+export interface BaseCluster {
   id: string;
   name: string | null;
   description: string | null;
-  average_coherence_score: number | null;
-  created_at: Date | null;
-  updated_at: Date | null;
+  averageCoherenceScore: number | null;
+  createdAt: Date | string | null;
+  updatedAt: Date | string | null;
+  wasSplit?: boolean | null;
 }
 
 export interface EntityCluster extends BaseCluster {
-  entity_count: number;
-  group_count: number;
+  entityCount: number | null;
+  groupCount: number | null;
 }
 
-export interface ServiceCluster extends BaseCluster { // New
-  service_count: number;
-  service_group_count: number; // Renamed from group_count for clarity
+export interface ServiceCluster extends BaseCluster {
+  serviceCount: number | null;
+  serviceGroupCount: number | null;
 }
 
-// Match decision and feedback types
-export interface MatchDecisionDetails { // Potentially generic or duplicated for services
+export interface MatchDecisionDetails {
   id: string;
-  // entity_group_id or service_group_id would be needed
-  group_id: string; // Generic group_id
-  pipeline_run_id: string | null;
-  snapshotted_features: Record<string, unknown>;
-  method_type_at_decision: string;
-  pre_rl_confidence_at_decision: number;
-  tuned_confidence_at_decision: number;
-  confidence_tuner_version_at_decision: number | null;
-  created_at: Date;
+  groupId: string;
+  pipelineRunId: string | null;
+  snapshottedFeatures: Record<string, unknown>;
+  methodTypeAtDecision: string;
+  preRlConfidenceAtDecision: number;
+  tunedConfidenceAtDecision: number;
+  confidenceTunerVersionAtDecision: number | null;
+  createdAt: Date | string;
 }
 
-export interface HumanFeedbackBase { // Generic base for feedback
-  reviewer_id: string;
-  feedback_timestamp: Date;
-  is_match_correct: boolean;
+export interface HumanFeedbackBase {
+  reviewerId: string;
+  feedbackTimestamp: Date | string;
+  isMatchCorrect: boolean;
   notes: string | null;
-  processed_for_tuner_update_at: Date | null;
-  match_decision_id: string; // Assuming this ID refers to a record of why the match was initially proposed
+  processedForTunerUpdateAt: Date | string | null;
+  matchDecisionId: string;
 }
 
 export interface EntityHumanFeedback extends HumanFeedbackBase {
-  id: string; // Feedback record ID
-  entity_group_id: string;
-}
-
-export interface ServiceMatchHumanFeedback extends HumanFeedbackBase { // New
-  // id will be auto-generated by DB
-  service_group_id: string;
-  // match_decision_id is already in HumanFeedbackBase
-}
-
-
-// Visualization types
-export interface BaseNode { // Generic Node
   id: string;
-  name: string;
+  entityGroupId: string;
+}
+
+export interface ServiceMatchHumanFeedback extends HumanFeedbackBase {
+  serviceGroupId: string;
+}
+
+export interface BaseNode {
+  id: string;
+  name: string | null;
+  sourceSystem?: string | null;
+  sourceId?: string | null;
+  organizationId?: string | null;
+  contributorId?: string | null;
 }
 export type EntityNode = BaseNode;
-export type ServiceNode = BaseNode; // Services can also be nodes
+export type ServiceNode = BaseNode;
 
-export interface BaseLink { // Generic Link
-  id: string; // This is the edge_visualization_id
-  source: string; // entity_id_1 or service_id_1
-  target: string; // entity_id_2 or service_id_2
-  weight: number; // edge_weight
-  status?: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH';
+export interface BaseLink {
+  id: string;
+  source: string;
+  target: string;
+  weight: number;
+  status?: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  details?: Record<string, any> | null;
+  createdAt?: Date | string | null;
 }
 export type EntityLink = BaseLink;
-export type ServiceLink = BaseLink; // Service connections can also be links
+export type ServiceLink = BaseLink;
 
-export interface VisualizationEntityEdge {
-  id: string;
-  cluster_id: string; // entity_group_cluster_id
-  entity_id_1: string;
-  entity_id_2: string;
-  edge_weight: number;
-  details: {
+// Details structure for VisualizationEntityEdge based on previous TS definition
+// Note: The provided sample JSON for edge.details includes method_count and rl_weight_factor
+// which are not in this interface. Consider adding them if they are consistently present.
+export interface VisualizationEntityEdgeDetails {
     methods: Array<{
       method_type: string;
       pre_rl_confidence: number;
       rl_confidence: number;
       combined_confidence: number;
     }>;
-  };
-  pipeline_run_id: string | null;
-  created_at: Date;
-  status?: EntityLink['status']; // Derived/set by frontend logic
-  confirmed_status?: EntityGroup['confirmed_status'];
+    method_count?: number; // Added based on sample JSON
+    rl_weight_factor?: number; // Added based on sample JSON
 }
 
-// ServiceEdgeVisualization type (new) - based on your schema
+export interface VisualizationEntityEdge {
+  id: string;
+  clusterId: string;
+  entityId1: string;
+  entityId2: string;
+  edgeWeight: number;
+  details: VisualizationEntityEdgeDetails | null;
+  pipelineRunId: string | null;
+  createdAt: Date | string;
+  status?: EntityLink['status'];
+  confirmedStatus?: EntityGroup['confirmedStatus'] | string;
+  entity1Name?: string | null;
+  entity2Name?: string | null;
+  displayWeight?: number | null;
+  color?: string | null;
+}
+
 export interface VisualizationServiceEdge {
   id: string;
-  cluster_id: string; // service_group_cluster_id
-  service_id_1: string;
-  service_id_2: string;
-  edge_weight: number; // numeric(10,5) in DB, ensure conversion if needed
-  details: Record<string, unknown> | null; // jsonb in DB
-  pipeline_run_id: string;
-  created_at: Date; // timestamp with time zone in DB
-  status?: ServiceLink['status']; // Derived/set by frontend logic
-  confirmed_status?: ServiceGroup['confirmed_status'];
+  clusterId: string;
+  serviceId1: string;
+  serviceId2: string;
+  edgeWeight: number;
+  details: Record<string, unknown> | null; // For services, details might be more generic or have a different structure
+  pipelineRunId: string;
+  createdAt: Date | string | null;
+  status?: ServiceLink['status'];
+  service1Name?: string | null;
+  service2Name?: string | null;
+  displayWeight?: number | null;
+  color?: string | null;
 }
 
-
-// Match values structure (seems generic enough)
-export interface MatchValues {
-  type?: string;
-  values: Record<string, any>;
-}
-
-// API request/response types
 export interface GroupReviewApiPayloadBase {
   decision: GroupReviewDecision;
   reviewerId: string;
   notes?: string;
 }
 export type EntityGroupReviewApiPayload = GroupReviewApiPayloadBase;
-export type ServiceGroupReviewApiPayload = GroupReviewApiPayloadBase; // New
+export type ServiceGroupReviewApiPayload = GroupReviewApiPayloadBase;
 
-export interface GroupReviewApiResponse { // Generic
+export interface GroupReviewApiResponse {
   message: string;
+  updatedGroupId?: string;
+  newStatus?: string;
+  updatedEdgesInUserSchema?: number | null;
 }
 
-export type GroupReviewDecision = 'ACCEPTED' | 'REJECTED'; // Generic
+export type GroupReviewDecision = 'ACCEPTED' | 'REJECTED' | string;
 
 export interface ClusterFinalizationStatusResponse {
-  status: 'COMPLETED_NO_SPLIT_NEEDED' | 'COMPLETED_SPLIT_OCCURRED' | 'PENDING_FULL_REVIEW' | 'CLUSTER_NOT_FOUND' | 'ERROR';
+  status: 'COMPLETED_NO_SPLIT_NEEDED' | 'COMPLETED_SPLIT_OCCURRED' | 'PENDING_FULL_REVIEW' | 'CLUSTER_NOT_FOUND' | 'ERROR' | string;
   message: string;
   originalClusterId: string;
   newClusterIds?: string[];
 }
 
-// API response types
-export interface ClustersResponse<TCluster extends BaseCluster> { // Generic
+export interface ClustersResponse<TCluster extends BaseCluster> {
   clusters: TCluster[];
   total: number;
   page: number;
   limit: number;
+  totalPages?: number;
 }
 export type EntityClustersResponse = ClustersResponse<EntityCluster>;
-export type ServiceClustersResponse = ClustersResponse<ServiceCluster>; // New
+export type ServiceClustersResponse = ClustersResponse<ServiceCluster>;
 
-export interface VisualizationDataResponse<TNode extends BaseNode, TLink extends BaseLink, TGroup> { // Generic
+export interface VisualizationDataResponse<TNode extends BaseNode, TLink extends BaseLink, TGroup> {
   nodes: TNode[];
   links: TLink[];
-  entityGroups: TGroup[]; // Represents the groups that form the links
+  entityGroups: TGroup[] | Record<string, any>;
 }
 export type EntityVisualizationDataResponse = VisualizationDataResponse<EntityNode, EntityLink, EntityGroup>;
-export type ServiceVisualizationDataResponse = VisualizationDataResponse<ServiceNode, ServiceLink, ServiceGroup>; // New
+export type ServiceVisualizationDataResponse = VisualizationDataResponse<ServiceNode, ServiceLink, ServiceGroup>;
 
-export interface ConnectionDataResponse<TEdge, TGroup, TEntityOrService extends Entity | Service> { // Generic
+
+export interface ConnectionDataResponse<TEdge, TGroup, TEntityOrService extends Entity | Service> {
   edge: TEdge;
-  entityGroups: TGroup[]; // Groups specific to this edge
-  matchDecisions: MatchDecisionDetails[]; // Assuming structure is similar
-  entity1: TEntityOrService; // Represents the first node of the edge
-  entity2: TEntityOrService; // Represents the second node of the edge
+  // The key from the API is 'entityGroups' for both entity and service resolution modes.
+  // The type of the items in the array (TGroup) will be EntityGroup or ServiceGroup.
+  entityGroups: TGroup[];
+  matchDecisions?: MatchDecisionDetails[] | null;
+  entity1: TEntityOrService; // Represents either the first entity or first service
+  entity2: TEntityOrService; // Represents either the second entity or second service
 }
 export type EntityConnectionDataResponse = ConnectionDataResponse<VisualizationEntityEdge, EntityGroup, Entity>;
-export type ServiceConnectionDataResponse = ConnectionDataResponse<VisualizationServiceEdge, ServiceGroup, Service>; // New
+export type ServiceConnectionDataResponse = ConnectionDataResponse<VisualizationServiceEdge, ServiceGroup, Service>;
+
+// Type guards to help differentiate between EntityConnectionDataResponse and ServiceConnectionDataResponse
+export function isEntityConnectionData(
+  data: EntityConnectionDataResponse | ServiceConnectionDataResponse,
+  mode: ResolutionMode
+): data is EntityConnectionDataResponse {
+  // This guard relies on the external 'mode' to discriminate.
+  // It assumes that if mode is 'entity', the data structure will match EntityConnectionDataResponse.
+  return mode === 'entity';
+}
+
+export function isServiceConnectionData(
+  data: EntityConnectionDataResponse | ServiceConnectionDataResponse,
+  mode: ResolutionMode
+): data is ServiceConnectionDataResponse {
+  // Similar to isEntityConnectionData, relies on 'mode'.
+  return mode === 'service';
+}
 
 
 export interface SuggestedAction {
   id: string;
-  pipeline_run_id: string | null;
-  action_type: string;
-  entity_id: string | null; // or service_id
-  group_id_1: string | null; // or service_group_id_1
-  group_id_2: string | null; // or service_group_id_2
-  cluster_id: string | null; // or service_cluster_id
-  triggering_confidence: number | null;
+  pipelineRunId: string | null;
+  actionType: string;
+  entityId: string | null;
+  groupId1: string | null;
+  groupId2: string | null;
+  clusterId: string | null;
+  triggeringConfidence: number | null;
   details: Record<string, unknown> | null;
-  reason_code: string | null;
-  reason_message: string | null;
+  reasonCode: string | null;
+  reasonMessage: string | null;
   priority: number;
   status: string;
-  reviewer_id: string | null;
-  reviewed_at: Date | null;
-  review_notes: string | null;
-  created_at: Date;
-  updated_at: Date;
+  reviewerId: string | null;
+  reviewedAt: Date | string | null;
+  reviewNotes: string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
 }
 
-export interface ReviewOperationBase { // Generic
+export interface ReviewOperationBase {
   groupId: string;
-  // originalGroupStatus: EntityGroup['confirmed_status'] | ServiceGroup['confirmed_status'];
-  originalGroupStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH';
+  originalGroupStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
 }
 
 export interface QueuedReviewBatch {
@@ -256,16 +288,13 @@ export interface QueuedReviewBatch {
   decision: GroupReviewDecision;
   reviewerId: string;
   operations: ReviewOperationBase[];
-  // originalEdgeStatus: EntityLink['status'] | ServiceLink['status'];
-  originalEdgeStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH';
-  // optimisticEdgeStatus: EntityLink['status'] | ServiceLink['status'];
-  optimisticEdgeStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH';
-  // optimisticGroupStatus: EntityGroup['confirmed_status'] | ServiceGroup['confirmed_status'];
-  optimisticGroupStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH';
+  originalEdgeStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  optimisticEdgeStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  optimisticGroupStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
   attempt: number;
   error?: string;
   processedOperations: Set<string>;
   failedOperations: Set<string>;
   isTerminalFailure?: boolean;
-  mode: ResolutionMode; // To distinguish between entity and service feedback
+  mode: ResolutionMode;
 }

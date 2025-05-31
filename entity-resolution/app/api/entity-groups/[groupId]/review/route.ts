@@ -1,7 +1,7 @@
-// NEW: app/api/entity-groups/[groupId]/review/route.ts
+// app/api/entity-groups/[groupId]/review/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { query, withTransaction } from '@/types/db';
-import { getUserSchemaFromSession } from '@/utils/auth-db';
+import { getUserSchemaFromSession } from '@/utils/auth-db'; // Still needed
+import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client'; // Import new utility
 
 export async function POST(
   request: NextRequest,
@@ -16,56 +16,53 @@ export async function POST(
   }
 
   const { groupId } = await params;
-  const { decision, reviewerId, notes } = await request.json();
+  if (!groupId) {
+    return NextResponse.json({ error: "Group ID is required." }, { status: 400 });
+  }
+
+  let requestBody;
+  try {
+    requestBody = await request.json();
+  } catch (e) {
+    console.error('Error parsing JSON body for entity group review:', e);
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+
+  const { decision, reviewerId, notes } = requestBody;
+
+  if (!decision || !reviewerId) {
+    return NextResponse.json(
+      { error: 'Missing decision or reviewerId in request body' },
+      { status: 400 }
+    );
+  }
+
+  if (decision !== 'ACCEPTED' && decision !== 'REJECTED') {
+    return NextResponse.json(
+      { error: 'Invalid decision value. Must be "ACCEPTED" or "REJECTED".' },
+      { status: 400 }
+    );
+  }
 
   try {
-    const result = await withTransaction(async (client) => {
-      // Update the entity group
-      const updateGroupSql = `
-        UPDATE "${userSchema}".entity_group 
-        SET confirmed_status = $1, reviewer_id = $2, reviewed_at = NOW()
-        WHERE id = $3
-        RETURNING entity_id_1, entity_id_2
-      `;
-      const statusValue = decision === 'ACCEPTED' ? 'CONFIRMED_MATCH' : 'CONFIRMED_NON_MATCH';
-      const groupResult = await client.query(updateGroupSql, [statusValue, reviewerId, groupId]);
-      
-      if (groupResult.rows.length === 0) {
-        throw new Error('Entity group not found');
-      }
-
-      const { entity_id_1, entity_id_2 } = groupResult.rows[0];
-
-      // Find the corresponding edge(s) and update their status
-      const findEdgesSql = `
-        SELECT id FROM public.entity_edge_visualization 
-        WHERE (entity_id_1 = $1 AND entity_id_2 = $2) 
-           OR (entity_id_1 = $2 AND entity_id_2 = $1)
-      `;
-      const edgeResults = await client.query(findEdgesSql, [entity_id_1, entity_id_2]);
-
-      // Update each edge's status to match the review decision
-      for (const edgeRow of edgeResults.rows) {
-        const updateEdgeSql = `
-          UPDATE public.entity_edge_visualization 
-          SET confirmed_status = $1 
-          WHERE id = $2
-        `;
-        await client.query(updateEdgeSql, [statusValue, edgeRow.id]);
-      }
-
-      return { 
-        message: 'Review submitted successfully',
-        updatedEdges: edgeResults.rows.length 
-      };
-    });
-
-    return NextResponse.json(result);
-  } catch (error) {
-    console.error('Error submitting review:', error);
-    return NextResponse.json(
-      { error: 'Failed to submit review' },
-      { status: 500 }
+    // Call the Rust gateway
+    const gatewayResponse = await fetchFromGateway(
+      `/entity-groups/${groupId}/review`,
+      {
+        method: 'POST',
+        headers: { // Explicitly set Content-Type to application/json
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ decision, reviewerId, notes }), // Pass the original body
+      },
+      userSchema // Pass userSchema as a header
     );
+
+    // The gateway response is assumed to match the structure previously returned
+    return NextResponse.json(gatewayResponse);
+
+  } catch (error: any) {
+    console.error(`Error submitting entity group review for group ${groupId} via gateway:`, error);
+    return handleGatewayError(error, 'Failed to submit entity group review');
   }
 }

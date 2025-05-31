@@ -97,43 +97,47 @@ export default function GraphVisualizer() {
       // to find contact details (email, phone, address, url) from match_values.
       // This logic remains the same.
       for (const group of displayGroups) {
-        const values = group.match_values.values;
+        // console.log(
+        //   "EntityGroup or ServiceGroup received from Rust API: ",
+        //   JSON.stringify(group)
+        // );
+        const values = group.matchValues?.values;
         let isEntity1 = false;
         let isEntity2 = false;
 
         if (resolutionMode === "entity") {
           const eg = group as EntityGroup;
-          isEntity1 = eg.entity_id_1 === node.id;
-          isEntity2 = eg.entity_id_2 === node.id;
+          isEntity1 = eg.entityId1 === node.id;
+          isEntity2 = eg.entityId2 === node.id;
         } else {
           // service mode
           const sg = group as ServiceGroup;
-          isEntity1 = sg.service_id_1 === node.id;
-          isEntity2 = sg.service_id_2 === node.id;
+          isEntity1 = sg.serviceId1 === node.id;
+          isEntity2 = sg.serviceId2 === node.id;
         }
 
         if (!isEntity1 && !isEntity2) continue;
 
-        switch (group.match_values.type?.toLowerCase()) {
+        switch (group.matchValues?.type?.toLowerCase()) {
           case "email":
             contactInfo.email = isEntity1
-              ? values.original_email1 || values.email1
-              : values.original_email2 || values.email2;
+              ? values?.original_email1 || values?.email1
+              : values?.original_email2 || values?.email2;
             break;
           case "phone":
             contactInfo.phone = isEntity1
-              ? values.original_phone1 || values.phone1
-              : values.original_phone2 || values.phone2;
+              ? values?.original_phone1 || values?.phone1
+              : values?.original_phone2 || values?.phone2;
             break;
           case "address":
             contactInfo.address = isEntity1
-              ? values.original_address1 || values.address1
-              : values.original_address2 || values.address2;
+              ? values?.original_address1 || values?.address1
+              : values?.original_address2 || values?.address2;
             break;
           case "url":
             contactInfo.url = isEntity1
-              ? values.original_url1 || values.url1
-              : values.original_url2 || values.url2;
+              ? values?.original_url1 || values?.url1
+              : values?.original_url2 || values?.url2;
             break;
         }
       }
@@ -238,15 +242,11 @@ export default function GraphVisualizer() {
     setNodes(currentVisualizationData.nodes as BaseNode[]);
     setLinks(currentVisualizationData.links as BaseLink[]);
     if (resolutionMode === "entity") {
-      setDisplayGroups(
-        (currentVisualizationData as EntityVisualizationDataResponse)
-          .entityGroups
-      );
+      const data = currentVisualizationData as EntityVisualizationDataResponse;
+      setDisplayGroups( (Array.isArray(data.entityGroups) ? data.entityGroups : []) as EntityGroup[]);
     } else {
-      setDisplayGroups(
-        (currentVisualizationData as ServiceVisualizationDataResponse)
-          .entityGroups as ServiceGroup[]
-      );
+      const data = currentVisualizationData as ServiceVisualizationDataResponse;
+      setDisplayGroups( (Array.isArray(data.entityGroups) ? data.entityGroups : []) as ServiceGroup[]);
     }
   }, [currentVisualizationData, resolutionMode]);
 
@@ -470,8 +470,12 @@ export default function GraphVisualizer() {
               nodeInfo.name || "Unknown"
             } (${resolutionMode})</div>
             <div style="margin-bottom: 2px;"><span style="font-weight: 500;">Source:</span> ${
-              nodeInfo.contactInfo.source_system || "Unknown"
-            }${nodeInfo.contactInfo.source_id ? ` (${nodeInfo.contactInfo.source_id})` : ""}</div>
+              nodeInfo.sourceSystem || "Unknown" // Use nodeInfo.sourceSystem from BaseNode
+            }${
+          nodeInfo.sourceId // Use nodeInfo.sourceId from BaseNode
+            ? ` (${nodeInfo.sourceId})`
+            : ""
+        }</div>
             ${
               contactInfo.address
                 ? `<div style="margin-bottom: 2px;"><span style="font-weight: 500;">Address:</span> ${contactInfo.address}</div>`
@@ -511,18 +515,17 @@ export default function GraphVisualizer() {
           if (resolutionMode === "entity") {
             const eg = group as EntityGroup;
             return (
-              (eg.entity_id_1 === d_link.source &&
-                eg.entity_id_2 === d_link.target) ||
-              (eg.entity_id_1 === d_link.target &&
-                eg.entity_id_2 === d_link.source)
+              (eg.entityId1 === d_link.source &&
+                eg.entityId2 === d_link.target) ||
+              (eg.entityId1 === d_link.target && eg.entityId2 === d_link.source)
             );
           } else {
             const sg = group as ServiceGroup;
             return (
-              (sg.service_id_1 === d_link.source &&
-                sg.service_id_2 === d_link.target) ||
-              (sg.service_id_1 === d_link.target &&
-                sg.service_id_2 === d_link.source)
+              (sg.serviceId1 === d_link.source &&
+                sg.serviceId2 === d_link.target) ||
+              (sg.serviceId1 === d_link.target &&
+                sg.serviceId2 === d_link.source)
             );
           }
         });
@@ -539,11 +542,11 @@ export default function GraphVisualizer() {
         if (linkSpecificGroups.length > 0) {
           groupsHtml = `<div style="margin-top: 8px;"><div style="font-size: 10px; font-weight: 500; color: #6b7280; margin-bottom: 4px;">Match Methods:</div><div style="max-height: 150px; overflow-y: auto; space-y: 4px; padding-right: 5px;">${linkSpecificGroups
             .map((group) => {
-              const confidence = group.confidence_score
-                ? group.confidence_score.toFixed(3)
+              const confidence = group.rl_confidence
+                ? group.rl_confidence.toFixed(3)
                 : "N/A";
               const matchValuesDisplay = Object.entries(
-                group.match_values.values
+                group.matchValues?.values || {} // Fix: Provide default empty object
               )
                 .slice(0, 2)
                 .map(
@@ -555,7 +558,7 @@ export default function GraphVisualizer() {
                     }</div>`
                 )
                 .join("");
-              return `<div style="border-radius: 4px; border: 1px solid #e5e7eb; background-color: rgba(243, 244, 246, 0.5); padding: 6px;"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;"><span style="font-size: 10px; font-weight: 500; text-transform: capitalize;">${group.method_type.replace(
+              return `<div style="border-radius: 4px; border: 1px solid #e5e7eb; background-color: rgba(243, 244, 246, 0.5); padding: 6px;"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;"><span style="font-size: 10px; font-weight: 500; text-transform: capitalize;">${group.methodType.replace(
                 /_/g,
                 " "
               )}</span><span style="font-size: 10px; color: #6b7280;">${confidence}</span></div><div style="font-size: 10px; color: #6b7280; space-y: 2px;">${matchValuesDisplay}</div></div>`;

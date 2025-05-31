@@ -85,10 +85,10 @@ export interface EntityGroupClusterDbRecord {
   entity_count: number | null; // integer, default 0
   group_count: number | null; // integer, default 0
   average_coherence_score: number | null; // double precision
-  // source_cluster_id and is_user_modified are not in your provided schema for entity_group_cluster
+  was_split: boolean; // New flag, NOT NULL DEFAULT FALSE in DB
 }
 
-// Service Group Cluster types (from your schema description)
+// Service Group Cluster types
 export interface ServiceGroupClusterDbRecord {
   id: string; // text, PK
   name: string | null; // text
@@ -98,6 +98,7 @@ export interface ServiceGroupClusterDbRecord {
   service_count: number | null; // integer, default 0
   service_group_count: number | null; // integer, default 0
   average_coherence_score: number | null; // double precision
+  was_split: boolean; // New flag, NOT NULL DEFAULT FALSE in DB
 }
 
 // Entity types (assuming this maps to an 'entities' table or similar)
