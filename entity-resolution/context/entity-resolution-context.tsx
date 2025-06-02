@@ -89,12 +89,15 @@ interface ClusterProgress {
   isComplete: boolean;
 }
 
+// This interface must match the expected structure causing the error
 interface EdgeSelectionInfo {
   currentEdgeId: string | null;
   nextUnreviewedEdgeId: string | null;
   hasUnreviewedEdges: boolean;
-  currentEdgeIndex: number;
+  currentEdgeIndex: number; // Index in all links
   totalEdges: number;
+  totalUnreviewedEdgesInCluster: number; // Added based on error
+  currentUnreviewedEdgeIndexInCluster: number; // Added based on error (index among unreviewed links)
 }
 
 export interface EntityResolutionContextType {
@@ -124,7 +127,7 @@ export interface EntityResolutionContextType {
   isProcessingQueue: boolean;
 
   clusterProgress: Record<string, ClusterProgress>;
-  edgeSelectionInfo: EdgeSelectionInfo;
+  edgeSelectionInfo: EdgeSelectionInfo; // Ensure this matches the local interface
 
   currentVisualizationData:
     | EntityVisualizationDataResponse
@@ -159,7 +162,7 @@ export interface EntityResolutionContextType {
     invalidateVisualizationData: (clusterId: string) => void;
     invalidateConnectionData: (edgeId: string) => void;
     clearAllData: () => void;
-    selectNextUnreviewedEdge: (afterEdgeId?: string | null) => void;
+    selectNextUnreviewedEdge: (afterEdgeId?: string | null) => void; // Existing action
     advanceToNextCluster: () => Promise<void>;
     checkAndAdvanceIfComplete: (clusterIdToCheck?: string) => Promise<void>;
     submitEdgeReview: (
@@ -168,6 +171,9 @@ export interface EntityResolutionContextType {
     ) => Promise<void>;
     retryFailedBatch: (batchId: string) => void;
     setIsAutoAdvanceEnabled: (enabled: boolean) => void;
+    // Added based on error message for actions
+    selectPreviousUnreviewedInCluster: () => void;
+    selectNextUnreviewedInCluster: () => void;
   };
 
   queries: {
@@ -228,7 +234,7 @@ export function EntityResolutionProvider({
     useState<boolean>(true);
 
   const [clusters, setClusters] =
-    useState<ClustersState<EntityCluster | ServiceCluster>>( // Types will include was_split
+    useState<ClustersState<EntityCluster | ServiceCluster>>(
       initialClustersState
     );
   const [visualizationData, setVisualizationData] = useState<
@@ -279,18 +285,15 @@ export function EntityResolutionProvider({
         connectionData[edgeId]?.error || null,
       getClusterProgress: (clusterIdToQuery: string): ClusterProgress => {
         const vizState = visualizationData[clusterIdToQuery];
-        // A cluster marked as was_split might have 0 links if its viz data is reloaded post-split.
-        // Its "completeness" comes from the split status rather than edge review count.
-        // However, this progress is about *reviewable edges in the current view*.
         const clusterDetails = getClusterById(clusterIdToQuery);
-        if (clusterDetails?.wasSplit) { // If cluster was split, it's considered "complete" for review purposes
+        if (clusterDetails?.wasSplit) {
              return {
                 clusterId: clusterIdToQuery,
-                totalEdges: 0, // Or original total if you want to show that, but for review progress, 0 makes sense
-                reviewedEdges: 0,
+                totalEdges: vizState?.data?.links?.length || 0,
+                reviewedEdges: vizState?.data?.links?.length || 0, 
                 pendingEdges: 0,
-                confirmedMatches: 0,
-                confirmedNonMatches: 0,
+                confirmedMatches: vizState?.data?.links?.filter(l => l.status === "CONFIRMED_MATCH").length || 0,
+                confirmedNonMatches: vizState?.data?.links?.filter(l => l.status === "CONFIRMED_NON_MATCH").length || 0,
                 progressPercentage: 100,
                 isComplete: true,
              };
@@ -305,11 +308,11 @@ export function EntityResolutionProvider({
             confirmedMatches: 0,
             confirmedNonMatches: 0,
             progressPercentage: 0,
-            isComplete: false, // Not complete if no links unless it's an empty cluster
+            isComplete: false,
           };
         const { links } = vizState.data;
         const totalEdges = links.length;
-        if (totalEdges === 0) // Empty cluster (not split, just no links)
+        if (totalEdges === 0)
           return {
             clusterId: clusterIdToQuery,
             totalEdges: 0,
@@ -317,7 +320,7 @@ export function EntityResolutionProvider({
             pendingEdges: 0,
             confirmedMatches: 0,
             confirmedNonMatches: 0,
-            progressPercentage: 100, // An empty cluster is "complete" in terms of review
+            progressPercentage: 100,
             isComplete: true,
           };
 
@@ -378,7 +381,7 @@ export function EntityResolutionProvider({
       selectedClusterId,
       reviewQueue,
       processingBatchIdRef,
-      getClusterById // Added dependency
+      getClusterById
     ]
   );
 
@@ -412,32 +415,22 @@ export function EntityResolutionProvider({
       );
 
       clusterIds.forEach((clusterId) => {
-        const clusterDetail = queries.getClusterById(clusterId);
+        const clusterDetail = queries.getClusterById(clusterId); 
         if (clusterDetail?.wasSplit) {
-          console.log(`Skipping preload for already split cluster: ${clusterId}`);
-          // Optionally, set a specific state for split cluster visualization if needed
-           setVisualizationData((prev) => ({
-            ...prev,
-            [clusterId]: {
-              data: { nodes: [], links: [], entityGroups: [] } as any, // Empty viz data
-              loading: false,
-              error: null,
-              lastUpdated: Date.now(),
-            },
-          }));
-          return;
+          console.log(`Cluster ${clusterId} is marked as split. Proceeding to load its visualization data.`);
         }
 
         if (
           !visualizationData[clusterId]?.data ||
-          visualizationData[clusterId]?.error
+          visualizationData[clusterId]?.error ||
+          visualizationData[clusterId]?.loading 
         ) {
           setVisualizationData((prev) => ({
             ...prev,
             [clusterId]: {
-              data: prev[clusterId]?.data || null,
+              data: prev[clusterId]?.data || null, 
               loading: true,
-              error: null,
+              error: null, 
               lastUpdated: prev[clusterId]?.lastUpdated || null,
             },
           }));
@@ -471,10 +464,12 @@ export function EntityResolutionProvider({
                 },
               }));
             });
+        } else {
+            console.log(`Visualization data for cluster ${clusterId} already loaded and not errored. Skipping preload.`);
         }
       });
     },
-    [visualizationData, resolutionMode, queries] // Added queries
+    [visualizationData, resolutionMode, queries]
   );
 
   const loadConnectionData = useCallback(
@@ -498,7 +493,7 @@ export function EntityResolutionProvider({
         !cached.loading &&
         !cached.error &&
         cached.lastUpdated &&
-        Date.now() - cached.lastUpdated < 300000 // 5 min cache
+        Date.now() - cached.lastUpdated < 300000 
       ) {
         console.log(`Using cached connection data for edge ${edgeId}`);
         return cached.data;
@@ -515,7 +510,6 @@ export function EntityResolutionProvider({
       try {
         const data = await getConnData(edgeId);
         console.log(`Successfully loaded connection data for edge ${edgeId}`);
-        console.log("data:", JSON.stringify(data));
         setConnectionData((prev) => ({
           ...prev,
           [edgeId]: {
@@ -552,26 +546,15 @@ export function EntityResolutionProvider({
       setVisualizationData((prev) => ({
         ...prev,
         [clusterId]: {
-          data: null,
-          loading: false,
-          error: `Invalidated by user action`,
+          data: null, 
+          loading: true, 
+          error: null, 
           lastUpdated: null,
         },
       }));
-      if (selectedClusterId === clusterId) {
-         const clusterDetail = queries.getClusterById(clusterId);
-         if (!clusterDetail?.wasSplit) { // Don't preload for already split clusters
-            preloadVisualizationData([clusterId]);
-         } else {
-             // For a split cluster, ensure its visualization is cleared or set to an empty state
-            setVisualizationData((prevViz) => ({
-                ...prevViz,
-                [clusterId]: { data: { nodes: [], links: [], entityGroups: [] } as any, loading: false, error: null, lastUpdated: Date.now() },
-            }));
-         }
-      }
+      preloadVisualizationData([clusterId]);
     },
-    [selectedClusterId, preloadVisualizationData, queries] // Added queries
+    [preloadVisualizationData] 
   );
 
   const invalidateConnectionData = useCallback(
@@ -608,23 +591,20 @@ export function EntityResolutionProvider({
       const fetcher =
         resolutionMode === "entity" ? getEntityClusters : getServiceClusters;
       try {
-        const response = await fetcher(page, limit); // response.clusters will have `was_split`
+        const response = await fetcher(page, limit);
         console.log(
           `Successfully loaded clusters for mode ${resolutionMode}`,
           response
         );
         setClusters({
-          data: response.clusters as Array<EntityCluster | ServiceCluster>, // Cast ensures was_split is expected
+          data: response.clusters as Array<EntityCluster | ServiceCluster>,
           total: response.total,
           page,
           limit,
           loading: false,
           error: null,
         });
-        const clusterIdsToPreload = response.clusters
-            .filter(c => !(c as BaseCluster).wasSplit) // Don't preload viz for already split clusters
-            .map((c) => c.id);
-
+        const clusterIdsToPreload = response.clusters.map((c) => c.id);
         if (clusterIdsToPreload.length > 0) {
           preloadVisualizationData(clusterIdsToPreload);
         }
@@ -654,9 +634,12 @@ export function EntityResolutionProvider({
         `Setting selected cluster ID to: ${id}. Previous: ${previousSelectedClusterId}`
       );
       
-      const clusterDetail = id ? queries.getClusterById(id) : null;
+      setSelectedClusterIdState(id);
+      setSelectedEdgeIdState(null); 
+      setLastReviewedEdgeId(null); 
 
       if (id && id !== previousSelectedClusterId) {
+        const clusterDetail = queries.getClusterById(id); 
         if (clusterDetail?.wasSplit || queries.getClusterProgress(id).isComplete) {
           console.log(
             `Cluster ${id} is already split or complete. Pausing auto-advance.`
@@ -669,32 +652,22 @@ export function EntityResolutionProvider({
           setIsAutoAdvanceEnabledState(true);
         }
       }
-
-      setSelectedClusterIdState(id);
-      setSelectedEdgeIdState(null);
-      setLastReviewedEdgeId(null);
-
+      
       if (
         id &&
-        !clusterDetail?.wasSplit && // Don't preload for split clusters
-        !visualizationData[id]?.data &&
-        !visualizationData[id]?.loading
+        (!visualizationData[id]?.data || visualizationData[id]?.error) && 
+        !visualizationData[id]?.loading 
       ) {
+        const clusterDetail = queries.getClusterById(id); 
         console.log(
-          `Preloading visualization data for newly selected cluster: ${id}`
+          `Preloading visualization data for newly selected cluster: ${id} (wasSplit: ${clusterDetail?.wasSplit})`
         );
-        preloadVisualizationData([id]);
-      } else if (id && clusterDetail?.wasSplit) {
-         // For a split cluster, ensure its visualization is cleared or set to an empty state
-        setVisualizationData((prevViz) => ({
-            ...prevViz,
-            [id]: { data: { nodes: [], links: [], entityGroups: [] } as any, loading: false, error: null, lastUpdated: Date.now() },
-        }));
+        preloadVisualizationData([id]); 
       }
     },
     [
       selectedClusterId,
-      queries,
+      queries, 
       visualizationData,
       preloadVisualizationData,
       setIsAutoAdvanceEnabledState,
@@ -760,7 +733,7 @@ export function EntityResolutionProvider({
         selectedClusterId &&
         (target === "all" || target === "current_visualization")
       ) {
-        invalidateVisualizationData(selectedClusterId); // This will respect was_split
+        invalidateVisualizationData(selectedClusterId);
       }
       if (
         selectedEdgeId &&
@@ -801,16 +774,13 @@ export function EntityResolutionProvider({
     let nextClusterSelected = false;
     for (let i = currentIndex + 1; i < clusters.data.length; i++) {
       const nextClusterOnPage = clusters.data[i];
-      // Check progress AND was_split. A split cluster is also "complete" for advancement.
-      if (!queries.getClusterProgress(nextClusterOnPage.id).isComplete || (nextClusterOnPage as BaseCluster).wasSplit) {
-         if(!(nextClusterOnPage as BaseCluster).wasSplit && !queries.getClusterProgress(nextClusterOnPage.id).isComplete) {
+      if (!queries.getClusterProgress(nextClusterOnPage.id).isComplete) { 
             console.log(
-              `Selecting next uncompleted, non-split cluster in current page: ${nextClusterOnPage.id}`
+              `Selecting next uncompleted cluster in current page: ${nextClusterOnPage.id}`
             );
             handleSetSelectedClusterId(nextClusterOnPage.id);
             nextClusterSelected = true;
             break;
-         }
       }
     }
 
@@ -821,7 +791,6 @@ export function EntityResolutionProvider({
           `Loading next page (${nextPageToLoad}) of clusters.`
         );
         await loadClusters(nextPageToLoad, clusters.limit);
-        setSelectedClusterIdState(null); 
       } else {
         toast({
           title: "Workflow Complete",
@@ -850,15 +819,13 @@ export function EntityResolutionProvider({
       console.log(`Checking if cluster ${targetClusterId} is complete or split.`);
 
       const clusterDetail = queries.getClusterById(targetClusterId);
-      const progress = queries.getClusterProgress(targetClusterId); // getClusterProgress now considers was_split
-      const isCompleteOrSplit = progress.isComplete || clusterDetail?.wasSplit;
+      const progress = queries.getClusterProgress(targetClusterId);
+      const isCompleteOrSplit = progress.isComplete; 
 
       console.log(
         `Cluster ${targetClusterId}: Total=${progress.totalEdges}, Reviewed=${progress.reviewedEdges}, Pending=${progress.pendingEdges}, Complete=${progress.isComplete}, WasSplit=${clusterDetail?.wasSplit}`
       );
 
-      // Only finalize if it's complete AND NOT already split.
-      // A split cluster has already been "finalized" in a sense.
       if (progress.isComplete && !clusterDetail?.wasSplit && progress.totalEdges > 0) {
         toast({
           title: "Cluster Review Complete",
@@ -875,7 +842,7 @@ export function EntityResolutionProvider({
           console.log(
             `Finalizing cluster ${targetClusterId} for mode ${resolutionMode}.`
           );
-          const finalizationResponse = await finalizer(targetClusterId); // API now handles was_split
+          const finalizationResponse = await finalizer(targetClusterId);
           toast({
             title: "Cluster Finalization",
             description: `${finalizationResponse.message}. Status: ${finalizationResponse.status}`,
@@ -885,16 +852,7 @@ export function EntityResolutionProvider({
             finalizationResponse
           );
 
-          // Reload clusters. The reloaded original cluster will have was_split=true if split.
-          loadClusters(clusters.page, clusters.limit);
-          invalidateVisualizationData(targetClusterId); // Will correctly handle if it became split
-          if (
-            finalizationResponse.newClusterIds &&
-            finalizationResponse.newClusterIds.length > 0
-          ) {
-            // Preload viz for new clusters (these are not split themselves)
-            preloadVisualizationData(finalizationResponse.newClusterIds);
-          }
+          loadClusters(clusters.page, clusters.limit); 
 
           if (targetClusterId === selectedClusterId) {
             if (isAutoAdvanceEnabled) {
@@ -922,14 +880,14 @@ export function EntityResolutionProvider({
             finalizationError
           );
         }
-      } else if (isCompleteOrSplit) { // If it's already split, or complete with 0 edges
+      } else if (isCompleteOrSplit) { 
          if (targetClusterId === selectedClusterId && isAutoAdvanceEnabled) {
             console.log(
-                `Cluster ${targetClusterId} is already split or is an empty cluster. Auto-advance ON. Advancing.`
+                `Cluster ${targetClusterId} is already split or is an empty/completed cluster. Auto-advance ON. Advancing.`
             );
             advanceToNextCluster();
          } else if (isCompleteOrSplit) {
-             console.log(`Cluster ${targetClusterId} is already split or empty. Auto-advance OFF or not selected. Not advancing.`);
+             console.log(`Cluster ${targetClusterId} is already split or empty/completed. Auto-advance OFF or not selected. Not advancing.`);
          }
       }
     },
@@ -938,12 +896,10 @@ export function EntityResolutionProvider({
       queries,
       advanceToNextCluster,
       toast,
-      invalidateVisualizationData,
       loadClusters,
       clusters.page,
       clusters.limit,
       resolutionMode,
-      preloadVisualizationData,
       isAutoAdvanceEnabled,
     ]
   );
@@ -1015,9 +971,92 @@ export function EntityResolutionProvider({
       toast,
       checkAndAdvanceIfComplete,
       setIsAutoAdvanceEnabledState,
-      queries, // Added queries
+      queries,
     ]
   );
+
+  const selectNextUnreviewedInCluster = useCallback(() => {
+    setIsAutoAdvanceEnabledState(true); 
+    const currentClusterId = selectedClusterId;
+    if (!currentClusterId) return;
+
+    const clusterDetail = queries.getClusterById(currentClusterId);
+    if (clusterDetail?.wasSplit) {
+      checkAndAdvanceIfComplete(currentClusterId); 
+      return;
+    }
+
+    const currentViz = visualizationData[currentClusterId]?.data;
+    if (!currentViz?.links || currentViz.links.length === 0) {
+      checkAndAdvanceIfComplete(currentClusterId); 
+      return;
+    }
+
+    const unreviewedLinks = currentViz.links.filter(l => l.status === "PENDING_REVIEW");
+    if (unreviewedLinks.length === 0) {
+      toast({ title: "Info", description: "No unreviewed connections in this cluster." });
+      checkAndAdvanceIfComplete(currentClusterId); 
+      return;
+    }
+
+    let nextEdgeToSelectId: string | null = null;
+    if (selectedEdgeId) {
+      const currentIndexInUnreviewed = unreviewedLinks.findIndex(l => l.id === selectedEdgeId);
+      if (currentIndexInUnreviewed !== -1) { 
+        nextEdgeToSelectId = unreviewedLinks[(currentIndexInUnreviewed + 1) % unreviewedLinks.length].id;
+      } else { 
+        nextEdgeToSelectId = unreviewedLinks[0].id;
+      }
+    } else { 
+      nextEdgeToSelectId = unreviewedLinks[0].id;
+    }
+
+    if (nextEdgeToSelectId) {
+      setSelectedEdgeIdState(nextEdgeToSelectId);
+    }
+  }, [selectedClusterId, selectedEdgeId, visualizationData, queries, checkAndAdvanceIfComplete, toast, setIsAutoAdvanceEnabledState]);
+
+  const selectPreviousUnreviewedInCluster = useCallback(() => {
+    setIsAutoAdvanceEnabledState(true);
+    const currentClusterId = selectedClusterId;
+    if (!currentClusterId) return;
+
+    const clusterDetail = queries.getClusterById(currentClusterId);
+    if (clusterDetail?.wasSplit) {
+      checkAndAdvanceIfComplete(currentClusterId);
+      return;
+    }
+
+    const currentViz = visualizationData[currentClusterId]?.data;
+    if (!currentViz?.links || currentViz.links.length === 0) {
+      checkAndAdvanceIfComplete(currentClusterId);
+      return;
+    }
+
+    const unreviewedLinks = currentViz.links.filter(l => l.status === "PENDING_REVIEW");
+    if (unreviewedLinks.length === 0) {
+      toast({ title: "Info", description: "No unreviewed connections in this cluster." });
+      checkAndAdvanceIfComplete(currentClusterId);
+      return;
+    }
+
+    let prevEdgeToSelectId: string | null = null;
+    if (selectedEdgeId) {
+      const currentIndexInUnreviewed = unreviewedLinks.findIndex(l => l.id === selectedEdgeId);
+      if (currentIndexInUnreviewed !== -1) { 
+        prevEdgeToSelectId = unreviewedLinks[(currentIndexInUnreviewed - 1 + unreviewedLinks.length) % unreviewedLinks.length].id;
+      } else { 
+        prevEdgeToSelectId = unreviewedLinks[unreviewedLinks.length - 1].id; 
+      }
+    } else { 
+      prevEdgeToSelectId = unreviewedLinks[unreviewedLinks.length - 1].id; 
+    }
+    
+    if (prevEdgeToSelectId) {
+      setSelectedEdgeIdState(prevEdgeToSelectId);
+    }
+  }, [selectedClusterId, selectedEdgeId, visualizationData, queries, checkAndAdvanceIfComplete, toast, setIsAutoAdvanceEnabledState]);
+
 
   const submitEdgeReview = useCallback(
     async (edgeId: string, decision: GroupReviewDecision) => {
@@ -1045,7 +1084,7 @@ export function EntityResolutionProvider({
       if (!connData || !vizData) {
         toast({ title: "Data Error", description: "Data not loaded for review.", variant: "destructive" });
         if (!connData) loadConnectionData(edgeId);
-        if (!vizData && selectedClusterId) preloadVisualizationData([selectedClusterId]); // Respects was_split
+        if (!vizData && selectedClusterId) preloadVisualizationData([selectedClusterId]);
         return;
       }
 
@@ -1064,7 +1103,6 @@ export function EntityResolutionProvider({
         );
         currentEdgeLink = entityVizData.links.find((l) => l.id === edgeId);
       } else if (resolutionMode === "service" && "entityGroups" in connData && "links" in vizData ) {
-         // Assuming ServiceConnectionDataResponse has `entityGroups` as ServiceGroup[] and `edge` as VisualizationServiceEdge
         const serviceConnData = connData as ServiceConnectionDataResponse;
         const serviceVizData = vizData as ServiceVisualizationDataResponse;
         relevantGroups = (serviceConnData.entityGroups as ServiceGroup[]).filter(
@@ -1124,8 +1162,6 @@ export function EntityResolutionProvider({
         processedOperations: new Set(), failedOperations: new Set(), mode: resolutionMode,
       };
 
-      // Optimistic UI updates (visualization and connection data)
-      // ... (similar to original, ensure types are handled for Entity/Service)
        setVisualizationData((prevVizData) => {
         const newVizDataState = { ...prevVizData };
         const targetClusterVizState = newVizDataState[batch.clusterId];
@@ -1140,7 +1176,7 @@ export function EntityResolutionProvider({
             const groupsToUpdate = targetClusterViz.entityGroups as Array<EntityGroup | ServiceGroup>;
             (targetClusterViz.entityGroups as Array<EntityGroup | ServiceGroup>) = groupsToUpdate.map((group) =>
               batch.operations.some((op) => op.groupId === group.id)
-                ? { ...group, confirmed_status: batch.optimisticGroupStatus }
+                ? { ...group, confirmed_status: batch.optimisticGroupStatus } // This should be confirmedStatus, not confirmed_status
                 : group
             );
           }
@@ -1155,7 +1191,7 @@ export function EntityResolutionProvider({
           const targetConn = { ...targetConnState.data };
           if ("edge" in targetConn) {
             (targetConn.edge as VisualizationEntityEdge | VisualizationServiceEdge).status = batch.optimisticEdgeStatus;
-            if ("confirmed_status" in targetConn.edge) {
+            if ("confirmed_status" in targetConn.edge) { // This property might not exist on VisualizationServiceEdge
                 (targetConn.edge as any).confirmed_status = batch.optimisticGroupStatus;
             }
           }
@@ -1163,7 +1199,7 @@ export function EntityResolutionProvider({
              const groupsToUpdate = targetConn.entityGroups as Array<EntityGroup | ServiceGroup>;
             (targetConn.entityGroups as Array<EntityGroup | ServiceGroup>) = groupsToUpdate.map((group) =>
               batch.operations.some((op) => op.groupId === group.id)
-                ? { ...group, confirmed_status: batch.optimisticGroupStatus }
+                ? { ...group, confirmedStatus: batch.optimisticGroupStatus } // Use confirmedStatus
                 : group
             );
           }
@@ -1182,7 +1218,7 @@ export function EntityResolutionProvider({
     [
       currentUser, selectedClusterId, connectionData, visualizationData, toast,
       resolutionMode, loadConnectionData, preloadVisualizationData,
-      isAutoAdvanceEnabled, selectNextUnreviewedEdge, checkAndAdvanceIfComplete, queries // Added queries
+      isAutoAdvanceEnabled, selectNextUnreviewedEdge, checkAndAdvanceIfComplete, queries
     ]
   );
 
@@ -1235,8 +1271,6 @@ export function EntityResolutionProvider({
           variant: "destructive", duration: 10000,
         });
         console.error(`Batch ${currentBatch.batchId} failed permanently.`);
-        // Revert optimistic updates
-        // ... (similar to original, ensure types are handled for Entity/Service)
         setVisualizationData((prevVizData) => {
             const newVizDataState = { ...prevVizData };
             const targetClusterVizState = newVizDataState[currentBatch.clusterId];
@@ -1251,7 +1285,7 @@ export function EntityResolutionProvider({
                     const groupsToRevert = targetClusterViz.entityGroups as Array<EntityGroup | ServiceGroup>;
                     (targetClusterViz.entityGroups as Array<EntityGroup | ServiceGroup>) = groupsToRevert.map(group => {
                         const op = currentBatch.operations.find(o => o.groupId === group.id);
-                        if (op) return { ...group, confirmed_status: op.originalGroupStatus };
+                        if (op) return { ...group, confirmedStatus: op.originalGroupStatus }; // Use confirmedStatus
                         return group;
                     });
                 }
@@ -1272,7 +1306,7 @@ export function EntityResolutionProvider({
                     const groupsToRevert = targetConn.entityGroups as Array<EntityGroup | ServiceGroup>;
                     (targetConn.entityGroups as Array<EntityGroup | ServiceGroup>) = groupsToRevert.map(group => {
                         const op = currentBatch.operations.find(o => o.groupId === group.id);
-                        if (op) return { ...group, confirmed_status: op.originalGroupStatus };
+                        if (op) return { ...group, confirmedStatus: op.originalGroupStatus }; // Use confirmedStatus
                         return group;
                     });
                 }
@@ -1290,8 +1324,6 @@ export function EntityResolutionProvider({
       console.log(`Batch ${currentBatch.batchId} processed successfully.`);
       setReviewQueue(prevQ => prevQ.filter(b => b.batchId !== currentBatch.batchId));
       if (currentBatch.clusterId) {
-        // Check and advance, this will also handle finalization if the cluster is now complete
-        // and not split.
         checkAndAdvanceIfComplete(currentBatch.clusterId);
       }
     }
@@ -1317,31 +1349,81 @@ export function EntityResolutionProvider({
 
 
   const edgeSelectionInfo = useMemo((): EdgeSelectionInfo => {
-    if (!currentVisualizationData?.links)
-      return { currentEdgeId: selectedEdgeId, nextUnreviewedEdgeId: null, hasUnreviewedEdges: false, currentEdgeIndex: -1, totalEdges: 0 };
+    if (!currentVisualizationData?.links || currentVisualizationData.links.length === 0) {
+      return {
+        currentEdgeId: selectedEdgeId,
+        nextUnreviewedEdgeId: null,
+        hasUnreviewedEdges: false,
+        currentEdgeIndex: -1,
+        totalEdges: 0,
+        totalUnreviewedEdgesInCluster: 0,
+        currentUnreviewedEdgeIndexInCluster: -1,
+      };
+    }
+
     const { links } = currentVisualizationData;
     const totalEdges = links.length;
 
-    const findNextAfter = (afterId: string | null): string | null => {
-      let startIndex = 0;
-      if (afterId) {
-        const idx = links.findIndex((l) => l.id === afterId);
-        if (idx !== -1) startIndex = idx + 1;
-      }
-      for (let i = 0; i < links.length; i++) {
-        const currentIndex = (startIndex + i) % links.length;
-        if (links[currentIndex].status === "PENDING_REVIEW") return links[currentIndex].id;
-      }
-      return null;
-    };
-    const nextUnreviewedEdgeId = findNextAfter(lastReviewedEdgeId || selectedEdgeId);
-    const unreviewedLinksCount = links.filter(link => link.status === "PENDING_REVIEW").length;
+    const unreviewedLinks = links.filter(link => link.status === "PENDING_REVIEW");
+    const totalUnreviewedEdgesInCluster = unreviewedLinks.length;
+
+    let currentUnreviewedEdgeIndexInCluster = -1;
+    if (selectedEdgeId) {
+        const selectedEdgeIsUnreviewed = unreviewedLinks.some(l => l.id === selectedEdgeId);
+        if (selectedEdgeIsUnreviewed) {
+            currentUnreviewedEdgeIndexInCluster = unreviewedLinks.findIndex(l => l.id === selectedEdgeId);
+        }
+    }
+    
+    let nextUnreviewedEdgeId: string | null = null;
+    if (totalUnreviewedEdgesInCluster > 0) {
+        const referenceEdgeId = lastReviewedEdgeId || selectedEdgeId;
+        let startIndexInAllLinks = 0;
+        if (referenceEdgeId) {
+            const idx = links.findIndex((l) => l.id === referenceEdgeId);
+            if (idx !== -1) {
+                startIndexInAllLinks = idx + 1;
+            }
+        }
+        for (let i = 0; i < links.length; i++) {
+            const currentLinkToCheck = links[(startIndexInAllLinks + i) % links.length];
+            if (currentLinkToCheck.status === "PENDING_REVIEW") {
+                if (currentLinkToCheck.id !== selectedEdgeId || totalUnreviewedEdgesInCluster > 1) {
+                     nextUnreviewedEdgeId = currentLinkToCheck.id;
+                     break;
+                } else if (currentLinkToCheck.id === selectedEdgeId && totalUnreviewedEdgesInCluster === 1) {
+                    nextUnreviewedEdgeId = null; 
+                    break;
+                }
+            }
+        }
+        if (!nextUnreviewedEdgeId && unreviewedLinks.length > 0) {
+            if (selectedEdgeId && unreviewedLinks.some(l => l.id === selectedEdgeId) && unreviewedLinks.length === 1) {
+                nextUnreviewedEdgeId = null;
+            } else {
+                 // If the selected edge is reviewed, or no edge is selected, pick the first unreviewed.
+                const firstUnreviewed = unreviewedLinks.find(l => l.id !== selectedEdgeId);
+                if (firstUnreviewed) {
+                    nextUnreviewedEdgeId = firstUnreviewed.id;
+                } else if (unreviewedLinks.length > 0 && selectedEdgeId && !unreviewedLinks.some(l => l.id === selectedEdgeId)) {
+                    // selected edge is reviewed, pick the first unreviewed
+                    nextUnreviewedEdgeId = unreviewedLinks[0].id;
+                } else if (unreviewedLinks.length > 0 && !selectedEdgeId) {
+                    // no edge selected, pick the first unreviewed
+                    nextUnreviewedEdgeId = unreviewedLinks[0].id;
+                }
+            }
+        }
+    }
 
     return {
-      currentEdgeId: selectedEdgeId, nextUnreviewedEdgeId,
-      hasUnreviewedEdges: unreviewedLinksCount > 0,
+      currentEdgeId: selectedEdgeId,
+      nextUnreviewedEdgeId,
+      hasUnreviewedEdges: totalUnreviewedEdgesInCluster > 0,
       currentEdgeIndex: selectedEdgeId ? links.findIndex((link) => link.id === selectedEdgeId) : -1,
       totalEdges,
+      totalUnreviewedEdgesInCluster,
+      currentUnreviewedEdgeIndexInCluster,
     };
   }, [currentVisualizationData, selectedEdgeId, lastReviewedEdgeId]);
 
@@ -1353,7 +1435,7 @@ export function EntityResolutionProvider({
   useEffect(() => {
     if (!selectedClusterId && clusters.data.length > 0 && !clusters.loading) {
       const firstNonSplitUncompletedCluster = clusters.data.find(
-        (c) => !(c as BaseCluster).wasSplit && !queries.getClusterProgress(c.id).isComplete
+        (c) => !queries.getClusterProgress(c.id).isComplete 
       );
       if (firstNonSplitUncompletedCluster) {
         console.log("Auto-selecting first non-split, uncompleted cluster:", firstNonSplitUncompletedCluster.id);
@@ -1361,7 +1443,7 @@ export function EntityResolutionProvider({
       } else if (clusters.data.length > 0) {
         const firstCluster = clusters.data[0];
          console.log("All clusters on current page are split or complete. Auto-selecting first cluster for viewing:", firstCluster.id);
-        handleSetSelectedClusterId(firstCluster.id); // Will set auto-advance OFF due to completeness/split status
+        handleSetSelectedClusterId(firstCluster.id);
       }
     }
   }, [selectedClusterId, clusters.data, clusters.loading, queries, handleSetSelectedClusterId]);
@@ -1372,35 +1454,29 @@ export function EntityResolutionProvider({
       setSelectedEdgeId: setSelectedEdgeIdAction, setReviewerId, setLastReviewedEdgeId,
       triggerRefresh, loadClusters, preloadVisualizationData, loadConnectionData,
       invalidateVisualizationData, invalidateConnectionData, clearAllData,
-      selectNextUnreviewedEdge, advanceToNextCluster, checkAndAdvanceIfComplete,
+      selectNextUnreviewedEdge, 
+      selectNextUnreviewedInCluster, 
+      selectPreviousUnreviewedInCluster, 
+      advanceToNextCluster, checkAndAdvanceIfComplete,
       submitEdgeReview, retryFailedBatch, setIsAutoAdvanceEnabled: setIsAutoAdvanceEnabledState,
     }),
     [
       setResolutionMode, handleSetSelectedClusterId, setSelectedEdgeIdAction, setReviewerId,
       setLastReviewedEdgeId, triggerRefresh, loadClusters, preloadVisualizationData,
       loadConnectionData, invalidateVisualizationData, invalidateConnectionData,
-      clearAllData, selectNextUnreviewedEdge, advanceToNextCluster,
-      checkAndAdvanceIfComplete, submitEdgeReview, retryFailedBatch, setIsAutoAdvanceEnabledState
+      clearAllData, selectNextUnreviewedEdge, 
+      selectNextUnreviewedInCluster, selectPreviousUnreviewedInCluster,
+      advanceToNextCluster, checkAndAdvanceIfComplete, 
+      submitEdgeReview, retryFailedBatch, setIsAutoAdvanceEnabledState
     ]
   );
 
   useEffect(() => {
     if (selectedClusterId && currentVisualizationData?.links && !selectedEdgeId) {
-        const clusterDetail = queries.getClusterById(selectedClusterId);
-        if (clusterDetail && !clusterDetail.wasSplit) { // Only select edge if cluster is not split
-            if (edgeSelectionInfo.hasUnreviewedEdges) {
-                console.log(`Cluster ${selectedClusterId} active, non-split, data loaded, no edge selected, unreviewed edges exist. Triggering edge selection.`);
-                actions.selectNextUnreviewedEdge();
-            } else {
-                console.log(`Cluster ${selectedClusterId} active, non-split, data loaded, no edge selected, NO unreviewed edges. Checking completion/advance.`);
-                actions.checkAndAdvanceIfComplete(selectedClusterId);
-            }
-        } else if (clusterDetail?.wasSplit) {
-            console.log(`Cluster ${selectedClusterId} is split. No edge selection. Checking advance.`);
-            actions.checkAndAdvanceIfComplete(selectedClusterId); // Check if we should advance from this split cluster
-        }
+        console.log(`Cluster ${selectedClusterId} selected, viz data loaded, no edge selected. Evaluating next action using selectNextUnreviewedEdge.`);
+        actions.selectNextUnreviewedEdge();
     }
-  }, [selectedClusterId, currentVisualizationData, selectedEdgeId, edgeSelectionInfo, actions, queries]); // Added queries
+  }, [selectedClusterId, currentVisualizationData, selectedEdgeId, actions]);
 
   useEffect(() => {
     if (selectedEdgeId) {
@@ -1432,7 +1508,7 @@ export function EntityResolutionProvider({
     clusterProgress: useMemo(() => {
       const reconstructed: Record<string, ClusterProgress> = {};
       clusters.data.forEach((c) => {
-        reconstructed[c.id] = queries.getClusterProgress(c.id); // getClusterProgress now considers was_split
+        reconstructed[c.id] = queries.getClusterProgress(c.id); 
       });
       if (selectedClusterId && !reconstructed[selectedClusterId] && visualizationData[selectedClusterId]?.data?.links) {
         reconstructed[selectedClusterId] = queries.getClusterProgress(selectedClusterId);
@@ -1440,7 +1516,7 @@ export function EntityResolutionProvider({
       return reconstructed;
     }, [clusters.data, selectedClusterId, visualizationData, queries]),
     edgeSelectionInfo, currentVisualizationData, currentConnectionData,
-    selectedClusterDetails, // Added
+    selectedClusterDetails, 
     actions, queries,
   };
 

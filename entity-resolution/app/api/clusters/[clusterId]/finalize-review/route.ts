@@ -1,26 +1,25 @@
 // app/api/clusters/[clusterId]/finalize-review/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { getIronSession } from 'iron-session';
-import { withTransaction } from '@/types/db'; // query, queryOne not used here
-// import { getUserSchemaFromSession } from '@/utils/auth-db'; // DbUser not used here
-import { sessionOptions } from '@/lib/session';
-import { v4 as uuidv4 } from 'uuid';
-import type { ClusterFinalizationStatusResponse } from '@/types/entity-resolution'; // Ensure this and other types are updated
-import type { UserSessionData } from '@/app/api/auth/login/route';
+import { withTransaction } from '@/types/db'; // Assuming this is your DB helper
+import { sessionOptions } from '@/lib/session'; // Assuming this is your session config
+// import { v4 as uuidv4 } from 'uuid'; // No longer needed for new cluster IDs
+import type { ClusterFinalizationStatusResponse } from '@/types/entity-resolution';
+import type { UserSessionData } from '@/app/api/auth/login/route'; // Assuming this is your user session type
 
 // Interface for service groups or entity groups used in graph construction
 interface GenericGroupForGraph {
   id: string; // group id
   item_id_1: string; // service_id_1 or entity_id_1
   item_id_2: string; // service_id_2 or entity_id_2
-  group_cluster_id: string; // This is the original group_cluster.id
+  // group_cluster_id: string; // This is the original group_cluster.id - not strictly needed for component calculation
 }
 
 export async function POST(
   request: NextRequest,
   { params }: { params: { clusterId: string } }
 ) {
-  const { clusterId: originalClusterId } = await params;
+  const { clusterId: originalClusterId } = await params; // Renamed for clarity
 
   if (!originalClusterId) {
     return NextResponse.json({
@@ -46,7 +45,7 @@ export async function POST(
   let sessionId: string | null;
 
   try {
-    const tempResponse = new NextResponse();
+    const tempResponse = new NextResponse(); // Required for iron-session in Route Handlers
     const session = await getIronSession<UserSessionData>(request, tempResponse, sessionOptions);
 
     if (!session.isLoggedIn || !session.userSchema || !session.userId || !session.sessionId) {
@@ -58,7 +57,7 @@ export async function POST(
     }
     userSchema = session.userSchema;
     sessionUserId = session.userId;
-    sessionId = session.sessionId;
+    sessionId = session.sessionId; // Keep for logging/description
   } catch (error) {
     console.error('Session error:', error);
     return NextResponse.json({
@@ -68,34 +67,39 @@ export async function POST(
     } as ClusterFinalizationStatusResponse, { status: 500 });
   }
 
+  // Ensure userSchema and sessionUserId are available after session check
   if (!userSchema || !sessionUserId) {
+    // This case should ideally be caught by the session check above,
+    // but as a safeguard:
     return NextResponse.json({
         status: 'ERROR',
-        message: 'User schema or session user ID could not be determined.',
+        message: 'User schema or session user ID could not be determined from session.',
         originalClusterId: originalClusterId
     } as ClusterFinalizationStatusResponse, { status: 500 });
   }
+
 
   // Table and column names based on type
   const tableNames = {
     cluster: type === 'entity' ? 'entity_group_cluster' : 'service_group_cluster',
     group: type === 'entity' ? 'entity_group' : 'service_group',
-    edgeVisualization: type === 'entity' ? 'entity_edge_visualization' : 'service_edge_visualization',
-    itemCountCol: type === 'entity' ? 'entity_count' : 'service_count',
-    groupCountCol: type === 'entity' ? 'group_count' : 'service_group_count',
+    // edgeVisualization: type === 'entity' ? 'entity_edge_visualization' : 'service_edge_visualization', // Not directly updated anymore
+    itemCountCol: type === 'entity' ? 'entity_count' : 'service_count', // Used for updates
+    groupCountCol: type === 'entity' ? 'group_count' : 'service_group_count', // Used for updates
     itemId1Col: type === 'entity' ? 'entity_id_1' : 'service_id_1',
     itemId2Col: type === 'entity' ? 'entity_id_2' : 'service_id_2',
-    visClusterIdCol: type === 'entity' ? 'cluster_id' : 'service_group_cluster_id', // For edge_visualization table
+    // visClusterIdCol: type === 'entity' ? 'cluster_id' : 'service_group_cluster_id', // Not directly updated anymore
   };
 
   try {
     const result = await withTransaction(async (client) => {
       // 1. Check original cluster exists.
-      const originalClusterCheckSql = `SELECT id FROM "${userSchema}".${tableNames.cluster} WHERE id = $1;`;
+      const originalClusterCheckSql = `SELECT id, ${tableNames.itemCountCol} AS original_item_count, ${tableNames.groupCountCol} AS original_group_count FROM "${userSchema}".${tableNames.cluster} WHERE id = $1;`;
       const originalClusterCheckResult = await client.query(originalClusterCheckSql, [originalClusterId]);
       if (originalClusterCheckResult.rowCount === 0) {
           return { status: 'CLUSTER_NOT_FOUND', message: `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} not found.`, originalClusterId: originalClusterId } as ClusterFinalizationStatusResponse;
       }
+      // const originalCounts = originalClusterCheckResult.rows[0]; // We might not need to explicitly use these if we don't zero them out
 
       // 2. Check if fully reviewed.
       const reviewStatusSql = `
@@ -116,31 +120,41 @@ export async function POST(
           } as ClusterFinalizationStatusResponse;
       }
 
-      // 3. Fetch confirmed groups.
+      // 3. Fetch confirmed groups to determine connectivity.
       const confirmedGroupsSql = `
-          SELECT id, ${tableNames.itemId1Col} AS item_id_1, ${tableNames.itemId2Col} AS item_id_2, group_cluster_id
+          SELECT id, ${tableNames.itemId1Col} AS item_id_1, ${tableNames.itemId2Col} AS item_id_2
           FROM "${userSchema}".${tableNames.group}
           WHERE group_cluster_id = $1 AND confirmed_status = 'CONFIRMED_MATCH';
       `;
       const confirmedGroupsResult = await client.query(confirmedGroupsSql, [originalClusterId]);
       const confirmedGenericGroups: GenericGroupForGraph[] = confirmedGroupsResult.rows;
 
-      // Handle empty cluster (no confirmed matches after review)
+      // If there are no 'CONFIRMED_MATCH' groups, the cluster is effectively empty or all its connections are non-matches.
+      // It won't split. `was_split` should be false.
+      // We still need to update its description and potentially counts if they were based on confirmed matches.
       if (confirmedGenericGroups.length === 0) {
+          const descriptionSuffix = ` (Review Finalized - No Confirmed Matches)`;
+          // Update description, ensure was_split is FALSE. Counts remain as they were or are updated to 0 if appropriate.
+          // For simplicity, let's assume counts should reflect the *confirmed* state. So, 0 items, 0 groups.
           await client.query(
               `UPDATE "${userSchema}".${tableNames.cluster}
-               SET ${tableNames.itemCountCol} = 0, ${tableNames.groupCountCol} = 0, description = COALESCE(description, '') || ' (Reviewed - Empty)', updated_at = CURRENT_TIMESTAMP, was_split = FALSE
-               WHERE id = $1;`, // Explicitly set was_split to FALSE
+               SET ${tableNames.itemCountCol} = 0, ${tableNames.groupCountCol} = 0, description = COALESCE(description, '') || $1, updated_at = CURRENT_TIMESTAMP, was_split = FALSE
+               WHERE id = $2;`,
+              [descriptionSuffix, originalClusterId]
+          );
+          // Nullify group_cluster_id for DENIED/CONFIRMED_NON_MATCH groups
+          await client.query(
+              `UPDATE "${userSchema}".${tableNames.group} SET group_cluster_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE group_cluster_id = $1 AND confirmed_status IN ('DENIED', 'CONFIRMED_NON_MATCH');`,
               [originalClusterId]
           );
           return {
               status: 'COMPLETED_NO_SPLIT_NEEDED',
-              message: `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} has no confirmed groups after review. Marked as empty.`,
+              message: `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} has no confirmed groups after review. Marked as reviewed.`,
               originalClusterId: originalClusterId
           } as ClusterFinalizationStatusResponse;
       }
 
-      // Build graph & Find components using item IDs
+      // 4. Build graph & Find components using item IDs from 'CONFIRMED_MATCH' groups.
       const adj: Record<string, string[]> = {};
       const allItems = new Set<string>();
       confirmedGenericGroups.forEach(group => {
@@ -149,6 +163,7 @@ export async function POST(
           allItems.add(group.item_id_1);
           allItems.add(group.item_id_2);
       });
+
       const visited = new Set<string>();
       const components: Array<Set<string>> = [];
       allItems.forEach(itemId => {
@@ -158,7 +173,7 @@ export async function POST(
               visited.add(itemId);
               currentComponent.add(itemId);
               while (queue.length > 0) {
-                  const u = queue.shift()!;
+                  const u = queue.shift()!; // Bang operator is fine since queue.length > 0
                   (adj[u] || []).forEach(v => {
                       if (!visited.has(v)) {
                           visited.add(v);
@@ -167,97 +182,79 @@ export async function POST(
                       }
                   });
               }
-              components.push(currentComponent);
+              if (currentComponent.size > 0) { // Only add non-empty components
+                components.push(currentComponent);
+              }
           }
       });
 
-      // Handle no-split
-      if (components.length <= 1) {
-          // Even if no split, we update the counts based on the main component of *confirmed* matches
-          const mainComponentItems = components.length > 0 ? components[0] : new Set<string>();
-          const groupsInMainComponent = confirmedGenericGroups.filter(g => mainComponentItems.has(g.item_id_1) && mainComponentItems.has(g.item_id_2));
+      const wouldSplit = components.length > 1;
+      let finalStatus: ClusterFinalizationStatusResponse['status'];
+      let finalMessage: string;
 
-          // If the single component is empty (e.g. all confirmed_match groups were isolated pairs that got denied, leaving no graph),
-          // this would have been caught by the confirmedGenericGroups.length === 0 check earlier.
-          // So, mainComponentItems.size and groupsInMainComponent.length should reflect the content of the finalized cluster.
+      // Update the original cluster's description and was_split status.
+      // Item and group counts on the original cluster will be updated based on the largest component
+      // if no split occurs, or remain as they were if a split *would* occur (as per simplified logic).
+      // For simplicity and to reflect the "finalized" state based on confirmed matches:
+      // If it doesn't split, update counts to reflect the single component.
+      // If it *would* split, was_split = TRUE. Counts are not zeroed out, description updated.
+
+      if (!wouldSplit) {
+          // No split needed. Update counts based on the single component (or empty if no confirmed items).
+          const mainComponentItems = components.length > 0 ? components[0] : new Set<String>();
+          const groupsInMainComponent = confirmedGenericGroups.filter(g =>
+            mainComponentItems.has(g.item_id_1) && mainComponentItems.has(g.item_id_2)
+          );
+
+          const descriptionSuffix = ` (Review Finalized - No Split)`;
           await client.query(
               `UPDATE "${userSchema}".${tableNames.cluster}
-               SET ${tableNames.itemCountCol} = $1, ${tableNames.groupCountCol} = $2, description = COALESCE(description, '') || ' (Review Finalized)', updated_at = CURRENT_TIMESTAMP, was_split = FALSE
-               WHERE id = $3;`, // Explicitly set was_split to FALSE
-              [mainComponentItems.size, groupsInMainComponent.length, originalClusterId]
+               SET ${tableNames.itemCountCol} = $1, ${tableNames.groupCountCol} = $2, description = COALESCE(description, '') || $3, updated_at = CURRENT_TIMESTAMP, was_split = FALSE
+               WHERE id = $4;`,
+              [mainComponentItems.size, groupsInMainComponent.length, descriptionSuffix, originalClusterId]
           );
-          return {
-              status: 'COMPLETED_NO_SPLIT_NEEDED',
-              message: `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} review finalized. No split occurred.`,
-              originalClusterId: originalClusterId
-          } as ClusterFinalizationStatusResponse;
-      }
-
-      // Handle split
-      const newClusterIds: string[] = [];
-      for (const component of components) {
-          const newClusterId = uuidv4();
-          newClusterIds.push(newClusterId);
-          const componentItems = Array.from(component);
-          const groupsInComponent = confirmedGenericGroups.filter(g => component.has(g.item_id_1) && component.has(g.item_id_2));
-          const newClusterName = `User ${type.charAt(0).toUpperCase() + type.slice(1)} Split from ${originalClusterId.substring(0,8)} - ${newClusterId.substring(0,8)}`;
-          const newClusterDescription = `User-defined ${type} cluster split from ${originalClusterId} by user ${sessionUserId} on ${new Date().toISOString()}. Contains ${componentItems.length} ${type}s and ${groupsInComponent.length} ${type} groups.`;
-
+          finalStatus = 'COMPLETED_NO_SPLIT_NEEDED';
+          finalMessage = `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} review finalized. No split occurred. Counts updated based on confirmed matches.`;
+      } else {
+          // Split would have occurred. Mark was_split = TRUE.
+          // Do NOT create new clusters. Do NOT reassign groups or edges.
+          // Do NOT zero out counts on the original cluster.
+          const descriptionSuffix = ` (Review Finalized - Would Split into ${components.length} components)`;
           await client.query(
-              `INSERT INTO "${userSchema}".${tableNames.cluster} (id, name, description, ${tableNames.itemCountCol}, ${tableNames.groupCountCol}, created_at, updated_at, was_split)
-               VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, FALSE);`, // New clusters are not "split" themselves
-              [newClusterId, newClusterName, newClusterDescription, componentItems.length, groupsInComponent.length]
+              `UPDATE "${userSchema}".${tableNames.cluster}
+               SET description = COALESCE(description, '') || $1, was_split = TRUE, updated_at = CURRENT_TIMESTAMP
+               WHERE id = $2;`,
+              [descriptionSuffix, originalClusterId]
           );
-
-          if (groupsInComponent.length > 0) {
-              await client.query(
-                  `UPDATE "${userSchema}".${tableNames.group} SET group_cluster_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($2::text[]);`,
-                  [newClusterId, groupsInComponent.map(g => g.id)]
-              );
-          }
-
-          if (componentItems.length >= 2) {
-              const updateVisualizationSql = `
-                  UPDATE "${userSchema}".${tableNames.edgeVisualization}
-                  SET ${tableNames.visClusterIdCol} = $1
-                  ${type === 'entity' ? ', updated_at = CURRENT_TIMESTAMP' : ''} -- service_edge_visualization might not have updated_at
-                  WHERE ${tableNames.visClusterIdCol} = $2
-                    AND ${tableNames.itemId1Col} = ANY($3::text[])
-                    AND ${tableNames.itemId2Col} = ANY($3::text[]);
-              `;
-              await client.query(updateVisualizationSql, [newClusterId, originalClusterId, componentItems]);
-          }
+          finalStatus = 'COMPLETED_SPLIT_DETECTED'; // New status to reflect detection without actual splitting
+          finalMessage = `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} review finalized. A split into ${components.length} components was detected. 'was_split' is TRUE. No new clusters created.`;
       }
 
-      const originalClusterUpdateDesc = `Split into ${newClusterIds.length} new ${type} clusters by user ${sessionUserId} (Session: ${sessionId}) on ${new Date().toISOString()}. Original cluster had ${total_groups} total groups. Its pre-split counts are retained.`;
-      // IMPORTANT CHANGE: Do NOT zero out counts for the original cluster. Set was_split = TRUE.
-      await client.query(
-          `UPDATE "${userSchema}".${tableNames.cluster}
-           SET description = $1, was_split = TRUE, updated_at = CURRENT_TIMESTAMP
-           WHERE id = $2;`,
-          [originalClusterUpdateDesc, originalClusterId]
-      );
-
-      // Set group_cluster_id to NULL for DENIED/CONFIRMED_NON_MATCH groups from the original cluster
+      // Regardless of split or not, DENIED/CONFIRMED_NON_MATCH groups are disassociated.
       await client.query(
           `UPDATE "${userSchema}".${tableNames.group} SET group_cluster_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE group_cluster_id = $1 AND confirmed_status IN ('DENIED', 'CONFIRMED_NON_MATCH');`,
           [originalClusterId]
       );
 
       return {
-          status: 'COMPLETED_SPLIT_OCCURRED',
-          message: `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} was split into ${components.length} new clusters. Original cluster record updated with was_split=true.`,
-          newClusterIds,
-          originalClusterId: originalClusterId
+          status: finalStatus,
+          message: finalMessage,
+          originalClusterId: originalClusterId,
+          // newClusterIds: undefined, // Explicitly undefined as we are not creating new clusters
       } as ClusterFinalizationStatusResponse;
     });
+
+    // The 'result' from withTransaction will be passed to NextResponse.json
+    // Ensure the status code reflects the outcome.
+    // Generally, if no unhandled errors occurred within the transaction, it's a 200 OK.
+    // Specific error statuses (400, 401, 404, 500) are handled by early returns.
     return NextResponse.json(result, { status: 200 });
 
   } catch (error: any) {
     console.error(`Error finalizing review for ${type} cluster ${originalClusterId}:`, error);
     return NextResponse.json({
         status: 'ERROR',
-        message: `Failed to finalize ${type} review: ${error.message}`,
+        message: `Failed to finalize ${type} review: ${error.message || 'Unknown server error'}`,
         originalClusterId: originalClusterId
     } as ClusterFinalizationStatusResponse, { status: 500 });
   }

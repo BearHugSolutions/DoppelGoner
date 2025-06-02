@@ -26,6 +26,8 @@ import {
   XCircle,
   SkipForward,
   RotateCcw,
+  ChevronLeft, // Added
+  ChevronRight, // Added
 } from "lucide-react";
 import type {
   VisualizationEntityEdge,
@@ -36,9 +38,9 @@ import type {
   ServiceGroup,
   VisualizationServiceEdge,
   Service,
-  // EntityConnectionDataResponse, // No longer needed for direct casting here
-  // ServiceConnectionDataResponse, // No longer needed for direct casting here
   BaseNode,
+  EntityConnectionDataResponse, // Explicit import for clarity
+  ServiceConnectionDataResponse // Explicit import for clarity
 } from "@/types/entity-resolution";
 // Import the type guards
 import {
@@ -66,11 +68,11 @@ const getContactInfo = (
     let isNode2 = false;
 
     if (mode === "entity") {
-      const eg = group as EntityGroup; // Cast within helper is acceptable if 'groups' is truly mixed
+      const eg = group as EntityGroup; 
       isNode1 = eg.entityId1 === nodeId;
       isNode2 = eg.entityId2 === nodeId;
     } else {
-      const sg = group as ServiceGroup; // Cast within helper
+      const sg = group as ServiceGroup; 
       isNode1 = sg.serviceId1 === nodeId;
       isNode2 = sg.serviceId2 === nodeId;
     }
@@ -106,11 +108,13 @@ const getContactInfo = (
 export default function ConnectionReviewTools() {
   const {
     resolutionMode,
+    selectedClusterId, // Added to get cluster details for split status
     selectedEdgeId,
-    currentConnectionData, // This is EntityConnectionDataResponse | ServiceConnectionDataResponse | null
+    currentConnectionData, 
     actions,
     queries,
     reviewQueue,
+    edgeSelectionInfo, // Added for unreviewed navigation
   } = useEntityResolution();
   const { toast } = useToast();
 
@@ -127,6 +131,10 @@ export default function ConnectionReviewTools() {
     ? queries.getQueueItemStatus(selectedEdgeId)
     : null;
 
+  const currentClusterDetails = selectedClusterId ? queries.getClusterById(selectedClusterId) : null;
+  const isClusterSplit = currentClusterDetails?.wasSplit || false;
+
+
   useEffect(() => {
     if (
       selectedEdgeId &&
@@ -139,7 +147,8 @@ export default function ConnectionReviewTools() {
 
   useEffect(() => {
     setIsSubmitting(false);
-    setIsExpanded(true);
+    // Keep panel expanded by default on new edge selection, unless user collapses it manually
+    // setIsExpanded(true); 
   }, [selectedEdgeId]);
 
   const handleReviewDecision = async (decision: GroupReviewDecision) => {
@@ -149,6 +158,10 @@ export default function ConnectionReviewTools() {
         description: "No connection selected.",
         variant: "destructive",
       });
+      return;
+    }
+    if (isClusterSplit) {
+      toast({ title: "Info", description: "This cluster has been split and cannot be reviewed."});
       return;
     }
     if (isEdgeReviewed && queueStatus !== "failed") {
@@ -183,11 +196,12 @@ export default function ConnectionReviewTools() {
   const handleRetryLoad = useCallback(() => {
     if (selectedEdgeId) {
       actions.invalidateConnectionData(selectedEdgeId);
-      actions.loadConnectionData(selectedEdgeId);
+      // loadConnectionData will be called by useEffect if selectedEdgeId is still the same
     }
   }, [selectedEdgeId, actions]);
 
   const handleSkipToNext = useCallback(() => {
+    // This uses the auto-advance version, which might go to the next cluster
     actions.selectNextUnreviewedEdge(selectedEdgeId || undefined);
   }, [actions, selectedEdgeId]);
 
@@ -201,7 +215,7 @@ export default function ConnectionReviewTools() {
         actions.retryFailedBatch(batchToRetry.batchId);
         toast({
           title: "Retrying Submission",
-          description: `Retrying review for connection ${selectedEdgeId}.`,
+          description: `Retrying review for connection ${selectedEdgeId.substring(0,8)}...`,
         });
       } else {
         toast({
@@ -212,6 +226,15 @@ export default function ConnectionReviewTools() {
       }
     }
   };
+
+  const handlePreviousUnreviewed = useCallback(() => {
+    actions.selectPreviousUnreviewedInCluster();
+  }, [actions]);
+
+  const handleNextUnreviewed = useCallback(() => {
+    actions.selectNextUnreviewedInCluster();
+  }, [actions]);
+
 
   const isLoading = selectedEdgeId
     ? queries.isConnectionDataLoading(selectedEdgeId)
@@ -229,14 +252,14 @@ export default function ConnectionReviewTools() {
       </div>
     );
   }
-  if (isLoading && !currentConnectionData) {
+  if (isLoading && !currentConnectionData) { // Show loader only if data is truly absent
     return (
       <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
         <Loader2 className="h-6 w-6 animate-spin text-primary" />
       </div>
     );
   }
-  if (error && !currentConnectionData) {
+  if (error && !currentConnectionData) { // Show error only if data is truly absent
     return (
       <Card className="h-full flex flex-col items-center justify-center">
         <CardHeader>
@@ -269,59 +292,76 @@ export default function ConnectionReviewTools() {
     );
   }
 
-  if (!currentConnectionData) return null;
+  if (!currentConnectionData && selectedEdgeId) {
+      if (!isLoading && !error) {
+        return (
+             <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
+                <Loader2 className="h-6 w-6 animate-spin text-primary mr-2" /> Loading connection data...
+            </div>
+        )
+      }
+      return null;
+  }
 
-  // Use type guards to narrow down currentConnectionData
+
   let edgeDetails:
     | VisualizationEntityEdge
     | VisualizationServiceEdge
     | undefined;
-  let groupsForEdge: Array<EntityGroup | ServiceGroup> = []; // Initialize to empty array
+  let groupsForEdge: Array<EntityGroup | ServiceGroup> = []; 
   let node1: Entity | Service | undefined;
   let node2: Entity | Service | undefined;
 
-  if (isEntityConnectionData(currentConnectionData, resolutionMode)) {
-    // currentConnectionData is now EntityConnectionDataResponse
-    edgeDetails = currentConnectionData.edge;
-    groupsForEdge = currentConnectionData.entityGroups; // This is EntityGroup[]
-    node1 = currentConnectionData.entity1;
-    node2 = currentConnectionData.entity2;
-  } else if (isServiceConnectionData(currentConnectionData, resolutionMode)) {
-    // currentConnectionData is now ServiceConnectionDataResponse
-    edgeDetails = currentConnectionData.edge;
-    groupsForEdge = currentConnectionData.entityGroups; // This is ServiceGroup[]
-    node1 = currentConnectionData.entity1;
-    node2 = currentConnectionData.entity2;
-  } else {
-    // This case should ideally not be reached if currentConnectionData and resolutionMode are consistent.
-    console.error(
-      "Connection data type and resolution mode mismatch or data is null/undefined unexpectedly."
-    );
-    // Optionally, render an error state or return null
-    return (
-      <Card className="h-full flex flex-col items-center justify-center">
-        <CardHeader>
-          <CardTitle>Error</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p>Could not determine connection data type.</p>
-        </CardContent>
-      </Card>
-    );
+  // Check if currentConnectionData is non-null before using it with type guards
+  if (currentConnectionData) {
+    // Assign to a new const to help TypeScript with type narrowing for function arguments
+    const data: EntityConnectionDataResponse | ServiceConnectionDataResponse = currentConnectionData;
+
+    if (isEntityConnectionData(data, resolutionMode)) {
+      edgeDetails = data.edge;
+      groupsForEdge = data.entityGroups; 
+      node1 = data.entity1;
+      node2 = data.entity2;
+    } else if (isServiceConnectionData(data, resolutionMode)) {
+      edgeDetails = data.edge;
+      groupsForEdge = data.entityGroups; 
+      node1 = data.entity1;
+      node2 = data.entity2;
+    } else {
+      // This case implies 'data' is non-null but not one of the expected types.
+      // This should ideally not be reached if type guards are comprehensive.
+      console.error(
+        "Connection data type and resolution mode mismatch or data is of an unexpected non-null type."
+      );
+      return (
+        <Card className="h-full flex flex-col items-center justify-center">
+          <CardHeader><CardTitle>Type Error</CardTitle></CardHeader>
+          <CardContent><p>Could not determine the specific type of connection data.</p></CardContent>
+        </Card>
+      );
+    }
   }
 
-  // Ensure node1, node2, and edgeDetails are defined before proceeding
+
   if (!node1 || !node2 || !edgeDetails) {
+    // This can be reached if currentConnectionData was null and the above block was skipped.
     console.error(
-      "Critical data (node1, node2, or edgeDetails) is undefined after type guard."
+      "Critical data (node1, node2, or edgeDetails) is undefined. SelectedEdgeID:", selectedEdgeId, "HasData:", !!currentConnectionData
     );
+     if (isLoading) { 
+        return (
+            <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+            </div>
+        );
+    }
     return (
       <Card className="h-full flex flex-col items-center justify-center">
-        <CardHeader>
-          <CardTitle>Data Error</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p>Essential connection details are missing.</p>
+        <CardHeader><CardTitle>Data Error</CardTitle></CardHeader>
+        <CardContent><p>Essential connection details are missing or not yet loaded.</p>
+         <Button variant="outline" size="sm" onClick={handleRetryLoad} className="mt-2">
+              <RefreshCw className="h-4 w-4 mr-1" /> Retry Load
+            </Button>
         </CardContent>
       </Card>
     );
@@ -338,7 +378,7 @@ export default function ConnectionReviewTools() {
     resolutionMode
   );
 
-  const showReviewButtons = !isEdgeReviewed || queueStatus === "failed";
+  const showReviewButtons = (!isEdgeReviewed || queueStatus === "failed") && !isClusterSplit;
 
   return (
     <Collapsible
@@ -349,57 +389,44 @@ export default function ConnectionReviewTools() {
       <div className="flex justify-between items-center flex-shrink-0 pb-2 border-b mb-3">
         <div className="flex items-center gap-2">
           <h3 className="text-lg font-medium">{nodeLabel} Connection Review</h3>
+          {isLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
           {queueStatus === "processing" && (
-            <Badge
-              variant="outline"
-              className="bg-blue-50 text-blue-700 border-blue-300"
-            >
-              <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-              Processing
+            <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-300">
+              <Loader2 className="h-3 w-3 mr-1 animate-spin" /> Processing
             </Badge>
           )}
           {queueStatus === "pending" && (
-            <Badge
-              variant="outline"
-              className="bg-yellow-50 text-yellow-700 border-yellow-300"
-            >
-              <Info className="h-3 w-3 mr-1" />
-              Queued
+            <Badge variant="outline" className="bg-yellow-50 text-yellow-700 border-yellow-300">
+              <Info className="h-3 w-3 mr-1" /> Queued
             </Badge>
           )}
           {queueStatus === "failed" && (
             <Badge variant="destructive">
-              <AlertTriangle className="h-3 w-3 mr-1" />
-              Failed
+              <AlertTriangle className="h-3 w-3 mr-1" /> Failed
             </Badge>
           )}
-          {isEdgeReviewed && !queueStatus && (
+          {isEdgeReviewed && !queueStatus && !isClusterSplit && ( // Don't show if cluster is split
             <Badge
-              variant={
-                edgeStatus === "CONFIRMED_MATCH" ? "default" : "secondary"
-              }
+              variant={ edgeStatus === "CONFIRMED_MATCH" ? "default" : "secondary" }
               className={`${
                 edgeStatus === "CONFIRMED_MATCH"
                   ? "bg-green-100 text-green-800 border-green-300"
                   : "bg-red-100 text-red-800 border-red-300"
               }`}
             >
-              {edgeStatus === "CONFIRMED_MATCH" ? (
-                <CheckCircle className="h-3 w-3 mr-1" />
-              ) : (
-                <XCircle className="h-3 w-3 mr-1" />
-              )}
+              {edgeStatus === "CONFIRMED_MATCH" ? ( <CheckCircle className="h-3 w-3 mr-1" /> ) : ( <XCircle className="h-3 w-3 mr-1" /> )}
               {edgeStatus === "CONFIRMED_MATCH" ? "Match" : "Non-Match"}
+            </Badge>
+          )}
+           {isClusterSplit && (
+            <Badge variant="outline" className="bg-gray-100 text-gray-700 border-gray-300">
+              <Info className="h-3 w-3 mr-1" /> Cluster Split
             </Badge>
           )}
         </div>
         <CollapsibleTrigger asChild>
           <Button variant="ghost" size="sm">
-            {isExpanded ? (
-              <ChevronUp className="h-4 w-4" />
-            ) : (
-              <ChevronDown className="h-4 w-4" />
-            )}
+            {isExpanded ? ( <ChevronUp className="h-4 w-4" /> ) : ( <ChevronDown className="h-4 w-4" /> )}
             <span className="sr-only">Toggle review panel</span>
           </Button>
         </CollapsibleTrigger>
@@ -412,6 +439,50 @@ export default function ConnectionReviewTools() {
               <p className="text-sm text-muted-foreground">
                 Do these records represent the same real-world {resolutionMode}?
               </p>
+
+              {/* Navigation for unreviewed connections */}
+              {edgeSelectionInfo.totalUnreviewedEdgesInCluster > 0 && !isClusterSplit && (
+                <div className="flex justify-center items-center gap-2 mb-3">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={handlePreviousUnreviewed}
+                    disabled={
+                      isSubmitting ||
+                      isLoading ||
+                      queueStatus === "processing" ||
+                      queueStatus === "pending" ||
+                      edgeSelectionInfo.totalUnreviewedEdgesInCluster <= 0 // Disable if no unreviewed edges
+                    }
+                    aria-label="Previous unreviewed connection"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <span className="text-xs text-muted-foreground whitespace-nowrap px-2 py-1 bg-muted rounded-md">
+                    {edgeSelectionInfo.currentUnreviewedEdgeIndexInCluster !== -1 && edgeSelectionInfo.totalUnreviewedEdgesInCluster > 0
+                      ? `${edgeSelectionInfo.currentUnreviewedEdgeIndexInCluster + 1} of ${edgeSelectionInfo.totalUnreviewedEdgesInCluster} unreviewed`
+                      : edgeSelectionInfo.totalUnreviewedEdgesInCluster > 0
+                      ? `${edgeSelectionInfo.totalUnreviewedEdgesInCluster} unreviewed`
+                      : `No unreviewed`}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={handleNextUnreviewed}
+                    disabled={
+                      isSubmitting ||
+                      isLoading ||
+                      queueStatus === "processing" ||
+                      queueStatus === "pending" ||
+                      edgeSelectionInfo.totalUnreviewedEdgesInCluster <= 0 // Disable if no unreviewed edges
+                    }
+                    aria-label="Next unreviewed connection"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              )}
+
               <div className="flex flex-col sm:flex-row justify-between gap-2">
                 <Button
                   variant="outline"
@@ -420,8 +491,11 @@ export default function ConnectionReviewTools() {
                   onClick={() => handleReviewDecision("REJECTED")}
                   disabled={
                     isSubmitting ||
+                    isLoading ||
                     queueStatus === "processing" ||
-                    queueStatus === "pending"
+                    queueStatus === "pending" ||
+                    isClusterSplit || 
+                    !selectedEdgeId // Disable if no edge is selected
                   }
                 >
                   <X className="h-4 w-4 mr-1" /> Not a Match
@@ -433,29 +507,32 @@ export default function ConnectionReviewTools() {
                   onClick={() => handleReviewDecision("ACCEPTED")}
                   disabled={
                     isSubmitting ||
+                    isLoading ||
                     queueStatus === "processing" ||
-                    queueStatus === "pending"
+                    queueStatus === "pending" ||
+                    isClusterSplit || 
+                    !selectedEdgeId 
                   }
                 >
                   <Check className="h-4 w-4 mr-1" /> Confirm Match
                 </Button>
               </div>
-              {queueStatus === "failed" && (
+              {queueStatus === "failed" && !isClusterSplit && (
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={handleRetryQueueItem}
                   className="w-full mt-2 border-amber-500 text-amber-600 hover:bg-amber-50"
-                  disabled={isSubmitting}
+                  disabled={isSubmitting || isLoading}
                 >
                   <RotateCcw className="h-4 w-4 mr-1" /> Retry Failed Submission
                 </Button>
               )}
             </div>
-          ) : (
+          ) : ( // This block is for when !showReviewButtons (i.e., edge is reviewed or cluster is split)
             <div className="space-y-3 p-1">
               <Card
-                className={`border-2 ${
+                className={`border-2 ${ isClusterSplit ? "border-gray-200 bg-gray-50" :
                   edgeStatus === "CONFIRMED_MATCH"
                     ? "border-green-200 bg-green-50"
                     : "border-red-200 bg-red-50"
@@ -463,19 +540,17 @@ export default function ConnectionReviewTools() {
               >
                 <CardContent className="p-3">
                   <div className="flex items-center gap-3">
-                    {edgeStatus === "CONFIRMED_MATCH" ? (
-                      <CheckCircle className="h-6 w-6 text-green-600" />
-                    ) : (
-                      <XCircle className="h-6 w-6 text-red-600" />
-                    )}
+                    {isClusterSplit ? <Info className="h-6 w-6 text-gray-600" /> :
+                     edgeStatus === "CONFIRMED_MATCH" ? ( <CheckCircle className="h-6 w-6 text-green-600" /> ) : ( <XCircle className="h-6 w-6 text-red-600" />)}
                     <div>
                       <h4 className="font-semibold text-sm">
-                        {edgeStatus === "CONFIRMED_MATCH"
+                        {isClusterSplit ? "Cluster Split" :
+                         edgeStatus === "CONFIRMED_MATCH"
                           ? "Match Confirmed"
                           : "Non-Match Confirmed"}
                       </h4>
                       <p className="text-xs text-muted-foreground">
-                        This connection has been reviewed.
+                        {isClusterSplit ? "This cluster has been processed and split." : "This connection has been reviewed."}
                       </p>
                     </div>
                   </div>
@@ -484,10 +559,11 @@ export default function ConnectionReviewTools() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={handleSkipToNext}
+                onClick={handleSkipToNext} // This uses auto-advance logic
                 className="w-full"
+                disabled={isLoading}
               >
-                <SkipForward className="h-4 w-4 mr-1" /> Continue to Next
+                <SkipForward className="h-4 w-4 mr-1" /> Continue to Next Unreviewed/Cluster
               </Button>
             </div>
           )}
@@ -499,46 +575,12 @@ export default function ConnectionReviewTools() {
               </CardHeader>
               <CardContent className="p-3 pt-0">
                 <div className="space-y-1 text-xs">
-                  <div>
-                    <span className="font-medium">Name:</span>{" "}
-                    {node1.name || "N/A"}
-                  </div>
-                  <div>
-                    <span className="font-medium">Source:</span>{" "}
-                    {node1.source_system || "N/A"}{" "}
-                    {node1.source_id && `(${node1.source_id})`}
-                  </div>
-                  {node1ContactInfo.address && (
-                    <div>
-                      <span className="font-medium">Address:</span>{" "}
-                      {node1ContactInfo.address}
-                    </div>
-                  )}
-                  {node1ContactInfo.phone && (
-                    <div>
-                      <span className="font-medium">Phone:</span>{" "}
-                      {node1ContactInfo.phone}
-                    </div>
-                  )}
-                  {node1ContactInfo.email && (
-                    <div>
-                      <span className="font-medium">Email:</span>{" "}
-                      {node1ContactInfo.email}
-                    </div>
-                  )}
-                  {node1ContactInfo.url && (
-                    <div>
-                      <span className="font-medium">URL:</span>{" "}
-                      <a
-                        href={node1ContactInfo.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline break-all"
-                      >
-                        {node1ContactInfo.url}
-                      </a>
-                    </div>
-                  )}
+                  <div> <span className="font-medium">Name:</span>{" "} {node1.name || "N/A"} </div>
+                  <div> <span className="font-medium">Source:</span>{" "} {node1.source_system || "N/A"}{" "} {node1.source_id && `(${node1.source_id})`} </div>
+                  {node1ContactInfo.address && ( <div> <span className="font-medium">Address:</span>{" "} {node1ContactInfo.address} </div> )}
+                  {node1ContactInfo.phone && ( <div> <span className="font-medium">Phone:</span>{" "} {node1ContactInfo.phone} </div> )}
+                  {node1ContactInfo.email && ( <div> <span className="font-medium">Email:</span>{" "} {node1ContactInfo.email} </div> )}
+                  {node1ContactInfo.url && ( <div> <span className="font-medium">URL:</span>{" "} <a href={node1ContactInfo.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-all" > {node1ContactInfo.url} </a> </div> )}
                 </div>
               </CardContent>
             </Card>
@@ -548,46 +590,12 @@ export default function ConnectionReviewTools() {
               </CardHeader>
               <CardContent className="p-3 pt-0">
                 <div className="space-y-1 text-xs">
-                  <div>
-                    <span className="font-medium">Name:</span>{" "}
-                    {node2.name || "N/A"}
-                  </div>
-                  <div>
-                    <span className="font-medium">Source:</span>{" "}
-                    {node2.source_system || "N/A"}{" "}
-                    {node2.source_id && `(${node2.source_id})`}
-                  </div>
-                  {node2ContactInfo.address && (
-                    <div>
-                      <span className="font-medium">Address:</span>{" "}
-                      {node2ContactInfo.address}
-                    </div>
-                  )}
-                  {node2ContactInfo.phone && (
-                    <div>
-                      <span className="font-medium">Phone:</span>{" "}
-                      {node2ContactInfo.phone}
-                    </div>
-                  )}
-                  {node2ContactInfo.email && (
-                    <div>
-                      <span className="font-medium">Email:</span>{" "}
-                      {node2ContactInfo.email}
-                    </div>
-                  )}
-                  {node2ContactInfo.url && (
-                    <div>
-                      <span className="font-medium">URL:</span>{" "}
-                      <a
-                        href={node2ContactInfo.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline break-all"
-                      >
-                        {node2ContactInfo.url}
-                      </a>
-                    </div>
-                  )}
+                  <div> <span className="font-medium">Name:</span>{" "} {node2.name || "N/A"} </div>
+                  <div> <span className="font-medium">Source:</span>{" "} {node2.source_system || "N/A"}{" "} {node2.source_id && `(${node2.source_id})`} </div>
+                  {node2ContactInfo.address && ( <div> <span className="font-medium">Address:</span>{" "} {node2ContactInfo.address} </div> )}
+                  {node2ContactInfo.phone && ( <div> <span className="font-medium">Phone:</span>{" "} {node2ContactInfo.phone} </div> )}
+                  {node2ContactInfo.email && ( <div> <span className="font-medium">Email:</span>{" "} {node2ContactInfo.email} </div> )}
+                  {node2ContactInfo.url && ( <div> <span className="font-medium">URL:</span>{" "} <a href={node2ContactInfo.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-all" > {node2ContactInfo.url} </a> </div> )}
                 </div>
               </CardContent>
             </Card>
@@ -614,16 +622,17 @@ export default function ConnectionReviewTools() {
                 </CardHeader>
                 <CardContent className="p-3 pt-0">
                   {resolutionMode === "entity" &&
+                  currentConnectionData && // ensure data is non-null before type guard
                   isEntityConnectionData(
-                    currentConnectionData,
+                    currentConnectionData as EntityConnectionDataResponse | ServiceConnectionDataResponse, // Cast here after null check
                     resolutionMode
-                  ) ? (
-                    (edgeDetails as VisualizationEntityEdge).details?.methods &&
-                    (edgeDetails as VisualizationEntityEdge).details!.methods
+                  ) ? ( // Type guard will refine currentConnectionData
+                    ((currentConnectionData as EntityConnectionDataResponse).edge as VisualizationEntityEdge).details?.methods &&
+                    ((currentConnectionData as EntityConnectionDataResponse).edge as VisualizationEntityEdge).details!.methods
                       .length > 0 ? (
                       <div className="space-y-1">
                         {(
-                          edgeDetails as VisualizationEntityEdge
+                          ((currentConnectionData as EntityConnectionDataResponse).edge as VisualizationEntityEdge)
                         ).details!.methods.map((method, index) => (
                           <div
                             key={
@@ -658,13 +667,13 @@ export default function ConnectionReviewTools() {
                           </div>
                         ))}
                       </div>
-                    ) : groupsForEdge.length > 0 ? ( // Fallback to groupsForEdge if edge.details.methods is not available
+                    ) : (currentConnectionData as EntityConnectionDataResponse).entityGroups.length > 0 ? ( 
                       <div className="space-y-1">
-                        {(groupsForEdge as EntityGroup[]).map(
+                        {((currentConnectionData as EntityConnectionDataResponse).entityGroups as EntityGroup[]).map(
                           (group, index) => (
                             <div
                               key={group.id || index}
-                              className="grid grid-cols-[1fr_auto_auto] gap-2 items-center text-xs" // Adjusted for fewer columns
+                              className="grid grid-cols-[1fr_auto_auto] gap-2 items-center text-xs" 
                             >
                               <div>
                                 {group.methodType?.replace(/_/g, " ") ??
@@ -693,15 +702,14 @@ export default function ConnectionReviewTools() {
                       </p>
                     )
                   ) : resolutionMode === "service" &&
+                    currentConnectionData && // ensure data is non-null
                     isServiceConnectionData(
-                      currentConnectionData,
+                      currentConnectionData as EntityConnectionDataResponse | ServiceConnectionDataResponse, // Cast here
                       resolutionMode
-                    ) ? (
-                    // For services, display edgeDetails.details if it's generic JSON
-                    // VisualizationServiceEdge has details: Record<string, unknown> | null
-                    edgeDetails?.details ? (
+                    ) ? ( // Type guard refines
+                    (currentConnectionData as ServiceConnectionDataResponse).edge?.details ? (
                       <pre className="text-xs bg-muted p-2 rounded-md overflow-x-auto">
-                        {JSON.stringify(edgeDetails.details, null, 2)}
+                        {JSON.stringify((currentConnectionData as ServiceConnectionDataResponse).edge.details, null, 2)}
                       </pre>
                     ) : (
                       <p className="text-xs text-muted-foreground">

@@ -35,10 +35,10 @@ export interface EntityGroup {
   pre_rl_confidence: number | null;
   methodType: string;
   matchValues: MatchValues | null;
-  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | 'DENIED' | string; // Added DENIED based on backend
   createdAt: Date | string | null;
   updatedAt: Date | string | null;
-  groupClusterId?: string | null;
+  groupClusterId?: string | null; // This can become null
   reviewedAt?: Date | string | null;
   reviewerId?: string | null;
   notes?: string | null;
@@ -52,10 +52,10 @@ export interface ServiceGroup {
   pre_rl_confidence: number | null;
   methodType: string;
   matchValues: MatchValues | null;
-  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | 'DENIED' | string; // Added DENIED based on backend
   createdAt: Date | string | null;
   updatedAt: Date | string | null;
-  groupClusterId?: string | null;
+  groupClusterId?: string | null; // This can become null
   reviewedAt?: Date | string | null;
   reviewerId?: string | null;
   notes?: string | null;
@@ -130,13 +130,11 @@ export interface BaseLink {
   status?: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
   details?: Record<string, any> | null;
   createdAt?: Date | string | null;
+  clusterId: string; // Added clusterId to BaseLink for easier cache invalidation
 }
 export type EntityLink = BaseLink;
 export type ServiceLink = BaseLink;
 
-// Details structure for VisualizationEntityEdge based on previous TS definition
-// Note: The provided sample JSON for edge.details includes method_count and rl_weight_factor
-// which are not in this interface. Consider adding them if they are consistently present.
 export interface VisualizationEntityEdgeDetails {
     methods: Array<{
       method_type: string;
@@ -144,20 +142,17 @@ export interface VisualizationEntityEdgeDetails {
       rl_confidence: number;
       combined_confidence: number;
     }>;
-    method_count?: number; // Added based on sample JSON
-    rl_weight_factor?: number; // Added based on sample JSON
+    method_count?: number;
+    rl_weight_factor?: number;
 }
 
-export interface VisualizationEntityEdge {
-  id: string;
-  clusterId: string;
+export interface VisualizationEntityEdge extends EntityLink { // Inherits clusterId
   entityId1: string;
   entityId2: string;
   edgeWeight: number;
   details: VisualizationEntityEdgeDetails | null;
   pipelineRunId: string | null;
-  createdAt: Date | string;
-  status?: EntityLink['status'];
+  // createdAt is in BaseLink
   confirmedStatus?: EntityGroup['confirmedStatus'] | string;
   entity1Name?: string | null;
   entity2Name?: string | null;
@@ -165,16 +160,14 @@ export interface VisualizationEntityEdge {
   color?: string | null;
 }
 
-export interface VisualizationServiceEdge {
-  id: string;
-  clusterId: string;
+export interface VisualizationServiceEdge extends ServiceLink { // Inherits clusterId
   serviceId1: string;
   serviceId2: string;
   edgeWeight: number;
-  details: Record<string, unknown> | null; // For services, details might be more generic or have a different structure
+  details: Record<string, unknown> | null; // For services, details might be more generic
   pipelineRunId: string;
-  createdAt: Date | string | null;
-  status?: ServiceLink['status'];
+  // createdAt is in BaseLink
+  // confirmedStatus is not in the backend model for service_edge_visualization
   service1Name?: string | null;
   service2Name?: string | null;
   displayWeight?: number | null;
@@ -198,11 +191,12 @@ export interface GroupReviewApiResponse {
 
 export type GroupReviewDecision = 'ACCEPTED' | 'REJECTED' | string;
 
+// Updated ClusterFinalizationStatusResponse
 export interface ClusterFinalizationStatusResponse {
-  status: 'COMPLETED_NO_SPLIT_NEEDED' | 'COMPLETED_SPLIT_OCCURRED' | 'PENDING_FULL_REVIEW' | 'CLUSTER_NOT_FOUND' | 'ERROR' | string;
+  status: 'COMPLETED_NO_SPLIT_NEEDED' | 'COMPLETED_SPLIT_DETECTED' | 'PENDING_FULL_REVIEW' | 'CLUSTER_NOT_FOUND' | 'ERROR' | string;
   message: string;
   originalClusterId: string;
-  newClusterIds?: string[];
+  newClusterIds?: string[]; // Keep as optional, though we don't expect it now
 }
 
 export interface ClustersResponse<TCluster extends BaseCluster> {
@@ -215,34 +209,33 @@ export interface ClustersResponse<TCluster extends BaseCluster> {
 export type EntityClustersResponse = ClustersResponse<EntityCluster>;
 export type ServiceClustersResponse = ClustersResponse<ServiceCluster>;
 
+// VisualizationDataResponse now includes clusterId for context
 export interface VisualizationDataResponse<TNode extends BaseNode, TLink extends BaseLink, TGroup> {
+  clusterId: string; // Added to know which cluster this data belongs to
   nodes: TNode[];
   links: TLink[];
-  entityGroups: TGroup[] | Record<string, any>;
+  entityGroups: TGroup[] | Record<string, any>; // entityGroups might be specific to the cluster
 }
 export type EntityVisualizationDataResponse = VisualizationDataResponse<EntityNode, EntityLink, EntityGroup>;
 export type ServiceVisualizationDataResponse = VisualizationDataResponse<ServiceNode, ServiceLink, ServiceGroup>;
 
 
+// ConnectionDataResponse now includes clusterId for context
 export interface ConnectionDataResponse<TEdge, TGroup, TEntityOrService extends Entity | Service> {
   edge: TEdge;
-  // The key from the API is 'entityGroups' for both entity and service resolution modes.
-  // The type of the items in the array (TGroup) will be EntityGroup or ServiceGroup.
   entityGroups: TGroup[];
   matchDecisions?: MatchDecisionDetails[] | null;
-  entity1: TEntityOrService; // Represents either the first entity or first service
-  entity2: TEntityOrService; // Represents either the second entity or second service
+  entity1: TEntityOrService;
+  entity2: TEntityOrService;
+  clusterId: string; // Added to know which cluster this connection data belongs to
 }
 export type EntityConnectionDataResponse = ConnectionDataResponse<VisualizationEntityEdge, EntityGroup, Entity>;
 export type ServiceConnectionDataResponse = ConnectionDataResponse<VisualizationServiceEdge, ServiceGroup, Service>;
 
-// Type guards to help differentiate between EntityConnectionDataResponse and ServiceConnectionDataResponse
 export function isEntityConnectionData(
   data: EntityConnectionDataResponse | ServiceConnectionDataResponse,
   mode: ResolutionMode
 ): data is EntityConnectionDataResponse {
-  // This guard relies on the external 'mode' to discriminate.
-  // It assumes that if mode is 'entity', the data structure will match EntityConnectionDataResponse.
   return mode === 'entity';
 }
 
@@ -250,10 +243,8 @@ export function isServiceConnectionData(
   data: EntityConnectionDataResponse | ServiceConnectionDataResponse,
   mode: ResolutionMode
 ): data is ServiceConnectionDataResponse {
-  // Similar to isEntityConnectionData, relies on 'mode'.
   return mode === 'service';
 }
-
 
 export interface SuggestedAction {
   id: string;
@@ -297,4 +288,14 @@ export interface QueuedReviewBatch {
   failedOperations: Set<string>;
   isTerminalFailure?: boolean;
   mode: ResolutionMode;
+}
+
+// Progress tracking for each cluster
+export interface ClusterReviewProgress {
+  totalEdges: number;
+  reviewedEdges: number;
+  progressPercentage: number;
+  isComplete: boolean;
+  // Optional: Store individual edge statuses within this cluster if needed for quick lookups
+  // edgeStatuses?: Record<string, 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH'>;
 }
