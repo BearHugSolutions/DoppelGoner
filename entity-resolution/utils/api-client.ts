@@ -2,20 +2,24 @@
 import type {
   EntityClustersResponse,
   ServiceClustersResponse,
-  EntityConnectionDataResponse,
-  ServiceConnectionDataResponse,
-  EntityVisualizationDataResponse,
-  ServiceVisualizationDataResponse,
+  EntityConnectionDataResponse, // For single fetch
+  ServiceConnectionDataResponse, // For single fetch
+  EntityVisualizationDataResponse, // For single fetch
+  ServiceVisualizationDataResponse, // For single fetch
   EntityGroupReviewApiPayload,
   ServiceGroupReviewApiPayload,
   GroupReviewApiResponse,
   ClusterFinalizationStatusResponse,
   NodeDetailResponse,
-  BulkNodeDetailsRequest, // New import
-  NodeIdentifier, // New import (though not directly used as param type here, good for context)
+  BulkNodeDetailsRequest,
+  // New Bulk Types
+  BulkConnectionsRequest,
+  BulkConnectionsResponse,
+  BulkVisualizationsRequest,
+  BulkVisualizationsResponse,
 } from "@/types/entity-resolution";
 
-const API_BASE_URL = '/api'; // Assuming this is your Next.js API proxy
+const API_BASE_URL = '/api';
 
 /**
  * Handles API errors by logging them and throwing a new error.
@@ -57,6 +61,10 @@ async function validateResponse<T>(
     const fullContext = context ? `${context}: ${errorMessage}` : errorMessage;
     console.error(`API Response Error: ${response.status} ${response.statusText}`, errorData);
     throw new Error(fullContext);
+  }
+  // Handle 204 No Content specifically for POST/PUT/DELETE if necessary, GET usually has content
+  if (response.status === 204) {
+     return {} as T; // Or null, or handle as appropriate for the call
   }
   return response.json() as Promise<T>;
 }
@@ -192,12 +200,6 @@ export async function triggerServiceClusterFinalization(
 
 // --- Generic Node Detail Functions ---
 
-/**
- * Fetches detailed information for a specific entity or service node.
- * @param nodeId - The ID of the node (entity or service).
- * @param nodeType - The type of the node ('entity' or 'service').
- * @returns Promise resolving to NodeDetailResponse.
- */
 export async function getNodeDetails(nodeId: string, nodeType: 'entity' | 'service'): Promise<NodeDetailResponse> {
   const url = `${API_BASE_URL}/nodeData/${nodeId}?type=${nodeType}`;
   try {
@@ -208,11 +210,6 @@ export async function getNodeDetails(nodeId: string, nodeType: 'entity' | 'servi
   }
 }
 
-/**
- * Fetches detailed information for multiple entity or service nodes in bulk.
- * @param payload - Object containing an array of NodeIdentifier { id: string, nodeType: 'entity' | 'service' }.
- * @returns Promise resolving to an array of NodeDetailResponse.
- */
 export async function getBulkNodeDetails(payload: BulkNodeDetailsRequest): Promise<NodeDetailResponse[]> {
   const url = `${API_BASE_URL}/bulk-node-details`;
   try {
@@ -224,5 +221,45 @@ export async function getBulkNodeDetails(payload: BulkNodeDetailsRequest): Promi
     return await validateResponse<NodeDetailResponse[]>(response, 'getBulkNodeDetails');
   } catch (error) {
     return handleApiError(error, 'getBulkNodeDetails');
+  }
+}
+
+// --- NEW Bulk Data Fetching Functions ---
+
+/**
+ * Fetches bulk connection data.
+ * @param payload - The request payload containing items to fetch.
+ * @returns Promise resolving to an array of connection data items.
+ */
+export async function getBulkConnections(payload: BulkConnectionsRequest): Promise<BulkConnectionsResponse> {
+  const url = `${API_BASE_URL}/bulk-connections`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await validateResponse<BulkConnectionsResponse>(response, 'getBulkConnections');
+  } catch (error) {
+    return handleApiError(error, 'getBulkConnections');
+  }
+}
+
+/**
+ * Fetches bulk visualization data.
+ * @param payload - The request payload containing items to fetch.
+ * @returns Promise resolving to an array of visualization data items.
+ */
+export async function getBulkVisualizations(payload: BulkVisualizationsRequest): Promise<BulkVisualizationsResponse> {
+  const url = `${API_BASE_URL}/bulk-visualizations`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await validateResponse<BulkVisualizationsResponse>(response, 'getBulkVisualizations');
+  } catch (error) {
+    return handleApiError(error, 'getBulkVisualizations');
   }
 }

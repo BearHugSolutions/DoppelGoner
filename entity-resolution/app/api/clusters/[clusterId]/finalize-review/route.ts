@@ -129,27 +129,25 @@ export async function POST(
       const confirmedGroupsResult = await client.query(confirmedGroupsSql, [originalClusterId]);
       const confirmedGenericGroups: GenericGroupForGraph[] = confirmedGroupsResult.rows;
 
-      // If there are no 'CONFIRMED_MATCH' groups, the cluster is effectively empty or all its connections are non-matches.
-      // It won't split. `was_split` should be false.
-      // We still need to update its description and potentially counts if they were based on confirmed matches.
       if (confirmedGenericGroups.length === 0) {
           const descriptionSuffix = ` (Review Finalized - No Confirmed Matches)`;
-          // Update description, ensure was_split is FALSE. Counts remain as they were or are updated to 0 if appropriate.
-          // For simplicity, let's assume counts should reflect the *confirmed* state. So, 0 items, 0 groups.
+          // Update description, ensure was_split is FALSE.
+          // Item and group counts on the original cluster remain as they were,
+          // as per the principle of not altering the original cluster structure visually.
+          // The confirmed_status of individual groups already reflects their non-match status.
           await client.query(
               `UPDATE "${userSchema}".${tableNames.cluster}
-               SET ${tableNames.itemCountCol} = 0, ${tableNames.groupCountCol} = 0, description = COALESCE(description, '') || $1, updated_at = CURRENT_TIMESTAMP, was_split = FALSE
+               SET description = COALESCE(description, '') || $1, updated_at = CURRENT_TIMESTAMP, was_split = FALSE
                WHERE id = $2;`,
               [descriptionSuffix, originalClusterId]
           );
-          // Nullify group_cluster_id for DENIED/CONFIRMED_NON_MATCH groups
-          await client.query(
-              `UPDATE "${userSchema}".${tableNames.group} SET group_cluster_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE group_cluster_id = $1 AND confirmed_status IN ('DENIED', 'CONFIRMED_NON_MATCH');`,
-              [originalClusterId]
-          );
+          // CRITICAL CHANGE: Do NOT nullify group_cluster_id for DENIED/CONFIRMED_NON_MATCH groups here.
+          // Their confirmed_status already indicates they are not matches.
+          // Keeping their group_cluster_id ensures they remain part of the original cluster's dataset
+          // for visualization, allowing them to be styled as non-matches rather than disappearing.
           return {
-              status: 'COMPLETED_NO_SPLIT_NEEDED',
-              message: `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} has no confirmed groups after review. Marked as reviewed.`,
+              status: 'COMPLETED_NO_CONFIRMED_MATCHES', // Changed from COMPLETED_NO_SPLIT_NEEDED to be more specific
+              message: `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} has no confirmed groups after review. Marked as reviewed. Original structure preserved.`,
               originalClusterId: originalClusterId
           } as ClusterFinalizationStatusResponse;
       }
@@ -192,15 +190,9 @@ export async function POST(
       let finalStatus: ClusterFinalizationStatusResponse['status'];
       let finalMessage: string;
 
-      // Update the original cluster's description and was_split status.
-      // Item and group counts on the original cluster will be updated based on the largest component
-      // if no split occurs, or remain as they were if a split *would* occur (as per simplified logic).
-      // For simplicity and to reflect the "finalized" state based on confirmed matches:
-      // If it doesn't split, update counts to reflect the single component.
-      // If it *would* split, was_split = TRUE. Counts are not zeroed out, description updated.
-
       if (!wouldSplit) {
-          // No split needed. Update counts based on the single component (or empty if no confirmed items).
+          // No split needed based on confirmed matches.
+          // Update counts based on the single component of confirmed matches.
           const mainComponentItems = components.length > 0 ? components[0] : new Set<String>();
           const groupsInMainComponent = confirmedGenericGroups.filter(g =>
             mainComponentItems.has(g.item_id_1) && mainComponentItems.has(g.item_id_2)
@@ -214,40 +206,30 @@ export async function POST(
               [mainComponentItems.size, groupsInMainComponent.length, descriptionSuffix, originalClusterId]
           );
           finalStatus = 'COMPLETED_NO_SPLIT_NEEDED';
-          finalMessage = `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} review finalized. No split occurred. Counts updated based on confirmed matches.`;
+          finalMessage = `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} review finalized. No split occurred. Counts updated based on confirmed matches. Original structure preserved.`;
       } else {
-          // Split would have occurred. Mark was_split = TRUE.
+          // Split would have occurred based on confirmed matches. Mark was_split = TRUE.
           // Do NOT create new clusters. Do NOT reassign groups or edges.
           // Do NOT zero out counts on the original cluster.
-          const descriptionSuffix = ` (Review Finalized - Would Split into ${components.length} components)`;
+          const descriptionSuffix = ` (Review Finalized - Marked as Split; Contained ${components.length} sub-components based on confirmed matches)`;
           await client.query(
               `UPDATE "${userSchema}".${tableNames.cluster}
                SET description = COALESCE(description, '') || $1, was_split = TRUE, updated_at = CURRENT_TIMESTAMP
                WHERE id = $2;`,
               [descriptionSuffix, originalClusterId]
           );
-          finalStatus = 'COMPLETED_SPLIT_DETECTED'; // New status to reflect detection without actual splitting
-          finalMessage = `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} review finalized. A split into ${components.length} components was detected. 'was_split' is TRUE. No new clusters created.`;
+          finalStatus = 'COMPLETED_MARKED_AS_SPLIT'; // Changed status
+          finalMessage = `${type.charAt(0).toUpperCase() + type.slice(1)} cluster ${originalClusterId} review finalized. A split into ${components.length} components (based on confirmed matches) was detected. Original cluster marked 'was_split = TRUE'. No new clusters created, original structure preserved.`;
       }
-
-      // Regardless of split or not, DENIED/CONFIRMED_NON_MATCH groups are disassociated.
-      await client.query(
-          `UPDATE "${userSchema}".${tableNames.group} SET group_cluster_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE group_cluster_id = $1 AND confirmed_status IN ('DENIED', 'CONFIRMED_NON_MATCH');`,
-          [originalClusterId]
-      );
 
       return {
           status: finalStatus,
           message: finalMessage,
           originalClusterId: originalClusterId,
-          // newClusterIds: undefined, // Explicitly undefined as we are not creating new clusters
+          newClusterIds: undefined, // Explicitly undefined as we are not creating new clusters
       } as ClusterFinalizationStatusResponse;
     });
 
-    // The 'result' from withTransaction will be passed to NextResponse.json
-    // Ensure the status code reflects the outcome.
-    // Generally, if no unhandled errors occurred within the transaction, it's a 200 OK.
-    // Specific error statuses (400, 401, 404, 500) are handled by early returns.
     return NextResponse.json(result, { status: 200 });
 
   } catch (error: any) {

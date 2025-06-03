@@ -27,9 +27,6 @@ interface GatewayLoginResponse {
 }
 
 export async function POST(request: NextRequest) {
-  console.log("Login request received");
-  console.log("Request body:", await request.json());
-  console.log("Environment variables:", process.env);
   try {
     const { username, password } = await request.json();
 

@@ -4,19 +4,27 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import type {
-  EntityNode,
-  EntityLink,
+  // EntityNode, // Not directly used, BaseNode is sufficient
+  // EntityLink, // Not directly used, BaseLink is sufficient
   EntityGroup,
-  ServiceNode, // New
-  ServiceLink, // New
-  ServiceGroup, // New
-  BaseNode, // Generic (now includes source_system, source_id)
-  BaseLink, // Generic
-  EntityVisualizationDataResponse, // Specific
-  ServiceVisualizationDataResponse, // Specific
+  // ServiceNode, // Not directly used, BaseNode is sufficient
+  // ServiceLink, // Not directly used, BaseLink is sufficient
+  ServiceGroup,
+  BaseNode,
+  BaseLink,
+  EntityVisualizationDataResponse, // Used for typing currentVisualizationData
+  ServiceVisualizationDataResponse, // Used for typing currentVisualizationData
+  // The user provided VisualizationData interface which seems to be the actual data structure
+  // for the 'data' part of EntityVisualizationDataResponse/ServiceVisualizationDataResponse
 } from "@/types/entity-resolution";
 import * as d3 from "d3";
-import { ZoomIn, ZoomOut, RotateCcw, AlertCircle } from "lucide-react";
+import {
+  ZoomIn,
+  ZoomOut,
+  RotateCcw,
+  AlertCircle,
+  AlertTriangle,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -26,12 +34,23 @@ import {
 } from "@/components/ui/tooltip";
 import { useResizeObserver } from "@/hooks/use-resize-observer";
 
+export const LARGE_CLUSTER_THRESHOLD = 100; // Threshold for warning
+
+// Define a type that represents the structure of currentVisualizationData based on user's feedback
+// This includes the 'groups' property.
+interface EffectiveVisualizationData {
+  clusterId: string;
+  nodes: BaseNode[];
+  links: BaseLink[];
+  groups: EntityGroup[] | ServiceGroup[] | Record<string, any>;
+}
+
 export default function GraphVisualizer() {
   const {
-    resolutionMode, // Get current mode
+    resolutionMode,
     selectedClusterId,
     selectedEdgeId,
-    currentVisualizationData, // This is now EntityVisualizationDataResponse | ServiceVisualizationDataResponse | null
+    currentVisualizationData, // This is EntityVisualizationDataResponse | ServiceVisualizationDataResponse | null
     actions,
     queries,
   } = useEntityResolution();
@@ -60,6 +79,9 @@ export default function GraphVisualizer() {
   const [zoomLevel, setZoomLevel] = useState(1);
   const [rawDimensions, setRawDimensions] = useState({ width: 0, height: 0 });
 
+  const [showLargeGraphWarning, setShowLargeGraphWarning] = useState(false);
+  const [forceRenderLargeGraph, setForceRenderLargeGraph] = useState(false);
+
   const dimensions = useMemo(
     () => ({ width: rawDimensions.width, height: rawDimensions.height }),
     [rawDimensions.width, rawDimensions.height]
@@ -71,14 +93,66 @@ export default function GraphVisualizer() {
   > | null>(null);
   const isProgrammaticZoomRef = useRef(false);
 
+  const processVisualizationData = useCallback(() => {
+    // Cast currentVisualizationData to the effective structure that includes 'groups'
+    const data = currentVisualizationData as EffectiveVisualizationData | null;
+
+    if (!data) {
+      setNodes([]);
+      setLinks([]);
+      setDisplayGroups([]);
+      return;
+    }
+
+    setNodes(data.nodes || []);
+    setLinks(data.links || []);
+
+    const allGroups = data.groups || [];
+
+    if (Array.isArray(allGroups)) {
+      if (resolutionMode === "entity") {
+        setDisplayGroups(
+          allGroups.filter(
+            (g): g is EntityGroup =>
+              typeof g === "object" &&
+              g !== null &&
+              "entityId1" in g && // Check for a distinguishing property of EntityGroup
+              "entityId2" in g
+          )
+        );
+      } else if (resolutionMode === "service") {
+        setDisplayGroups(
+          allGroups.filter(
+            (g): g is ServiceGroup =>
+              typeof g === "object" &&
+              g !== null &&
+              "serviceId1" in g && // Check for a distinguishing property of ServiceGroup
+              "serviceId2" in g
+          )
+        );
+      } else {
+        setDisplayGroups([]);
+      }
+    } else {
+      // Handle cases where groups might be Record<string, any>
+      // For now, if it's not an array, we clear displayGroups.
+      // You might need more specific logic if Record<string, any> is a valid format for displayable groups.
+      console.warn("Visualization groups data is not an array:", allGroups);
+      setDisplayGroups([]);
+    }
+  }, [currentVisualizationData, resolutionMode]);
+
   const computeAllNodeContactInfo = useCallback(() => {
+    const data = currentVisualizationData as EffectiveVisualizationData | null;
+    if (!data) return;
+
     const allContactInfo: Record<
       string,
       BaseNode & { contactInfo: Record<string, any> }
     > = {};
-    if (!currentVisualizationData) return;
 
     for (const node of nodes) {
+      // nodes state is already set by processVisualizationData
       const contactInfo: {
         email?: string;
         phone?: string;
@@ -86,41 +160,57 @@ export default function GraphVisualizer() {
         url?: string;
       } = {};
 
+      // displayGroups state is also set by processVisualizationData
       for (const group of displayGroups) {
         const values = group.matchValues?.values;
-        let isEntity1 = false;
-        let isEntity2 = false;
+        let isNodeInGroup = false;
 
-        if (resolutionMode === "entity") {
+        if (resolutionMode === "entity" && "entityId1" in group) {
           const eg = group as EntityGroup;
-          isEntity1 = eg.entityId1 === node.id;
-          isEntity2 = eg.entityId2 === node.id;
-        } else {
+          isNodeInGroup = eg.entityId1 === node.id || eg.entityId2 === node.id;
+        } else if (resolutionMode === "service" && "serviceId1" in group) {
           const sg = group as ServiceGroup;
-          isEntity1 = sg.serviceId1 === node.id;
-          isEntity2 = sg.serviceId2 === node.id;
+          isNodeInGroup =
+            sg.serviceId1 === node.id || sg.serviceId2 === node.id;
         }
 
-        if (!isEntity1 && !isEntity2) continue;
+        if (!isNodeInGroup) continue;
+
+        // Determine which set of values to use (e.g., _1 or _2)
+        // This logic might need refinement if node's role (e.g. entity1 vs entity2) is important for contact info
+        let useSuffix1 = true; // Default assumption
+        if (
+          resolutionMode === "entity" &&
+          "entityId1" in group &&
+          (group as EntityGroup).entityId2 === node.id
+        ) {
+          useSuffix1 = false;
+        } else if (
+          resolutionMode === "service" &&
+          "serviceId1" in group &&
+          (group as ServiceGroup).serviceId2 === node.id
+        ) {
+          useSuffix1 = false;
+        }
 
         switch (group.matchValues?.type?.toLowerCase()) {
           case "email":
-            contactInfo.email = isEntity1
+            contactInfo.email = useSuffix1
               ? values?.original_email1 || values?.email1
               : values?.original_email2 || values?.email2;
             break;
           case "phone":
-            contactInfo.phone = isEntity1
+            contactInfo.phone = useSuffix1
               ? values?.original_phone1 || values?.phone1
               : values?.original_phone2 || values?.phone2;
             break;
           case "address":
-            contactInfo.address = isEntity1
+            contactInfo.address = useSuffix1
               ? values?.original_address1 || values?.address1
               : values?.original_address2 || values?.address2;
             break;
           case "url":
-            contactInfo.url = isEntity1
+            contactInfo.url = useSuffix1
               ? values?.original_url1 || values?.url1
               : values?.original_url2 || values?.url2;
             break;
@@ -135,10 +225,10 @@ export default function GraphVisualizer() {
   }, [nodes, displayGroups, resolutionMode, currentVisualizationData]);
 
   useEffect(() => {
-    if (nodes.length > 0 && (displayGroups.length > 0 || resolutionMode)) { // ensure it runs even if displayGroups is empty initially
+    if (nodes.length > 0 && (displayGroups.length > 0 || resolutionMode)) {
       computeAllNodeContactInfo();
     }
-  }, [computeAllNodeContactInfo]); // Removed nodes, displayGroups from deps as they are used inside
+  }, [computeAllNodeContactInfo]);
 
   useResizeObserver(containerRef, (entry) => {
     if (entry) {
@@ -150,6 +240,42 @@ export default function GraphVisualizer() {
       );
     }
   });
+
+  useEffect(() => {
+    setForceRenderLargeGraph(false);
+    setShowLargeGraphWarning(false);
+    setNodes([]);
+    setLinks([]);
+    setDisplayGroups([]);
+  }, [selectedClusterId]);
+
+  useEffect(() => {
+    const data = currentVisualizationData as EffectiveVisualizationData | null;
+    if (!data) {
+      setNodes([]);
+      setLinks([]);
+      setDisplayGroups([]);
+      setShowLargeGraphWarning(false);
+      return;
+    }
+
+    const recordCount = data.nodes?.length || 0;
+    const isLarge = recordCount > LARGE_CLUSTER_THRESHOLD;
+
+    if (isLarge && !forceRenderLargeGraph) {
+      setShowLargeGraphWarning(true);
+      setNodes([]);
+      setLinks([]);
+      setDisplayGroups([]);
+    } else {
+      processVisualizationData();
+      setShowLargeGraphWarning(false);
+    }
+  }, [
+    currentVisualizationData,
+    forceRenderLargeGraph,
+    processVisualizationData,
+  ]);
 
   const safeZoomTo = useCallback((transform: d3.ZoomTransform) => {
     if (!zoomRef.current || !svgRef.current) return;
@@ -187,7 +313,12 @@ export default function GraphVisualizer() {
     if (width === 0 || height === 0) return;
     try {
       const graphBounds = gRef.current.node()?.getBBox();
-      if (!graphBounds || graphBounds.width === 0 || graphBounds.height === 0 || nodes.length === 0) { // Added nodes.length check
+      if (
+        !graphBounds ||
+        graphBounds.width === 0 ||
+        graphBounds.height === 0 ||
+        nodes.length === 0
+      ) {
         safeZoomTo(d3.zoomIdentity.translate(width / 2, height / 2).scale(1));
         return;
       }
@@ -207,35 +338,17 @@ export default function GraphVisualizer() {
       console.warn("Error in resetZoom, falling back to simple center:", error);
       safeZoomTo(d3.zoomIdentity.translate(width / 2, height / 2).scale(1));
     }
-  }, [dimensions, safeZoomTo, nodes]); // Added nodes to dependency array
+  }, [dimensions, safeZoomTo, nodes]);
 
   const centerGraph = useCallback(() => resetZoom(), [resetZoom]);
 
-  useEffect(() => {
-    if (!currentVisualizationData) {
-      setNodes([]);
-      setLinks([]);
-      setDisplayGroups([]);
+  const updateVisualization = useCallback(() => {
+    if (!svgRef.current || dimensions.width === 0 || dimensions.height === 0) {
+      if (svgRef.current) d3.select(svgRef.current).selectAll("*").remove();
       return;
     }
-    setNodes(currentVisualizationData.nodes as BaseNode[]);
-    setLinks(currentVisualizationData.links as BaseLink[]);
-    if (resolutionMode === "entity") {
-      const data = currentVisualizationData as EntityVisualizationDataResponse;
-      setDisplayGroups( (Array.isArray(data.entityGroups) ? data.entityGroups : []) as EntityGroup[]);
-    } else {
-      const data = currentVisualizationData as ServiceVisualizationDataResponse;
-      setDisplayGroups( (Array.isArray(data.entityGroups) ? data.entityGroups : []) as ServiceGroup[]);
-    }
-  }, [currentVisualizationData, resolutionMode]);
 
-  const updateVisualization = useCallback(() => {
-    if (
-      !svgRef.current ||
-      // nodes.length === 0 || // We will check validNodes.length later
-      dimensions.width === 0 ||
-      dimensions.height === 0
-    ) {
+    if (nodes.length === 0) {
       if (svgRef.current) d3.select(svgRef.current).selectAll("*").remove();
       return;
     }
@@ -253,30 +366,21 @@ export default function GraphVisualizer() {
     const g = svg.append("g");
     gRef.current = g;
 
-    // Filter links to ensure they only connect existing nodes
-    const nodeIds = new Set(nodes.map(n => n.id));
-    const filteredLinks = links.filter(l => {
-        // D3 links source/target can be string ID or the node object itself after simulation.
-        // Initially, they are string IDs from our data.
-        const sourceId = typeof l.source === 'string' ? l.source : (l.source as BaseNode).id;
-        const targetId = typeof l.target === 'string' ? l.target : (l.target as BaseNode).id;
-        const sourceExists = nodeIds.has(sourceId);
-        const targetExists = nodeIds.has(targetId);
-        if (!sourceExists || !targetExists) {
-            console.warn(
-                `Filtering out link ${l.id} due to missing node(s). Source ID: ${sourceId} (exists: ${sourceExists}), Target ID: ${targetId} (exists: ${targetExists}). Available node IDs count: ${nodeIds.size}`
-            );
-        }
-        return sourceExists && targetExists;
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const filteredLinks = links.filter((l) => {
+      const sourceId =
+        typeof l.source === "string" ? l.source : (l.source as BaseNode).id;
+      const targetId =
+        typeof l.target === "string" ? l.target : (l.target as BaseNode).id;
+      const sourceExists = nodeIds.has(sourceId);
+      const targetExists = nodeIds.has(targetId);
+      if (!sourceExists || !targetExists) {
+        console.warn(
+          `Filtering out link ${l.id} due to missing node(s). Source ID: ${sourceId} (exists: ${sourceExists}), Target ID: ${targetId} (exists: ${targetExists}). Available node IDs count: ${nodeIds.size}`
+        );
+      }
+      return sourceExists && targetExists;
     });
-
-    // If there are no nodes to render, clear SVG and return.
-    if (nodes.length === 0) {
-        if (svgRef.current) d3.select(svgRef.current).selectAll("*").remove();
-        console.log("No nodes to render in graph visualizer.");
-        return;
-    }
-
 
     zoomRef.current = d3
       .zoom<Element, unknown>()
@@ -298,7 +402,7 @@ export default function GraphVisualizer() {
     const linkElements = g
       .append("g")
       .selectAll("line")
-      .data(filteredLinks) // Use filteredLinks
+      .data(filteredLinks)
       .enter()
       .append("line")
       .attr("stroke-width", (d) =>
@@ -369,14 +473,18 @@ export default function GraphVisualizer() {
     const nodeElements = g
       .append("g")
       .selectAll("circle")
-      .data(nodes) // Use original nodes for drawing nodes
+      .data(nodes)
       .enter()
       .append("circle")
       .attr("r", (d) =>
-        filteredLinks.some( // Check against filteredLinks for styling
+        filteredLinks.some(
           (link) =>
-            ((typeof link.source === 'string' ? link.source : (link.source as BaseNode).id) === d.id ||
-             (typeof link.target === 'string' ? link.target : (link.target as BaseNode).id) === d.id) &&
+            ((typeof link.source === "string"
+              ? link.source
+              : (link.source as BaseNode).id) === d.id ||
+              (typeof link.target === "string"
+                ? link.target
+                : (link.target as BaseNode).id) === d.id) &&
             link.status === "CONFIRMED_MATCH"
         )
           ? 10
@@ -385,14 +493,22 @@ export default function GraphVisualizer() {
       .attr("fill", (d) => {
         const confirmed = filteredLinks.filter(
           (l) =>
-            ((typeof l.source === 'string' ? l.source : (l.source as BaseNode).id) === d.id ||
-             (typeof l.target === 'string' ? l.target : (l.target as BaseNode).id) === d.id) &&
+            ((typeof l.source === "string"
+              ? l.source
+              : (l.source as BaseNode).id) === d.id ||
+              (typeof l.target === "string"
+                ? l.target
+                : (l.target as BaseNode).id) === d.id) &&
             l.status === "CONFIRMED_MATCH"
         ).length;
         const pending = filteredLinks.filter(
           (l) =>
-            ((typeof l.source === 'string' ? l.source : (l.source as BaseNode).id) === d.id ||
-             (typeof l.target === 'string' ? l.target : (l.target as BaseNode).id) === d.id) &&
+            ((typeof l.source === "string"
+              ? l.source
+              : (l.source as BaseNode).id) === d.id ||
+              (typeof l.target === "string"
+                ? l.target
+                : (l.target as BaseNode).id) === d.id) &&
             l.status === "PENDING_REVIEW"
         ).length;
         if (confirmed > 0) return "#dcfce7";
@@ -402,14 +518,22 @@ export default function GraphVisualizer() {
       .attr("stroke", (d) => {
         const confirmed = filteredLinks.filter(
           (l) =>
-            ((typeof l.source === 'string' ? l.source : (l.source as BaseNode).id) === d.id ||
-             (typeof l.target === 'string' ? l.target : (l.target as BaseNode).id) === d.id) &&
+            ((typeof l.source === "string"
+              ? l.source
+              : (l.source as BaseNode).id) === d.id ||
+              (typeof l.target === "string"
+                ? l.target
+                : (l.target as BaseNode).id) === d.id) &&
             l.status === "CONFIRMED_MATCH"
         ).length;
         const pending = filteredLinks.filter(
           (l) =>
-            ((typeof l.source === 'string' ? l.source : (l.source as BaseNode).id) === d.id ||
-             (typeof l.target === 'string' ? l.target : (l.target as BaseNode).id) === d.id) &&
+            ((typeof l.source === "string"
+              ? l.source
+              : (l.source as BaseNode).id) === d.id ||
+              (typeof l.target === "string"
+                ? l.target
+                : (l.target as BaseNode).id) === d.id) &&
             l.status === "PENDING_REVIEW"
         ).length;
         if (confirmed > 0) return "#16a34a";
@@ -428,8 +552,12 @@ export default function GraphVisualizer() {
           "r",
           filteredLinks.some(
             (l) =>
-              ((typeof l.source === 'string' ? l.source : (l.source as BaseNode).id) === d.id ||
-               (typeof l.target === 'string' ? l.target : (l.target as BaseNode).id) === d.id) &&
+              ((typeof l.source === "string"
+                ? l.source
+                : (l.source as BaseNode).id) === d.id ||
+                (typeof l.target === "string"
+                  ? l.target
+                  : (l.target as BaseNode).id) === d.id) &&
               l.status === "CONFIRMED_MATCH"
           )
             ? 10
@@ -478,11 +606,7 @@ export default function GraphVisualizer() {
             } (${resolutionMode})</div>
             <div style="margin-bottom: 2px;"><span style="font-weight: 500;">Source:</span> ${
               nodeInfo.sourceSystem || "Unknown"
-            }${
-          nodeInfo.sourceId
-            ? ` (${nodeInfo.sourceId})`
-            : ""
-        }</div>
+            }${nodeInfo.sourceId ? ` (${nodeInfo.sourceId})` : ""}</div>
             ${
               contactInfo.address
                 ? `<div style="margin-bottom: 2px;"><span style="font-weight: 500;">Address:</span> ${contactInfo.address}</div>`
@@ -508,7 +632,7 @@ export default function GraphVisualizer() {
 
     g.append("g")
       .selectAll("foreignObject")
-      .data(filteredLinks) // Use filteredLinks for tooltips too
+      .data(filteredLinks)
       .enter()
       .append("foreignObject")
       .attr("width", 270)
@@ -517,26 +641,32 @@ export default function GraphVisualizer() {
       .style("opacity", 0)
       .attr("id", (d) => `link-tooltip-${d.id}`)
       .html((d_link: BaseLink) => {
-        const linkSourceId = typeof d_link.source === 'string' ? d_link.source : (d_link.source as BaseNode).id;
-        const linkTargetId = typeof d_link.target === 'string' ? d_link.target : (d_link.target as BaseNode).id;
+        const linkSourceId =
+          typeof d_link.source === "string"
+            ? d_link.source
+            : (d_link.source as BaseNode).id;
+        const linkTargetId =
+          typeof d_link.target === "string"
+            ? d_link.target
+            : (d_link.target as BaseNode).id;
 
         const linkSpecificGroups = displayGroups.filter((group) => {
-          if (resolutionMode === "entity") {
+          if (resolutionMode === "entity" && "entityId1" in group) {
             const eg = group as EntityGroup;
             return (
               (eg.entityId1 === linkSourceId &&
                 eg.entityId2 === linkTargetId) ||
               (eg.entityId1 === linkTargetId && eg.entityId2 === linkSourceId)
             );
-          } else {
+          } else if (resolutionMode === "service" && "serviceId1" in group) {
             const sg = group as ServiceGroup;
             return (
               (sg.serviceId1 === linkSourceId &&
                 sg.serviceId2 === linkTargetId) ||
-              (sg.serviceId1 === linkTargetId &&
-                sg.serviceId2 === linkSourceId)
+              (sg.serviceId1 === linkTargetId && sg.serviceId2 === linkSourceId)
             );
           }
+          return false;
         });
 
         let statusHtml = "";
@@ -551,8 +681,11 @@ export default function GraphVisualizer() {
         if (linkSpecificGroups.length > 0) {
           groupsHtml = `<div style="margin-top: 8px;"><div style="font-size: 10px; font-weight: 500; color: #6b7280; margin-bottom: 4px;">Match Methods:</div><div style="max-height: 150px; overflow-y: auto; space-y: 4px; padding-right: 5px;">${linkSpecificGroups
             .map((group) => {
-              const confidence = group.rl_confidence
-                ? group.rl_confidence.toFixed(3)
+              const confidence = (group as EntityGroup | ServiceGroup)
+                .confidenceScore // Use confidenceScore
+                ? (
+                    group as EntityGroup | ServiceGroup
+                  ).confidenceScore!.toFixed(3) // Add ! for non-null assertion if sure
                 : "N/A";
               const matchValuesDisplay = Object.entries(
                 group.matchValues?.values || {}
@@ -586,18 +719,18 @@ export default function GraphVisualizer() {
     if (simulationRef.current) simulationRef.current.stop();
 
     const simulation = d3
-      .forceSimulation(nodes as d3.SimulationNodeDatum[]) // Simulate with all original nodes
+      .forceSimulation(nodes as d3.SimulationNodeDatum[])
       .force(
         "link",
         d3
-          .forceLink(filteredLinks) // But only use filteredLinks for the link force
+          .forceLink(filteredLinks)
           .id((d) => (d as BaseNode).id)
           .distance((d) =>
             (d as BaseLink).status === "CONFIRMED_MATCH"
-              ? 80
+              ? 40
               : (d as BaseLink).status === "CONFIRMED_NON_MATCH"
-              ? 120
-              : 100
+              ? 80
+              : 60
           )
           .strength(0.1)
       )
@@ -648,7 +781,9 @@ export default function GraphVisualizer() {
     }
 
     if (selectedEdgeId) {
-      const selectedLinkData = filteredLinks.find((l) => l.id === selectedEdgeId);
+      const selectedLinkData = filteredLinks.find(
+        (l) => l.id === selectedEdgeId
+      );
       if (selectedLinkData) {
         d3.select(`#link-${selectedEdgeId}`)
           .attr(
@@ -660,7 +795,7 @@ export default function GraphVisualizer() {
               : 1 + (selectedLinkData.weight || 0) * 5
           )
           .attr("stroke-opacity", 1.0)
-          .attr("stroke", "#000000"); // Highlight color for selected edge
+          .attr("stroke", "#000000");
       }
     }
     function dragstarted(event: any) {
@@ -680,7 +815,7 @@ export default function GraphVisualizer() {
   }, [
     dimensions,
     nodes,
-    links, // Keep original links as dependency here, filtering is internal to this callback
+    links,
     displayGroups,
     selectedEdgeId,
     actions.setSelectedEdgeId,
@@ -712,7 +847,7 @@ export default function GraphVisualizer() {
       .transition()
       .duration(150)
       .style("opacity", 0);
-    if (hoverLink && !selectedEdgeId) // Only show link tooltip if no edge is actively selected
+    if (hoverLink && !selectedEdgeId)
       svg
         .select(`#link-tooltip-${hoverLink}`)
         .transition()
@@ -720,7 +855,7 @@ export default function GraphVisualizer() {
         .style("opacity", 1);
   }, [hoverLink, selectedEdgeId]);
 
-  useEffect(updateVisualization, [updateVisualization]); // updateVisualization depends on nodes, links, etc.
+  useEffect(updateVisualization, [updateVisualization]);
 
   useEffect(
     () => () => {
@@ -735,11 +870,10 @@ export default function GraphVisualizer() {
   const error = selectedClusterId
     ? queries.getVisualizationError(selectedClusterId)
     : null;
-  const hasData = nodes.length > 0; // Based on actual nodes received, before filtering links
+
+  const hasData = nodes.length > 0;
 
   const edgeCounts = useMemo(() => {
-    // Calculate counts based on the links currently in state (which are pre-filtering)
-    // If you want counts of *rendered* links, use filteredLinks inside updateVisualization
     const confirmed = links.filter(
       (l) => l.status === "CONFIRMED_MATCH"
     ).length;
@@ -750,118 +884,159 @@ export default function GraphVisualizer() {
     return { confirmed, nonMatch, pending, total: links.length };
   }, [links]);
 
+  if (isLoading) {
+    return (
+      <div className="flex justify-center items-center h-full">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900"></div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col justify-center items-center h-full text-destructive">
+        <AlertCircle className="h-8 w-8 mb-2" />
+        <p className="font-semibold">Failed to load visualization</p>
+        <p className="text-sm text-muted-foreground">{error}</p>
+      </div>
+    );
+  }
+
+  if (!selectedClusterId) {
+    return (
+      <div className="flex justify-center items-center h-full text-muted-foreground">
+        Select a cluster to visualize
+      </div>
+    );
+  }
+
+  if (showLargeGraphWarning && !forceRenderLargeGraph) {
+    const data = currentVisualizationData as EffectiveVisualizationData | null;
+    return (
+      <div className="flex flex-col justify-center items-center h-full text-orange-500 p-4">
+        <AlertTriangle className="h-12 w-12 mb-4" />
+        <h2 className="text-xl font-semibold mb-2 text-gray-800 dark:text-gray-200">
+          Large Cluster Warning
+        </h2>
+        <p className="text-sm text-center text-gray-600 dark:text-gray-400 mb-6 max-w-md">
+          This cluster contains <strong>{data?.nodes?.length || "many"}</strong>{" "}
+          records. Visualizing it may cause performance issues or browser lag.
+        </p>
+        <Button
+          onClick={() => {
+            setForceRenderLargeGraph(true);
+          }}
+          variant="outline"
+          className="bg-orange-500 hover:bg-orange-600 text-white dark:bg-orange-600 dark:hover:bg-orange-700"
+        >
+          Render Anyway
+        </Button>
+      </div>
+    );
+  }
+
+  if (!hasData) {
+    return (
+      <div className="flex justify-center items-center h-full text-muted-foreground">
+        No visualization data to display for this {resolutionMode} cluster.
+        {selectedClusterId &&
+          queries.getClusterById(selectedClusterId)?.wasSplit &&
+          " (Cluster was split)"}
+      </div>
+    );
+  }
+
   return (
     <div ref={containerRef} className={`relative h-full flex flex-col`}>
-      {isLoading ? (
-        <div className="flex justify-center items-center h-full">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900"></div>
+      <>
+        <div className="absolute top-4 right-4 z-30 flex flex-col gap-1 bg-white/90 backdrop-blur-sm rounded-lg p-2 shadow-lg border">
+          <TooltipProvider>
+            <div className="flex flex-col gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={zoomIn}
+                    className="h-8 w-8 p-0"
+                  >
+                    <ZoomIn className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="left">
+                  <p>Zoom In</p>
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={zoomOut}
+                    className="h-8 w-8 p-0"
+                  >
+                    <ZoomOut className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="left">
+                  <p>Zoom Out</p>
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={centerGraph}
+                    className="h-8 w-8 p-0"
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="left">
+                  <p>Reset & Center</p>
+                </TooltipContent>
+              </Tooltip>
+            </div>
+          </TooltipProvider>
+          <div className="text-xs text-center text-gray-500 mt-1 min-w-0">
+            {Math.round(zoomLevel * 100)}%
+          </div>
         </div>
-      ) : error ? (
-        <div className="flex flex-col justify-center items-center h-full text-destructive">
-          <AlertCircle className="h-8 w-8 mb-2" />
-          <p className="font-semibold">Failed to load visualization</p>
-          <p className="text-sm text-muted-foreground">{error}</p>
-        </div>
-      ) : !selectedClusterId ? (
-        <div className="flex justify-center items-center h-full text-muted-foreground">
-          Select a cluster to visualize
-        </div>
-      ) : !hasData ? ( // This checks if nodes array is empty
-        <div className="flex justify-center items-center h-full text-muted-foreground">
-          No visualization data for this {resolutionMode} cluster.
-          {(selectedClusterId && queries.getClusterById(selectedClusterId)?.wasSplit) && " (Cluster was split)"}
-        </div>
-      ) : (
-        <>
-          <div className="absolute top-4 right-4 z-30 flex flex-col gap-1 bg-white/90 backdrop-blur-sm rounded-lg p-2 shadow-lg border">
-            <TooltipProvider>
-              <div className="flex flex-col gap-1">
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={zoomIn}
-                      className="h-8 w-8 p-0"
-                    >
-                      <ZoomIn className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="left">
-                    <p>Zoom In</p>
-                  </TooltipContent>
-                </Tooltip>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={zoomOut}
-                      className="h-8 w-8 p-0"
-                    >
-                      <ZoomOut className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="left">
-                    <p>Zoom Out</p>
-                  </TooltipContent>
-                </Tooltip>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={centerGraph}
-                      className="h-8 w-8 p-0"
-                    >
-                      <RotateCcw className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="left">
-                    <p>Reset & Center</p>
-                  </TooltipContent>
-                </Tooltip>
-              </div>
-            </TooltipProvider>
-            <div className="text-xs text-center text-gray-500 mt-1 min-w-0">
-              {Math.round(zoomLevel * 100)}%
+        <div className="absolute top-4 left-4 z-30 bg-white/90 backdrop-blur-sm rounded-lg p-3 shadow-lg border">
+          <h4 className="text-xs font-semibold mb-2">
+            Connection Status ({resolutionMode})
+          </h4>
+          <div className="space-y-1.5 text-xs">
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-0.5 bg-green-600"></div>
+              <span>Confirmed Match ({edgeCounts.confirmed})</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div
+                className="w-4 h-0.5 bg-red-600 opacity-60"
+                style={{ borderTop: "1px dashed #dc2626" }}
+              ></div>
+              <span>Confirmed Non-Match ({edgeCounts.nonMatch})</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-0.5 bg-blue-500"></div>
+              <span>Pending Review ({edgeCounts.pending})</span>
+            </div>
+            <div className="text-xs text-muted-foreground mt-2 pt-2 border-t">
+              Total: {edgeCounts.total} connections
             </div>
           </div>
-          <div className="absolute top-4 left-4 z-30 bg-white/90 backdrop-blur-sm rounded-lg p-3 shadow-lg border">
-            <h4 className="text-xs font-semibold mb-2">
-              Connection Status ({resolutionMode})
-            </h4>
-            <div className="space-y-1.5 text-xs">
-              <div className="flex items-center gap-2">
-                <div className="w-4 h-0.5 bg-green-600"></div>
-                <span>Confirmed Match ({edgeCounts.confirmed})</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div
-                  className="w-4 h-0.5 bg-red-600 opacity-60"
-                  style={{ borderTop: "1px dashed #dc2626" }}
-                ></div>
-                <span>Confirmed Non-Match ({edgeCounts.nonMatch})</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="w-4 h-0.5 bg-blue-500"></div>
-                <span>Pending Review ({edgeCounts.pending})</span>
-              </div>
-              <div className="text-xs text-muted-foreground mt-2 pt-2 border-t">
-                Total: {edgeCounts.total} connections
-              </div>
-            </div>
-          </div>
-          <svg
-            ref={svgRef}
-            className="w-full h-full border rounded-md bg-white"
-            onClick={() => {
-              actions.setSelectedEdgeId(""); // Clear selected edge on SVG click
-              setHoverLink(null); // Clear hover link as well
-            }}
-          ></svg>
-        </>
-      )}
+        </div>
+        <svg
+          ref={svgRef}
+          className="w-full h-full border rounded-md bg-white"
+          onClick={() => {
+            actions.setSelectedEdgeId("");
+            setHoverLink(null);
+          }}
+        ></svg>
+      </>
     </div>
   );
 }

@@ -5,32 +5,44 @@ import { useCallback } from "react";
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { CheckCircle, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
+import { CheckCircle, ChevronLeft, ChevronRight, Loader2, HelpCircle, Info } from "lucide-react"; 
 import { Progress } from "@/components/ui/progress";
-import type { EntityCluster, ServiceCluster } from "@/types/entity-resolution"; // Import specific cluster types
+import type { EntityCluster, ServiceCluster, ClusterReviewProgress } from "@/types/entity-resolution"; 
+
+const LARGE_CLUSTER_THRESHOLD = 200; // Ensure this matches context if used here
 
 export default function ClusterSelector() {
   const {
-    resolutionMode, // Get current mode
+    resolutionMode, 
     selectedClusterId,
-    clusters, // This will now be ClustersState<EntityCluster | ServiceCluster>
-    clusterProgress,
+    clusters, 
+    clusterProgress, // This is Record<string, ClusterReviewProgress>
     actions,
     queries,
+    visualizationData, // Added to solve 'Cannot find name' error
   } = useEntityResolution();
 
   const handleClusterSelection = useCallback(async (clusterId: string) => {
     if (selectedClusterId !== clusterId) {
       actions.setSelectedClusterId(clusterId);
     } else if (!queries.isVisualizationDataLoaded(clusterId)) {
-      actions.invalidateVisualizationData(clusterId);
+      const clusterDetail = queries.getClusterById(clusterId);
+      const connectionCount = clusterDetail ? (resolutionMode === 'entity' 
+            ? (clusterDetail as EntityCluster)?.groupCount 
+            : (clusterDetail as ServiceCluster)?.serviceGroupCount) : 0;
+      // Use the constant from context if available, or define locally
+      const isLarge = connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD; 
+
+      if(!isLarge){ 
+        actions.invalidateVisualizationData(clusterId);
+      }
     }
-  }, [selectedClusterId, actions, queries]);
+  }, [selectedClusterId, actions, queries, resolutionMode]);
 
   const handlePageChange = useCallback((newPage: number) => {
     const { total, limit } = clusters;
     if (newPage >= 1 && newPage <= Math.ceil(total / limit)) {
-      actions.loadClusters(newPage, limit); // loadClusters is mode-aware
+      actions.loadClusters(newPage, limit); 
     }
   }, [clusters, actions]);
 
@@ -44,7 +56,7 @@ export default function ClusterSelector() {
   const { data: clustersData, loading, error, page, total, limit } = clusters;
 
   const entityLabel = resolutionMode === 'entity' ? 'Entities' : 'Services';
-  const groupLabel = resolutionMode === 'entity' ? 'Groups' : 'Service Groups';
+  const groupLabel = resolutionMode === 'entity' ? 'Potential Connections' : 'Potential Connections';
 
   return (
     <div className="space-y-4 h-full flex flex-col bg-card p-3 rounded-lg shadow">
@@ -71,16 +83,22 @@ export default function ClusterSelector() {
             {clustersData.map((cluster) => {
               const isSelected = selectedClusterId === cluster.id;
               const isLoadingViz = queries.isVisualizationDataLoading(cluster.id);
-              const hasVizData = queries.isVisualizationDataLoaded(cluster.id);
+              const vizForCluster = visualizationData[cluster.id]; // Get the specific viz data
+              const hasVizDataWithLinks = queries.isVisualizationDataLoaded(cluster.id) && 
+                                          vizForCluster?.data?.links?.length !== undefined;
               const vizError = queries.getVisualizationError(cluster.id);
-              const progress = clusterProgress[cluster.id] || {
-                progressPercentage: 0,
-                isComplete: false,
-                totalEdges: 0,
+              
+              const progress: ClusterReviewProgress = clusterProgress[cluster.id] || {
+                totalEdges: -1, 
                 reviewedEdges: 0,
+                progressPercentage: -1, 
+                isComplete: false,
+                pendingEdges: -1,
+                confirmedMatches: 0,
+                confirmedNonMatches: 0,
+                // clusterId: cluster.id, // Removed: Not part of ClusterReviewProgress type
               };
-
-              // Type assertion for cluster specific properties
+              
               const entityCount = resolutionMode === 'entity' ? (cluster as EntityCluster).entityCount : (cluster as ServiceCluster).serviceCount;
               const groupCount = resolutionMode === 'entity' ? (cluster as EntityCluster).groupCount : (cluster as ServiceCluster).serviceGroupCount;
 
@@ -103,16 +121,21 @@ export default function ClusterSelector() {
                       <div className="flex items-center gap-1">
                         {isLoadingViz &&
                           <div className="h-2 w-2 bg-blue-500 rounded-full animate-pulse" title="Loading visualization data..." />}
-                        {hasVizData && !isLoadingViz &&
+                        {hasVizDataWithLinks && !isLoadingViz &&
                           <div className="h-2 w-2 bg-green-500 rounded-full" title="Visualization data loaded" />}
                         {vizError &&
                           <div className="h-2 w-2 bg-red-500 rounded-full" title={`Error: ${vizError}`} />}
+                        {(groupCount && groupCount > LARGE_CLUSTER_THRESHOLD && !hasVizDataWithLinks && !isLoadingViz && !vizError) && (
+                          <span title="Large cluster: Load connections to see details.">
+                            <HelpCircle className="h-3 w-3 text-amber-500" />
+                          </span>
+                        )}
                       </div>
                     </div>
 
                     <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground mb-1.5">
-                      <div>{entityLabel}: <span className="font-medium text-card-foreground">{entityCount}</span></div>
-                      <div>{groupLabel}: <span className="font-medium text-card-foreground">{groupCount}</span></div>
+                      <div>{entityLabel}: <span className="font-medium text-card-foreground">{entityCount ?? '?'}</span></div>
+                      <div>{groupLabel}: <span className="font-medium text-card-foreground">{groupCount ?? '?'}</span></div>
                     </div>
 
                     <div className="flex items-center gap-1.5 mb-2 text-xs">
@@ -129,16 +152,28 @@ export default function ClusterSelector() {
                       <div className="flex justify-between text-xs mb-0.5 text-muted-foreground">
                         <span>Review Progress</span>
                         <span className="font-medium text-card-foreground">
-                          {progress.progressPercentage}% ({progress.reviewedEdges}/{progress.totalEdges})
+                          {progress.totalEdges === -1 || progress.progressPercentage === -1
+                            ? `${progress.reviewedEdges} / ?`
+                            : `${progress.reviewedEdges} / ${progress.totalEdges}`}
                         </span>
                       </div>
-                      <Progress value={progress.progressPercentage} className="h-1.5" />
+                      <Progress 
+                        value={progress.progressPercentage === -1 ? 0 : progress.progressPercentage} 
+                        // Removed indicatorClassName, apply conditional background to the main className for the track
+                        className={`h-1.5 ${progress.progressPercentage === -1 ? 'bg-gray-200 [&>div]:bg-gray-400' : ''}`} 
+                      />
                     </div>
 
-                    {progress.isComplete && (
+                    {progress.isComplete && progress.totalEdges !== -1 && ( 
                       <div className="flex items-center mt-1.5 text-green-600 text-xs font-medium">
                         <CheckCircle className="h-3.5 w-3.5 mr-1" />
                         Review Complete
+                      </div>
+                    )}
+                     {cluster.wasSplit && (
+                       <div className="flex items-center mt-1.5 text-orange-600 text-xs font-medium">
+                        <Info className="h-3.5 w-3.5 mr-1" />
+                        Cluster Processed (Split)
                       </div>
                     )}
                   </CardContent>
