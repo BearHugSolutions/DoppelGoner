@@ -1,32 +1,21 @@
 // utils/api-client.ts
 import type {
-  // ResolutionMode, // Not directly used in this file but good for context
-  EntityCluster,
-  ServiceCluster,
-  EntityGroup,
-  ServiceGroup,
-  EntityNode,
-  ServiceNode,
-  EntityLink,
-  ServiceLink,
-  VisualizationEntityEdge,
-  VisualizationServiceEdge,
-  // MatchDecisionDetails, // Not directly used in current API client functions' return types
-  Entity,
-  Service,
+  EntityClustersResponse,
+  ServiceClustersResponse,
+  EntityConnectionDataResponse,
+  ServiceConnectionDataResponse,
+  EntityVisualizationDataResponse,
+  ServiceVisualizationDataResponse,
   EntityGroupReviewApiPayload,
   ServiceGroupReviewApiPayload,
   GroupReviewApiResponse,
   ClusterFinalizationStatusResponse,
-  EntityConnectionDataResponse,
-  ServiceConnectionDataResponse,
-  EntityClustersResponse,
-  ServiceClustersResponse,
-  EntityVisualizationDataResponse,
-  ServiceVisualizationDataResponse,
+  NodeDetailResponse,
+  BulkNodeDetailsRequest, // New import
+  NodeIdentifier, // New import (though not directly used as param type here, good for context)
 } from "@/types/entity-resolution";
 
-const API_BASE_URL = '/api';
+const API_BASE_URL = '/api'; // Assuming this is your Next.js API proxy
 
 /**
  * Handles API errors by logging them and throwing a new error.
@@ -62,7 +51,6 @@ async function validateResponse<T>(
     try {
       errorData = await response.json();
     } catch (e) {
-      // If response is not JSON, use status text or a generic message
       errorData = { message: response.statusText || `Request failed with status ${response.status}` };
     }
     const errorMessage = errorData.message || errorData.error || `Request failed with status ${response.status}`;
@@ -75,28 +63,16 @@ async function validateResponse<T>(
 
 // --- Entity Specific Functions ---
 
-/**
- * Fetches a paginated list of entity clusters.
- * @param page - The page number to fetch.
- * @param limit - The number of items per page.
- * @returns Promise resolving to EntityClustersResponse.
- */
 export async function getEntityClusters(page: number = 1, limit: number = 10): Promise<EntityClustersResponse> {
   const url = `${API_BASE_URL}/clusters?type=entity&page=${page}&limit=${limit}`;
   try {
     const response = await fetch(url);
-    console.log("getEntityClusters response:", JSON.stringify(response));
     return await validateResponse<EntityClustersResponse>(response, 'getEntityClusters');
   } catch (error) {
     return handleApiError(error, `getEntityClusters (url: ${url})`);
   }
 }
 
-/**
- * Fetches detailed data for a specific entity connection (edge).
- * @param edgeId - The ID of the edge.
- * @returns Promise resolving to EntityConnectionDataResponse.
- */
 export async function getEntityConnectionData(edgeId: string): Promise<EntityConnectionDataResponse> {
   const url = `${API_BASE_URL}/connections/${edgeId}?type=entity`;
   try {
@@ -107,28 +83,16 @@ export async function getEntityConnectionData(edgeId: string): Promise<EntityCon
   }
 }
 
-/**
- * Fetches visualization data (nodes and links) for a specific entity cluster.
- * @param clusterId - The ID of the cluster.
- * @returns Promise resolving to EntityVisualizationDataResponse.
- */
 export async function getEntityVisualizationData(clusterId: string): Promise<EntityVisualizationDataResponse> {
   const url = `${API_BASE_URL}/visualization/${clusterId}?type=entity`;
   try {
     const response = await fetch(url);
-    // console.log("getEntityVisualizationData response:", JSON.stringify(response));
     return await validateResponse<EntityVisualizationDataResponse>(response, `getEntityVisualizationData for cluster ${clusterId}`);
   } catch (error) {
     return handleApiError(error, `getEntityVisualizationData (clusterId: ${clusterId})`);
   }
 }
 
-/**
- * Submits feedback for an entity group.
- * @param groupId - The ID of the entity group.
- * @param payload - The review payload.
- * @returns Promise resolving to GroupReviewApiResponse.
- */
 export async function postEntityGroupFeedback(
   groupId: string,
   payload: EntityGroupReviewApiPayload
@@ -146,11 +110,6 @@ export async function postEntityGroupFeedback(
   }
 }
 
-/**
- * Triggers the finalization process for an entity cluster.
- * @param clusterId - The ID of the cluster to finalize.
- * @returns Promise resolving to ClusterFinalizationStatusResponse.
- */
 export async function triggerEntityClusterFinalization(
   clusterId: string
 ): Promise<ClusterFinalizationStatusResponse> {
@@ -159,7 +118,6 @@ export async function triggerEntityClusterFinalization(
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // No body needed if the API doesn't expect one for this POST
     });
     return await validateResponse<ClusterFinalizationStatusResponse>(response, `triggerEntityClusterFinalization for cluster ${clusterId}`);
   } catch (error) {
@@ -170,12 +128,6 @@ export async function triggerEntityClusterFinalization(
 
 // --- Service Specific Functions ---
 
-/**
- * Fetches a paginated list of service clusters.
- * @param page - The page number to fetch.
- * @param limit - The number of items per page.
- * @returns Promise resolving to ServiceClustersResponse.
- */
 export async function getServiceClusters(page: number = 1, limit: number = 10): Promise<ServiceClustersResponse> {
   const url = `${API_BASE_URL}/clusters?type=service&page=${page}&limit=${limit}`;
   try {
@@ -186,11 +138,6 @@ export async function getServiceClusters(page: number = 1, limit: number = 10): 
   }
 }
 
-/**
- * Fetches detailed data for a specific service connection (edge).
- * @param edgeId - The ID of the edge.
- * @returns Promise resolving to ServiceConnectionDataResponse.
- */
 export async function getServiceConnectionData(edgeId: string): Promise<ServiceConnectionDataResponse> {
   const url = `${API_BASE_URL}/connections/${edgeId}?type=service`;
   try {
@@ -201,11 +148,6 @@ export async function getServiceConnectionData(edgeId: string): Promise<ServiceC
   }
 }
 
-/**
- * Fetches visualization data (nodes and links) for a specific service cluster.
- * @param clusterId - The ID of the cluster.
- * @returns Promise resolving to ServiceVisualizationDataResponse.
- */
 export async function getServiceVisualizationData(clusterId: string): Promise<ServiceVisualizationDataResponse> {
   const url = `${API_BASE_URL}/visualization/${clusterId}?type=service`;
   try {
@@ -216,17 +158,11 @@ export async function getServiceVisualizationData(clusterId: string): Promise<Se
   }
 }
 
-/**
- * Submits feedback for a service group.
- * @param groupId - The ID of the service group.
- * @param payload - The review payload.
- * @returns Promise resolving to GroupReviewApiResponse.
- */
 export async function postServiceGroupFeedback(
   groupId: string,
   payload: ServiceGroupReviewApiPayload
 ): Promise<GroupReviewApiResponse> {
-  const url = `${API_BASE_URL}/service-groups/${groupId}/review`; // Uses the new service-specific endpoint
+  const url = `${API_BASE_URL}/service-groups/${groupId}/review`;
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -239,11 +175,6 @@ export async function postServiceGroupFeedback(
   }
 }
 
-/**
- * Triggers the finalization process for a service cluster.
- * @param clusterId - The ID of the cluster to finalize.
- * @returns Promise resolving to ClusterFinalizationStatusResponse.
- */
 export async function triggerServiceClusterFinalization(
   clusterId: string
 ): Promise<ClusterFinalizationStatusResponse> {
@@ -252,10 +183,46 @@ export async function triggerServiceClusterFinalization(
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // No body needed if the API doesn't expect one for this POST
     });
     return await validateResponse<ClusterFinalizationStatusResponse>(response, `triggerServiceClusterFinalization for cluster ${clusterId}`);
   } catch (error) {
     return handleApiError(error, `triggerServiceClusterFinalization (clusterId: ${clusterId})`);
+  }
+}
+
+// --- Generic Node Detail Functions ---
+
+/**
+ * Fetches detailed information for a specific entity or service node.
+ * @param nodeId - The ID of the node (entity or service).
+ * @param nodeType - The type of the node ('entity' or 'service').
+ * @returns Promise resolving to NodeDetailResponse.
+ */
+export async function getNodeDetails(nodeId: string, nodeType: 'entity' | 'service'): Promise<NodeDetailResponse> {
+  const url = `${API_BASE_URL}/nodeData/${nodeId}?type=${nodeType}`;
+  try {
+    const response = await fetch(url);
+    return await validateResponse<NodeDetailResponse>(response, `getNodeDetails for node ${nodeId} (type: ${nodeType})`);
+  } catch (error) {
+    return handleApiError(error, `getNodeDetails (nodeId: ${nodeId}, nodeType: ${nodeType})`);
+  }
+}
+
+/**
+ * Fetches detailed information for multiple entity or service nodes in bulk.
+ * @param payload - Object containing an array of NodeIdentifier { id: string, nodeType: 'entity' | 'service' }.
+ * @returns Promise resolving to an array of NodeDetailResponse.
+ */
+export async function getBulkNodeDetails(payload: BulkNodeDetailsRequest): Promise<NodeDetailResponse[]> {
+  const url = `${API_BASE_URL}/bulk-node-details`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await validateResponse<NodeDetailResponse[]>(response, 'getBulkNodeDetails');
+  } catch (error) {
+    return handleApiError(error, 'getBulkNodeDetails');
   }
 }

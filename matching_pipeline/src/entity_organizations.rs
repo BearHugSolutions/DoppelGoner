@@ -190,9 +190,10 @@ pub async fn extract_entities(pool: &PgPool) -> Result<Vec<Entity>> {
 ///    - phones associated with the organization
 ///    - locations operated by the organization
 ///    - contacts linked to the organization
+///    - addresses linked via locations to the organization
 /// 3. For each reference found, create an entity_feature record if it doesn't exist with:
 ///    - entity_id pointing to the entity
-///    - table_name indicating the source table (e.g., "service", "phone")
+///    - table_name indicating the source table (e.g., "service", "phone", "address")
 ///    - table_id containing the ID of the referenced record
 /// 4. Batch insert the new entity_feature records
 pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<usize> {
@@ -530,7 +531,7 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
         .context("Failed to query contacts")?;
 
     for row in &contact_rows {
-        let contact_id: String = row.get("id");
+        let contact_id: String = row.get("contact_id");
         let org_id: String = row.get("organization_id");
 
         if let Some(entity_id) = org_to_entity.get(&org_id) {
@@ -555,6 +556,47 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
             new_features.push(feature);
         }
     }
+    
+    // 5. Link addresses via locations
+    info!("Linking addresses to entities via locations...");
+    let address_rows = conn
+        .query(
+            "SELECT a.id as address_id, l.organization_id
+             FROM public.address a
+             JOIN public.location l ON a.location_id = l.id
+             WHERE l.organization_id IS NOT NULL",
+            &[],
+        )
+        .await
+        .context("Failed to query addresses linked via locations")?;
+
+    for row in &address_rows {
+        let address_id: String = row.get("address_id");
+        let org_id: String = row.get("organization_id");
+
+        if let Some(entity_id) = org_to_entity.get(&org_id) {
+            let table_name = "address".to_string();
+
+            // Skip if this feature already exists
+            if existing_features.contains(&(
+                entity_id.clone(),
+                table_name.clone(),
+                address_id.clone(),
+            )) {
+                continue;
+            }
+
+            let feature = EntityFeature {
+                id: Uuid::new_v4().to_string(),
+                entity_id: EntityId(entity_id.clone()),
+                table_name,
+                table_id: address_id,
+                created_at: now,
+            };
+            new_features.push(feature);
+        }
+    }
+
 
     info!("Found {} new features to link", new_features.len());
 
@@ -565,7 +607,7 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
     }
 
     // Insert the new features into the database in batches
-    let batch_size = 100;
+    let batch_size = 100; // Can be adjusted based on performance
     let total_batches = (new_features.len() + batch_size - 1) / batch_size;
 
     info!(
@@ -589,8 +631,8 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
                 "('{}', '{}', '{}', '{}', '{}')",
                 feature.id,
                 feature.entity_id.0,
-                feature.table_name,
-                feature.table_id,
+                feature.table_name.replace('\'', "''"), // Sanitize table_name
+                feature.table_id.replace('\'', "''"),   // Sanitize table_id
                 feature.created_at
             ));
         }
@@ -610,7 +652,7 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
         // Log batch progress
         if (batch_idx + 1) % 10 == 0 || batch_idx + 1 == total_batches {
             info!(
-                "Processed batch {}/{} ({:.1}%)",
+                "Processed feature insertion batch {}/{} ({:.1}%)",
                 batch_idx + 1,
                 total_batches,
                 (batch_idx + 1) as f32 / total_batches as f32 * 100.0
@@ -632,7 +674,7 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
 /// feature sets even as the database changes over time.
 ///
 /// This involves:
-/// 1. Finding all features (services, phones, locations, contacts) that reference
+/// 1. Finding all features (services, phones, locations, contacts, addresses) that reference
 ///    organizations with existing entities but don't yet have entity_feature links
 /// 2. Creating entity_feature records for these new features
 /// 3. Efficiently inserting them in a single database operation
@@ -641,7 +683,8 @@ pub async fn update_entity_features(pool: &PgPool) -> Result<usize> {
 
     let conn = pool.get().await.context("Failed to get DB connection")?;
 
-    // The SQL query has been expanded to include all the indirect paths
+    // The SQL query has been expanded to include all the indirect paths for phones
+    // and the new path for addresses via locations.
     info!("Finding and inserting new features for existing entities...");
     let result = conn
         .execute(
@@ -753,6 +796,18 @@ pub async fn update_entity_features(pool: &PgPool) -> Result<usize> {
                 LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
                     AND ef.table_name = 'contact' AND ef.table_id = c.id
                 WHERE ef.id IS NULL AND c.organization_id IS NOT NULL
+                
+                UNION ALL
+
+                -- Find new addresses (via location) not yet linked to their entities
+                SELECT 'address' as table_name, a.id as table_id, e.id as entity_id
+                FROM public.address a
+                JOIN public.location l ON a.location_id = l.id
+                JOIN public.entity e ON l.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id
+                    AND ef.table_name = 'address' AND ef.table_id = a.id
+                WHERE ef.id IS NULL AND l.organization_id IS NOT NULL
+
             ) as new_features
             ",
             &[],

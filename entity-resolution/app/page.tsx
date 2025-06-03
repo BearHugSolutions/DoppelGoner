@@ -3,7 +3,7 @@ import { Suspense } from "react";
 import { EntityResolutionProvider } from "@/context/entity-resolution-context";
 import ClusterSelector from "@/components/cluster-selector";
 import GraphVisualizer from "@/components/graph-visualizer";
-import ConnectionReviewTools from "@/components/connection-review-tools";
+import ConnectionReviewTools from "@/components/connection-review-tools/connection-review-tools";
 import ResolutionModeSwitcher from "@/components/resolution-mode-switcher"; // Import the new component
 import { Skeleton } from "@/components/ui/skeleton";
 

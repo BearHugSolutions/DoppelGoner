@@ -117,6 +117,14 @@ path = "src/bin/calculate_service_signatures.rs"
 name = "backfill_comparison_cache"
 path = "src/bin/backfill_comparison_cache.rs"
 
+[[bin]]
+name = "address_entity_feature_creation"
+path = "src/bin/address_entity_feature_creation.rs"
+
+[[bin]]
+name = "phone_entity_feature_creation"
+path = "src/bin/phone_entity_feature_creation.rs"
+
 [lib]
 name = "dedupe_lib"
 path = "src/lib.rs"

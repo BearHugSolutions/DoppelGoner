@@ -2,6 +2,16 @@
 
 export type ResolutionMode = "entity" | "service";
 
+// --- Structs for Bulk Node Details ---
+export interface NodeIdentifier {
+  id: string;
+  nodeType: ResolutionMode; // 'entity' or 'service'
+}
+
+export interface BulkNodeDetailsRequest {
+  items: NodeIdentifier[];
+}
+
 // Base entity and cluster types
 export interface Entity {
   id: string;
@@ -16,6 +26,8 @@ export interface Entity {
 export interface Service {
   id: string;
   name: string | null;
+  // Assuming organizationId might be present based on backend models
+  organizationId?: string | null;
   createdAt: Date | string | null;
   updatedAt: Date | string | null;
   source_system: string | null;
@@ -35,10 +47,10 @@ export interface EntityGroup {
   pre_rl_confidence: number | null;
   methodType: string;
   matchValues: MatchValues | null;
-  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | 'DENIED' | string; // Added DENIED based on backend
+  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | 'DENIED' | string;
   createdAt: Date | string | null;
   updatedAt: Date | string | null;
-  groupClusterId?: string | null; // This can become null
+  groupClusterId?: string | null;
   reviewedAt?: Date | string | null;
   reviewerId?: string | null;
   notes?: string | null;
@@ -52,10 +64,10 @@ export interface ServiceGroup {
   pre_rl_confidence: number | null;
   methodType: string;
   matchValues: MatchValues | null;
-  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | 'DENIED' | string; // Added DENIED based on backend
+  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | 'DENIED' | string;
   createdAt: Date | string | null;
   updatedAt: Date | string | null;
-  groupClusterId?: string | null; // This can become null
+  groupClusterId?: string | null;
   reviewedAt?: Date | string | null;
   reviewerId?: string | null;
   notes?: string | null;
@@ -78,7 +90,7 @@ export interface EntityCluster extends BaseCluster {
 
 export interface ServiceCluster extends BaseCluster {
   serviceCount: number | null;
-  serviceGroupCount: number | null;
+  serviceGroupCount: number | null; // Corrected from groupCount
 }
 
 export interface MatchDecisionDetails {
@@ -115,64 +127,53 @@ export interface BaseNode {
   id: string;
   name: string | null;
   sourceSystem?: string | null;
-  sourceId?: string | null;
+  sourceId?: string | null; // previously contributor_id for service, now consistently source_id
   organizationId?: string | null;
-  contributorId?: string | null;
+  // contributorId is deprecated in favor of sourceId for consistency
 }
 export type EntityNode = BaseNode;
 export type ServiceNode = BaseNode;
 
 export interface BaseLink {
   id: string;
-  source: string;
-  target: string;
+  source: string; // node ID
+  target: string; // node ID
   weight: number;
   status?: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
   details?: Record<string, any> | null;
-  createdAt?: Date | string | null;
-  clusterId: string; // Added clusterId to BaseLink for easier cache invalidation
+  createdAt?: Date | string | null; // NaiveDateTime from Rust, so string or Date
+  clusterId: string;
 }
-export type EntityLink = BaseLink;
-export type ServiceLink = BaseLink;
+export type EntityLink = BaseLink; // Can be extended if entity links have unique props not in BaseLink
+export type ServiceLink = BaseLink; // Can be extended if service links have unique props
 
-export interface VisualizationEntityEdgeDetails {
-    methods: Array<{
-      method_type: string;
-      pre_rl_confidence: number;
-      rl_confidence: number;
-      combined_confidence: number;
-    }>;
-    method_count?: number;
-    rl_weight_factor?: number;
-}
-
-export interface VisualizationEntityEdge extends EntityLink { // Inherits clusterId
-  entityId1: string;
-  entityId2: string;
-  edgeWeight: number;
-  details: VisualizationEntityEdgeDetails | null;
+// Specific edge types for connection data (if different from generic links)
+export interface VisualizationEntityEdge extends BaseLink {
+  entityId1: string; // Maps to source
+  entityId2: string; // Maps to target
+  edgeWeight: number; // Maps to weight
+  // details: VisualizationEntityEdgeDetails | null; // Already in BaseLink
   pipelineRunId: string | null;
-  // createdAt is in BaseLink
-  confirmedStatus?: EntityGroup['confirmedStatus'] | string;
+  confirmedStatus?: EntityGroup['confirmedStatus'] | string; // Maps to status
   entity1Name?: string | null;
   entity2Name?: string | null;
   displayWeight?: number | null;
   color?: string | null;
 }
 
-export interface VisualizationServiceEdge extends ServiceLink { // Inherits clusterId
-  serviceId1: string;
-  serviceId2: string;
-  edgeWeight: number;
-  details: Record<string, unknown> | null; // For services, details might be more generic
-  pipelineRunId: string;
-  // createdAt is in BaseLink
-  // confirmedStatus is not in the backend model for service_edge_visualization
+export interface VisualizationServiceEdge extends BaseLink {
+  serviceId1: string; // Maps to source
+  serviceId2: string; // Maps to target
+  edgeWeight: number; // Maps to weight
+  // details: Record<string, unknown> | null; // Already in BaseLink
+  pipelineRunId: string; // Note: Rust model had this as non-optional
+  // confirmedStatus is not directly on service_edge_visualization, status comes from groups
   service1Name?: string | null;
   service2Name?: string | null;
   displayWeight?: number | null;
   color?: string | null;
 }
+
 
 export interface GroupReviewApiPayloadBase {
   decision: GroupReviewDecision;
@@ -191,12 +192,11 @@ export interface GroupReviewApiResponse {
 
 export type GroupReviewDecision = 'ACCEPTED' | 'REJECTED' | string;
 
-// Updated ClusterFinalizationStatusResponse
 export interface ClusterFinalizationStatusResponse {
   status: 'COMPLETED_NO_SPLIT_NEEDED' | 'COMPLETED_SPLIT_DETECTED' | 'PENDING_FULL_REVIEW' | 'CLUSTER_NOT_FOUND' | 'ERROR' | string;
   message: string;
   originalClusterId: string;
-  newClusterIds?: string[]; // Keep as optional, though we don't expect it now
+  newClusterIds?: string[];
 }
 
 export interface ClustersResponse<TCluster extends BaseCluster> {
@@ -209,28 +209,28 @@ export interface ClustersResponse<TCluster extends BaseCluster> {
 export type EntityClustersResponse = ClustersResponse<EntityCluster>;
 export type ServiceClustersResponse = ClustersResponse<ServiceCluster>;
 
-// VisualizationDataResponse now includes clusterId for context
-export interface VisualizationDataResponse<TNode extends BaseNode, TLink extends BaseLink, TGroup> {
-  clusterId: string; // Added to know which cluster this data belongs to
+export interface VisualizationDataResponse<TNode extends BaseNode, TLink extends BaseLink> {
+  clusterId: string;
   nodes: TNode[];
-  links: TLink[];
-  entityGroups: TGroup[] | Record<string, any>; // entityGroups might be specific to the cluster
+  links: TLink[]; // These are generic links, not specific VisualizationEntityEdge/ServiceEdge
+  groups: EntityGroup[] | ServiceGroup[] | Record<string, any>; // Changed from entityGroups
 }
-export type EntityVisualizationDataResponse = VisualizationDataResponse<EntityNode, EntityLink, EntityGroup>;
-export type ServiceVisualizationDataResponse = VisualizationDataResponse<ServiceNode, ServiceLink, ServiceGroup>;
+export type EntityVisualizationDataResponse = VisualizationDataResponse<EntityNode, EntityLink>;
+export type ServiceVisualizationDataResponse = VisualizationDataResponse<ServiceNode, ServiceLink>;
 
 
-// ConnectionDataResponse now includes clusterId for context
 export interface ConnectionDataResponse<TEdge, TGroup, TEntityOrService extends Entity | Service> {
-  edge: TEdge;
-  entityGroups: TGroup[];
+  edge: TEdge; // This will be VisualizationEntityEdge or VisualizationServiceEdge
+  entityGroups: TGroup[]; // For entity mode, TGroup is EntityGroup. For service, ServiceGroup.
   matchDecisions?: MatchDecisionDetails[] | null;
-  entity1: TEntityOrService;
+  entity1: TEntityOrService; // For entity mode, TEntityOrService is Entity. For service, Service.
   entity2: TEntityOrService;
-  clusterId: string; // Added to know which cluster this connection data belongs to
+  clusterId: string;
 }
+
 export type EntityConnectionDataResponse = ConnectionDataResponse<VisualizationEntityEdge, EntityGroup, Entity>;
 export type ServiceConnectionDataResponse = ConnectionDataResponse<VisualizationServiceEdge, ServiceGroup, Service>;
+
 
 export function isEntityConnectionData(
   data: EntityConnectionDataResponse | ServiceConnectionDataResponse,
@@ -290,12 +290,16 @@ export interface QueuedReviewBatch {
   mode: ResolutionMode;
 }
 
-// Progress tracking for each cluster
 export interface ClusterReviewProgress {
   totalEdges: number;
   reviewedEdges: number;
   progressPercentage: number;
   isComplete: boolean;
-  // Optional: Store individual edge statuses within this cluster if needed for quick lookups
-  // edgeStatuses?: Record<string, 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH'>;
+}
+
+export interface NodeDetailResponse {
+  id: string;
+  nodeType: 'entity' | 'service';
+  baseData: Record<string, any>; // Entity or Service (serialized as JSON from backend)
+  attributes: Record<string, any[]>; // e.g., {"address": [{}, {}], "phone": [{}]}
 }
