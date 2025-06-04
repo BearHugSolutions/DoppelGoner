@@ -71,12 +71,16 @@ const LOW_PRIORITY_COMMON_FIELDS = [
 
 interface NodeAttributesDisplayProps {
   nodeDetails: NodeDetailResponse | null | "loading" | "error"; // Updated to include "error"
+  isAttributesOpen: boolean;
+  setIsAttributesOpen: (open: boolean) => void;
 }
 
 const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
   nodeDetails,
+  isAttributesOpen,
+  setIsAttributesOpen,
 }) => {
-  const [isAttributesOpen, setIsAttributesOpen] = useState(false);
+  
 
   if (nodeDetails === "loading") {
     return (
