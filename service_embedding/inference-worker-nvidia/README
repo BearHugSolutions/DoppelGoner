@@ -1,5 +1,0 @@
-# Build the image
-docker build -f Dockerfile.cuda -t inference-worker-cuda:latest .
-
-# Run the container with GPU support
-docker run --gpus all -p 3000:3000 -p 3001:3001 -v $(pwd)/models:/app/models inference-worker-cuda:latest
