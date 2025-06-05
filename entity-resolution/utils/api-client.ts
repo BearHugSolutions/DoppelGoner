@@ -1,5 +1,7 @@
 // utils/api-client.ts
 import type {
+  EntityClustersResponse,
+  ServiceClustersResponse,
   EntityConnectionDataResponse, // For single fetch
   ServiceConnectionDataResponse, // For single fetch
   EntityVisualizationDataResponse, // For single fetch
@@ -15,7 +17,6 @@ import type {
   BulkConnectionsResponse,
   BulkVisualizationsRequest,
   BulkVisualizationsResponse,
-  ClustersResponse,
 } from "@/types/entity-resolution";
 
 const API_BASE_URL = '/api';
@@ -70,17 +71,17 @@ async function validateResponse<T>(
 
 // --- Entity Specific Functions ---
 
-export async function getOrganizationClusters(page: number = 1, limit: number = 10): Promise<ClustersResponse> {
+export async function getEntityClusters(page: number = 1, limit: number = 10): Promise<EntityClustersResponse> {
   const url = `${API_BASE_URL}/clusters?type=entity&page=${page}&limit=${limit}`;
   try {
     const response = await fetch(url);
-    return await validateResponse<ClustersResponse>(response, 'getEntityClusters');
+    return await validateResponse<EntityClustersResponse>(response, 'getEntityClusters');
   } catch (error) {
     return handleApiError(error, `getEntityClusters (url: ${url})`);
   }
 }
 
-export async function getOrganizationConnectionData(edgeId: string): Promise<EntityConnectionDataResponse> {
+export async function getEntityConnectionData(edgeId: string): Promise<EntityConnectionDataResponse> {
   const url = `${API_BASE_URL}/connections/${edgeId}?type=entity`;
   try {
     const response = await fetch(url);
@@ -135,11 +136,11 @@ export async function triggerEntityClusterFinalization(
 
 // --- Service Specific Functions ---
 
-export async function getServiceClusters(page: number = 1, limit: number = 10): Promise<ClustersResponse> {
+export async function getServiceClusters(page: number = 1, limit: number = 10): Promise<ServiceClustersResponse> {
   const url = `${API_BASE_URL}/clusters?type=service&page=${page}&limit=${limit}`;
   try {
     const response = await fetch(url);
-    return await validateResponse<ClustersResponse>(response, 'getServiceClusters');
+    return await validateResponse<ServiceClustersResponse>(response, 'getServiceClusters');
   } catch (error) {
     return handleApiError(error, `getServiceClusters (url: ${url})`);
   }

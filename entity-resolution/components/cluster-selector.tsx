@@ -7,7 +7,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { CheckCircle, ChevronLeft, ChevronRight, Loader2, HelpCircle, Info } from "lucide-react"; 
 import { Progress } from "@/components/ui/progress";
-import type { EntityCluster, ClusterReviewProgress } from "@/types/entity-resolution"; 
+import type { EntityCluster, ServiceCluster, ClusterReviewProgress } from "@/types/entity-resolution"; 
 
 const LARGE_CLUSTER_THRESHOLD = 200; // Ensure this matches context if used here
 
@@ -27,7 +27,9 @@ export default function ClusterSelector() {
       actions.setSelectedClusterId(clusterId);
     } else if (!queries.isVisualizationDataLoaded(clusterId)) {
       const clusterDetail = queries.getClusterById(clusterId);
-      const connectionCount = clusterDetail ? clusterDetail.groupCount : 0;
+      const connectionCount = clusterDetail ? (resolutionMode === 'entity' 
+            ? (clusterDetail as EntityCluster)?.groupCount 
+            : (clusterDetail as ServiceCluster)?.serviceGroupCount) : 0;
       // Use the constant from context if available, or define locally
       const isLarge = connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD; 
 
@@ -94,10 +96,11 @@ export default function ClusterSelector() {
                 pendingEdges: -1,
                 confirmedMatches: 0,
                 confirmedNonMatches: 0,
+                // clusterId: cluster.id, // Removed: Not part of ClusterReviewProgress type
               };
               
-              const entityCount = cluster.entityCount;
-              const groupCount = cluster.groupCount;
+              const entityCount = resolutionMode === 'entity' ? (cluster as EntityCluster).entityCount : (cluster as ServiceCluster).serviceCount;
+              const groupCount = resolutionMode === 'entity' ? (cluster as EntityCluster).groupCount : (cluster as ServiceCluster).serviceGroupCount;
 
               return (
                 <Card

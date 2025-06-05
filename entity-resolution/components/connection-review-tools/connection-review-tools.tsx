@@ -1,7 +1,7 @@
 // components/connection-review-tools.tsx
 "use client";
 
-import { useEffect, useState, useCallback, Key, useMemo } from "react";
+import { useEffect, useState, useCallback, Key } from "react";
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -42,6 +42,9 @@ import type {
   Service,
   EntityConnectionDataResponse,
   ServiceConnectionDataResponse,
+  NodeDetailResponse,
+  EntityCluster, // For groupCount
+  ServiceCluster, // For serviceGroupCount
 } from "@/types/entity-resolution";
 import {
   isEntityConnectionData,
@@ -58,31 +61,58 @@ export default function ConnectionReviewTools() {
     resolutionMode,
     selectedClusterId,
     selectedEdgeId,
-    currentConnectionData,
+    currentConnectionData, // This is data for the *selectedEdgeId*
     currentVisualizationData, // This is the *paged* visualization data for large clusters
     selectedClusterDetails,
     actions,
     queries,
-    reviewQueue, // Added for checking processing state
+    reviewQueue,
     edgeSelectionInfo,
+    // Large cluster specific state from context
     activelyPagingClusterId,
     largeClusterConnectionsPage,
     isLoadingConnectionPageData,
-    isProcessingQueue, // Global queue processing status
   } = useEntityResolution();
   const { toast } = useToast();
 
-  const [isSubmitting, setIsSubmitting] = useState(false); // For accept/reject actions
-  const [isContinuing, setIsContinuing] = useState(false); // For the "Continue" button's action
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [isExpanded, setIsExpanded] = useState(true);
   const [isAttributesOpen, setIsAttributesOpen] = useState(false);
 
+  const edgeStatus = selectedEdgeId
+    ? queries.getEdgeStatus(selectedEdgeId)
+    : null;
+  const isEdgeReviewed = selectedEdgeId
+    ? queries.isEdgeReviewed(selectedEdgeId)
+    : false;
+  const queueStatus = selectedEdgeId
+    ? queries.getQueueItemStatus(selectedEdgeId)
+    : null;
+
+  const isClusterSplit = selectedClusterDetails?.wasSplit || false;
+
+  // Determine if the selected cluster is large and if paging is active for it
+  const connectionCount = selectedClusterDetails
+    ? resolutionMode === "entity"
+      ? (selectedClusterDetails as EntityCluster).groupCount
+      : (selectedClusterDetails as ServiceCluster).serviceGroupCount
+    : 0;
+
+  const isSelectedClusterLarge =
+    connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD;
+  const isPagingActiveForSelectedCluster =
+    selectedClusterId === activelyPagingClusterId &&
+    largeClusterConnectionsPage > 0;
+
   useEffect(() => {
+    // This effect ensures that if an edge is selected (e.g. by auto-advance or click),
+    // its connection data is loaded if not already present or loading.
+    // This is independent of large cluster paging, but works with it.
     if (
       selectedEdgeId &&
-      !currentConnectionData &&
+      !currentConnectionData && // currentConnectionData is for the specific selectedEdgeId
       !queries.isConnectionDataLoading(selectedEdgeId) &&
-      !isLoadingConnectionPageData
+      !isLoadingConnectionPageData // Don't interfere if a page is loading
     ) {
       actions.loadSingleConnectionData(selectedEdgeId);
     }
@@ -96,266 +126,117 @@ export default function ConnectionReviewTools() {
 
   useEffect(() => {
     setIsSubmitting(false);
+    // setIsExpanded(true); // Consider if panel should always expand on new edge
   }, [selectedEdgeId]);
 
-  const handleReviewDecision = useCallback(
-    async (decision: GroupReviewDecision) => {
-      if (!selectedEdgeId) {
-        toast({
-          title: "Error",
-          description: "No connection selected.",
-          variant: "destructive",
-        });
-        return;
-      }
-      // It's okay to access isClusterSplit here as it's derived from context props.
-      if (selectedClusterDetails?.wasSplit) {
-        toast({
-          title: "Info",
-          description: "This cluster has been split and cannot be reviewed.",
-        });
-        return;
-      }
-      // It's okay to access isEdgeReviewed and queueStatusForSelectedEdge here.
-      const currentEdgeIsReviewed = selectedEdgeId
-        ? queries.isEdgeReviewed(selectedEdgeId)
-        : false;
-      const currentQueueStatus = selectedEdgeId
-        ? queries.getQueueItemStatus(selectedEdgeId)
-        : null;
-
-      if (currentEdgeIsReviewed && currentQueueStatus !== "failed") {
-        toast({
-          title: "Already Reviewed",
-          description: "This connection has already been reviewed.",
-        });
-        return;
-      }
-      if (
-        currentQueueStatus === "processing" ||
-        currentQueueStatus === "pending"
-      ) {
-        toast({
-          title: "In Progress",
-          description: "This connection review is already being processed.",
-        });
-        return;
-      }
-
-      setIsSubmitting(true);
-      try {
-        await actions.submitEdgeReview(selectedEdgeId, decision);
-      } catch (error) {
-        toast({
-          title: "Submission Error",
-          description: (error as Error).message,
-          variant: "destructive",
-        });
-      } finally {
-        setIsSubmitting(false);
-      }
-    },
-    [selectedEdgeId, toast, selectedClusterDetails?.wasSplit, queries, actions]
-  );
-
-  const handleRetryLoadConnection = useCallback(() => {
-    if (selectedEdgeId && selectedClusterDetails && selectedClusterDetails.groupCount) {
-      const isLarge = selectedClusterDetails.groupCount > LARGE_CLUSTER_THRESHOLD;
-
-      const isPaging =
-        selectedClusterId === activelyPagingClusterId &&
-        largeClusterConnectionsPage > 0;
-
-      if (isLarge && isPaging) {
-        // selectedClusterId is checked by isPaging and also implicitly by selectedClusterDetails being non-null
-        actions.viewNextConnectionPage(selectedClusterId!);
-      } else {
-        actions.invalidateConnectionData(selectedEdgeId);
-      }
-    } else if (selectedEdgeId) {
-      // Fallback if selectedClusterDetails is null but we have an edgeId, just invalidate connection
-      actions.invalidateConnectionData(selectedEdgeId);
-    }
-  }, [
-    selectedEdgeId,
-    selectedClusterDetails, // Now a direct dependency
-    resolutionMode,
-    selectedClusterId,
-    activelyPagingClusterId,
-    largeClusterConnectionsPage,
-    actions,
-  ]);
-
-  const handleContinueToNext = useCallback(async () => {
-    if (!selectedClusterId) {
+  const handleReviewDecision = async (decision: GroupReviewDecision) => {
+    if (!selectedEdgeId) {
       toast({
-        title: "No Cluster Selected",
-        description: "Cannot continue.",
+        title: "Error",
+        description: "No connection selected.",
         variant: "destructive",
       });
       return;
     }
-    setIsContinuing(true);
-
-    try {
-      const clusterDetails = queries.getClusterById(selectedClusterId);
-      const isClusterMarkedSplit = clusterDetails?.wasSplit || false;
-
-      let isCriticallyProcessing = false;
-      if (isProcessingQueue && currentVisualizationData?.links) {
-        for (const link of currentVisualizationData.links) {
-          if (queries.getQueueItemStatus(link.id) === "processing") {
-            isCriticallyProcessing = true;
-            break;
-          }
-        }
-      }
-
-      if (isCriticallyProcessing) {
-        toast({
-          title: "Processing Active",
-          description:
-            "Current cluster reviews are saving. Advancing to next cluster.",
-          duration: 2500,
-        });
-        await actions.advanceToNextCluster();
-        return;
-      }
-
-      if (isClusterMarkedSplit) {
-        console.log(`Cluster ${selectedClusterId} is split. Advancing.`);
-        await actions.advanceToNextCluster();
-        return;
-      }
-
-      if (edgeSelectionInfo.totalUnreviewedEdgesInCluster > 0) {
-        const unreviewedInCurrentView =
-          currentVisualizationData?.links?.filter(
-            (l) => !queries.isEdgeReviewed(l.id)
-          ) || [];
-        let attemptPagingOrAdvanceCluster = false;
-
-        if (unreviewedInCurrentView.length > 0) {
-          const currentSelectedEdgeIsReviewed = selectedEdgeId
-            ? queries.isEdgeReviewed(selectedEdgeId)
-            : true; // Treat null selectedEdgeId as if it's reviewed for this logic block
-          if (selectedEdgeId && !currentSelectedEdgeIsReviewed) {
-            const otherUnreviewedInView = unreviewedInCurrentView.filter(
-              (l) => l.id !== selectedEdgeId
-            );
-            if (otherUnreviewedInView.length > 0) {
-              console.log(
-                "Continuing to next unreviewed item in current view."
-              );
-              actions.selectNextUnreviewedInCluster();
-            } else {
-              console.log(
-                "Current selection is the only unreviewed in view. Attempting to page or advance cluster."
-              );
-              attemptPagingOrAdvanceCluster = true;
-            }
-          } else {
-            console.log("Selecting first unreviewed item in current view.");
-            actions.selectNextUnreviewedInCluster();
-          }
-        } else {
-          console.log(
-            "Current view exhausted of unreviewed. Attempting to page or advance cluster."
-          );
-          attemptPagingOrAdvanceCluster = true;
-        }
-
-        if (attemptPagingOrAdvanceCluster) {
-          const isLargeAndPaged =
-            selectedClusterId === activelyPagingClusterId &&
-            largeClusterConnectionsPage > 0;
-          const totalLinksInEntireCluster =
-            edgeSelectionInfo.totalEdgesInEntireCluster;
-          const canLoadMorePages =
-            isLargeAndPaged &&
-            largeClusterConnectionsPage * CONNECTION_PAGE_SIZE <
-              totalLinksInEntireCluster;
-
-          if (isLargeAndPaged && canLoadMorePages) {
-            console.log(
-              `Loading next page for large cluster ${selectedClusterId}.`
-            );
-            await actions.viewNextConnectionPage(selectedClusterId);
-          } else {
-            console.warn(
-              `Cluster ${selectedClusterId} has unreviewed items, but current view is exhausted and paging options are limited/done. Advancing to next cluster.`
-            );
-            await actions.advanceToNextCluster();
-          }
-        }
-      } else {
-        console.log(
-          `All connections in cluster ${selectedClusterId} are reviewed. Advancing.`
-        );
-        await actions.advanceToNextCluster();
-      }
-    } catch (error) {
-      console.error("Error in handleContinueToNext:", error);
+    if (isClusterSplit) {
       toast({
-        title: "Error",
-        description: "Could not proceed with navigation.",
+        title: "Info",
+        description: "This cluster has been split and cannot be reviewed.",
+      });
+      return;
+    }
+    if (isEdgeReviewed && queueStatus !== "failed") {
+      toast({
+        title: "Already Reviewed",
+        description: "This connection has already been reviewed.",
+      });
+      return;
+    }
+    if (queueStatus === "processing" || queueStatus === "pending") {
+      toast({
+        title: "In Progress",
+        description: "This connection review is already being processed.",
+      });
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      await actions.submitEdgeReview(selectedEdgeId, decision);
+    } catch (error) {
+      toast({
+        title: "Submission Error",
+        description: (error as Error).message,
         variant: "destructive",
       });
     } finally {
-      setTimeout(() => setIsContinuing(false), 300);
+      setIsSubmitting(false);
     }
-  }, [
-    selectedClusterId,
-    selectedEdgeId,
-    actions,
-    queries,
-    toast,
-    edgeSelectionInfo,
-    currentVisualizationData,
-    activelyPagingClusterId,
-    largeClusterConnectionsPage,
-    isProcessingQueue,
-  ]);
+  };
 
-  const handleRetryQueueItem = useCallback(() => {
+  const handleRetryLoadConnection = useCallback(() => {
     if (selectedEdgeId) {
-      const currentQueueStatus = queries.getQueueItemStatus(selectedEdgeId);
-      if (currentQueueStatus === "failed") {
-        const batchToRetry = reviewQueue.find(
-          (b: QueuedReviewBatch) =>
-            b.edgeId === selectedEdgeId && b.isTerminalFailure
-        );
-        if (batchToRetry) {
-          actions.retryFailedBatch(batchToRetry.batchId);
-          toast({
-            title: "Retrying Submission",
-            description: `Retrying review for connection ${selectedEdgeId.substring(
-              0,
-              8
-            )}...`,
-          });
-        } else {
-          toast({
-            title: "Retry Error",
-            description: "Could not find failed batch to retry.",
-            variant: "destructive",
-          });
-        }
+      // For a paged large cluster, retrying might mean re-requesting the current page's connection data
+      // For a non-paged or single edge, it's simpler.
+      if (isSelectedClusterLarge && isPagingActiveForSelectedCluster) {
+        // Re-load connection data for the current page
+        actions.viewNextConnectionPage(selectedClusterId!); // This reloads current page if called with same page, effectively
+        // A more direct "reloadCurrentPageConnectionData" might be better in context if viewNext always advances.
+        // For now, let's assume viewNextConnectionPage can handle reloading current page if needed, or we add a specific action.
+        // A simpler approach for retry might be to invalidate and let useEffect pick it up.
+        actions.invalidateConnectionData(selectedEdgeId);
+      } else {
+        actions.invalidateConnectionData(selectedEdgeId);
       }
     }
-  }, [selectedEdgeId, reviewQueue, actions, queries, toast]);
+  }, [
+    selectedEdgeId,
+    actions,
+    isSelectedClusterLarge,
+    isPagingActiveForSelectedCluster,
+    selectedClusterId,
+  ]);
 
-  const handleInitializeLargeClusterPaging = useCallback(async () => {
+  const handleSkipToNext = useCallback(() => {
+    actions.selectNextUnreviewedEdge(selectedEdgeId || undefined);
+  }, [actions, selectedEdgeId]);
+
+  const handleRetryQueueItem = () => {
+    if (selectedEdgeId && queueStatus === "failed") {
+      const batchToRetry = reviewQueue.find(
+        (b: QueuedReviewBatch) =>
+          b.edgeId === selectedEdgeId && b.isTerminalFailure
+      );
+      if (batchToRetry) {
+        actions.retryFailedBatch(batchToRetry.batchId);
+        toast({
+          title: "Retrying Submission",
+          description: `Retrying review for connection ${selectedEdgeId.substring(
+            0,
+            8
+          )}...`,
+        });
+      } else {
+        toast({
+          title: "Retry Error",
+          description: "Could not find failed batch to retry.",
+          variant: "destructive",
+        });
+      }
+    }
+  };
+
+  const handleInitializeLargeClusterPaging = async () => {
     if (selectedClusterId) {
       await actions.initializeLargeClusterConnectionPaging(selectedClusterId);
     }
-  }, [selectedClusterId, actions]);
+  };
 
-  const handleViewNextConnectionPage = useCallback(async () => {
+  const handleViewNextConnectionPage = async () => {
     if (selectedClusterId) {
       await actions.viewNextConnectionPage(selectedClusterId);
     }
-  }, [selectedClusterId, actions]);
+  };
 
   const handlePreviousUnreviewed = useCallback(() => {
     actions.selectPreviousUnreviewedInCluster();
@@ -365,34 +246,17 @@ export default function ConnectionReviewTools() {
     actions.selectNextUnreviewedInCluster();
   }, [actions]);
 
-  // Moved isAnyOperationPending useMemo hook and its dependent variable definitions here
-  // Ensure variables used by isAnyOperationPending are defined before it.
   const isLoadingUI = selectedEdgeId
     ? queries.isConnectionDataLoading(selectedEdgeId)
     : false;
-  const isPagingActiveForSelectedCluster =
-    selectedClusterId === activelyPagingClusterId &&
-    largeClusterConnectionsPage > 0;
+  const errorUI = selectedEdgeId
+    ? queries.getConnectionError(selectedEdgeId)
+    : null;
+  const nodeLabel = resolutionMode === "entity" ? "Entity" : "Service";
 
-  const isAnyOperationPending = useMemo(() => {
-    return (
-      isSubmitting ||
-      isLoadingUI ||
-      (isLoadingConnectionPageData && isPagingActiveForSelectedCluster) ||
-      isContinuing ||
-      isProcessingQueue
-    );
-  }, [
-    isSubmitting,
-    isLoadingUI,
-    isLoadingConnectionPageData,
-    isPagingActiveForSelectedCluster,
-    isContinuing,
-    isProcessingQueue,
-  ]);
-
-  // Conditional returns start here. All hooks must be above this line.
+  // UI display conditions
   if (!selectedClusterId) {
+    // If no cluster is selected at all
     return (
       <div className="flex justify-center items-center h-[100px] text-muted-foreground p-4 border rounded-md bg-card shadow">
         Select a cluster to begin reviewing connections.
@@ -400,10 +264,7 @@ export default function ConnectionReviewTools() {
     );
   }
 
-  const connectionCount = selectedClusterDetails?.groupCount || 0;
-  const isSelectedClusterLarge =
-    connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD;
-
+  // If selected cluster is large AND connection paging has NOT been initialized for it
   if (isSelectedClusterLarge && !isPagingActiveForSelectedCluster) {
     return (
       <Card className="h-full flex flex-col items-center justify-center p-4">
@@ -421,7 +282,7 @@ export default function ConnectionReviewTools() {
           </p>
           <Button
             onClick={handleInitializeLargeClusterPaging}
-            disabled={isLoadingConnectionPageData || isAnyOperationPending}
+            disabled={isLoadingConnectionPageData}
             size="lg"
             className="w-full"
           >
@@ -437,11 +298,13 @@ export default function ConnectionReviewTools() {
     );
   }
 
+  // If no edge is selected WITHIN an initialized (possibly paged) cluster
   if (
     !selectedEdgeId &&
     (isPagingActiveForSelectedCluster || !isSelectedClusterLarge)
   ) {
     if (isLoadingConnectionPageData && isSelectedClusterLarge) {
+      // Loading first page for large cluster
       return (
         <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
           <Loader2 className="h-6 w-6 animate-spin text-primary mr-2" />{" "}
@@ -463,6 +326,7 @@ export default function ConnectionReviewTools() {
     );
   }
 
+  // Loading state for a specific edge's connection data (currentConnectionData)
   if (isLoadingUI && !currentConnectionData) {
     return (
       <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
@@ -471,10 +335,7 @@ export default function ConnectionReviewTools() {
     );
   }
 
-  const errorUI = selectedEdgeId
-    ? queries.getConnectionError(selectedEdgeId)
-    : null;
-
+  // Error state for a specific edge's connection data
   if (errorUI && !currentConnectionData) {
     return (
       <Card className="h-full flex flex-col items-center justify-center">
@@ -496,7 +357,6 @@ export default function ConnectionReviewTools() {
               variant="outline"
               size="sm"
               onClick={handleRetryLoadConnection}
-              disabled={isAnyOperationPending}
             >
               <RefreshCw className="h-4 w-4 mr-1" /> Retry
             </Button>
@@ -504,7 +364,6 @@ export default function ConnectionReviewTools() {
               variant="outline"
               size="sm"
               onClick={() => actions.setSelectedEdgeId(null)}
-              disabled={isAnyOperationPending}
             >
               Clear Selection
             </Button>
@@ -514,8 +373,10 @@ export default function ConnectionReviewTools() {
     );
   }
 
+  // If currentConnectionData is still null after checks (should be rare if selectedEdgeId is set)
   if (!currentConnectionData && selectedEdgeId) {
     if (!isLoadingUI && !errorUI) {
+      // Not loading, no error, but no data. Potentially still initializing.
       return (
         <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
           <Loader2 className="h-6 w-6 animate-spin text-primary mr-2" /> Loading
@@ -523,7 +384,7 @@ export default function ConnectionReviewTools() {
         </div>
       );
     }
-    return null;
+    return null; // Should be covered by loading/error states
   }
 
   let edgeDetails:
@@ -551,10 +412,13 @@ export default function ConnectionReviewTools() {
       console.error(
         "Connection data type and resolution mode mismatch or data is of an unexpected non-null type."
       );
+      // UI for this error state
     }
   }
 
   if (!node1 || !node2 || !edgeDetails) {
+    // This state might occur if selectedEdgeId is set, but its data hasn't loaded yet,
+    // or if it's a new edge on a paged large cluster whose data is still fetching.
     if (
       isLoadingUI ||
       (isLoadingConnectionPageData && isPagingActiveForSelectedCluster)
@@ -584,7 +448,6 @@ export default function ConnectionReviewTools() {
             size="sm"
             onClick={handleRetryLoadConnection}
             className="mt-2"
-            disabled={isAnyOperationPending}
           >
             <RefreshCw className="h-4 w-4 mr-1" /> Retry Load
           </Button>
@@ -596,27 +459,14 @@ export default function ConnectionReviewTools() {
   const node1Details = queries.getNodeDetail(node1.id);
   const node2Details = queries.getNodeDetail(node2.id);
 
-  const edgeStatus = selectedEdgeId
-    ? queries.getEdgeStatus(selectedEdgeId)
-    : null;
-  const isEdgeReviewed = selectedEdgeId
-    ? queries.isEdgeReviewed(selectedEdgeId)
-    : false;
-  const queueStatusForSelectedEdge = selectedEdgeId
-    ? queries.getQueueItemStatus(selectedEdgeId)
-    : null;
-  const isClusterSplit = selectedClusterDetails?.wasSplit || false;
-
   const showReviewButtons =
-    (!isEdgeReviewed || queueStatusForSelectedEdge === "failed") &&
-    !isClusterSplit;
+    (!isEdgeReviewed || queueStatus === "failed") && !isClusterSplit;
 
   const totalLinksInEntireCluster = edgeSelectionInfo.totalEdgesInEntireCluster;
   const canLoadMoreConnections =
     isPagingActiveForSelectedCluster &&
     largeClusterConnectionsPage * CONNECTION_PAGE_SIZE <
       totalLinksInEntireCluster;
-  const nodeLabel = resolutionMode === "entity" ? "Entity" : "Service";
 
   return (
     <Collapsible
@@ -628,32 +478,36 @@ export default function ConnectionReviewTools() {
         <div className="flex items-center gap-2 flex-wrap">
           <h3 className="text-lg font-medium">{nodeLabel} Connection Review</h3>
           {(isLoadingUI ||
-            (isLoadingConnectionPageData && isPagingActiveForSelectedCluster) ||
-            isContinuing) && (
+            (isLoadingConnectionPageData &&
+              isPagingActiveForSelectedCluster)) && (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
           )}
-          {queueStatusForSelectedEdge === "processing" && (
+          {/* Status Badges */}
+          {queueStatus === "processing" && (
             <Badge
               variant="outline"
               className="bg-blue-50 text-blue-700 border-blue-300"
             >
-              <Loader2 className="h-3 w-3 mr-1 animate-spin" /> Processing
+              {" "}
+              <Loader2 className="h-3 w-3 mr-1 animate-spin" /> Processing{" "}
             </Badge>
           )}
-          {queueStatusForSelectedEdge === "pending" && (
+          {queueStatus === "pending" && (
             <Badge
               variant="outline"
               className="bg-yellow-50 text-yellow-700 border-yellow-300"
             >
-              <Info className="h-3 w-3 mr-1" /> Queued
+              {" "}
+              <Info className="h-3 w-3 mr-1" /> Queued{" "}
             </Badge>
           )}
-          {queueStatusForSelectedEdge === "failed" && (
+          {queueStatus === "failed" && (
             <Badge variant="destructive">
-              <AlertTriangle className="h-3 w-3 mr-1" /> Failed
+              {" "}
+              <AlertTriangle className="h-3 w-3 mr-1" /> Failed{" "}
             </Badge>
           )}
-          {isEdgeReviewed && !queueStatusForSelectedEdge && !isClusterSplit && (
+          {isEdgeReviewed && !queueStatus && !isClusterSplit && (
             <Badge
               variant={
                 edgeStatus === "CONFIRMED_MATCH" ? "default" : "secondary"
@@ -664,12 +518,13 @@ export default function ConnectionReviewTools() {
                   : "bg-red-100 text-red-800 border-red-300"
               }`}
             >
+              {" "}
               {edgeStatus === "CONFIRMED_MATCH" ? (
                 <CheckCircle className="h-3 w-3 mr-1" />
               ) : (
                 <XCircle className="h-3 w-3 mr-1" />
-              )}
-              {edgeStatus === "CONFIRMED_MATCH" ? "Match" : "Non-Match"}
+              )}{" "}
+              {edgeStatus === "CONFIRMED_MATCH" ? "Match" : "Non-Match"}{" "}
             </Badge>
           )}
           {isClusterSplit && (
@@ -677,7 +532,8 @@ export default function ConnectionReviewTools() {
               variant="outline"
               className="bg-gray-100 text-gray-700 border-gray-300"
             >
-              <Info className="h-3 w-3 mr-1" /> Cluster Split
+              {" "}
+              <Info className="h-3 w-3 mr-1" /> Cluster Split{" "}
             </Badge>
           )}
           {isPagingActiveForSelectedCluster && (
@@ -696,7 +552,7 @@ export default function ConnectionReviewTools() {
           )}
         </div>
         <CollapsibleTrigger asChild>
-          <Button variant="ghost" size="sm" disabled={isAnyOperationPending}>
+          <Button variant="ghost" size="sm">
             {isExpanded ? (
               <ChevronUp className="h-4 w-4" />
             ) : (
@@ -714,16 +570,21 @@ export default function ConnectionReviewTools() {
               <p className="text-sm text-muted-foreground">
                 Do these records represent the same real-world {resolutionMode}?
               </p>
-              {edgeSelectionInfo.totalUnreviewedEdgesInCluster > 0 &&
+
+              {/* Navigation for unreviewed connections (operates on current view) */}
+              {edgeSelectionInfo.totalUnreviewedEdgesInCluster > 0 && // Check total unreviewed in *entire* cluster
                 !isClusterSplit &&
-                edgeSelectionInfo.totalEdges > 0 && (
+                edgeSelectionInfo.totalEdges > 0 && ( // Check edges in current view
                   <div className="flex justify-center items-center gap-2 mb-3">
                     <Button
                       variant="outline"
                       size="icon"
                       onClick={handlePreviousUnreviewed}
                       disabled={
-                        isAnyOperationPending ||
+                        isSubmitting ||
+                        isLoadingUI ||
+                        queueStatus === "processing" ||
+                        queueStatus === "pending" ||
                         edgeSelectionInfo.totalEdges <= 0
                       }
                       aria-label="Previous unreviewed connection in view"
@@ -734,12 +595,12 @@ export default function ConnectionReviewTools() {
                       {edgeSelectionInfo.currentUnreviewedEdgeIndexInCluster !==
                         -1 &&
                       edgeSelectionInfo.totalUnreviewedEdgesInCluster > 0
-                        ? `Unreviewed ${
+                        ? `Viewing unreviewed ${
                             edgeSelectionInfo.currentUnreviewedEdgeIndexInCluster +
                             1
                           } of ${
                             edgeSelectionInfo.totalUnreviewedEdgesInCluster
-                          } (cluster total)`
+                          } (total in cluster)`
                         : edgeSelectionInfo.totalUnreviewedEdgesInCluster > 0
                         ? `${edgeSelectionInfo.totalUnreviewedEdgesInCluster} unreviewed in cluster`
                         : `No unreviewed in cluster`}
@@ -749,7 +610,10 @@ export default function ConnectionReviewTools() {
                       size="icon"
                       onClick={handleNextUnreviewed}
                       disabled={
-                        isAnyOperationPending ||
+                        isSubmitting ||
+                        isLoadingUI ||
+                        queueStatus === "processing" ||
+                        queueStatus === "pending" ||
                         edgeSelectionInfo.totalEdges <= 0
                       }
                       aria-label="Next unreviewed connection in view"
@@ -766,10 +630,16 @@ export default function ConnectionReviewTools() {
                   size="sm"
                   onClick={() => handleReviewDecision("REJECTED")}
                   disabled={
-                    isAnyOperationPending || isClusterSplit || !selectedEdgeId
+                    isSubmitting ||
+                    isLoadingUI ||
+                    queueStatus === "processing" ||
+                    queueStatus === "pending" ||
+                    isClusterSplit ||
+                    !selectedEdgeId
                   }
                 >
-                  <X className="h-4 w-4 mr-1" /> Not a Match
+                  {" "}
+                  <X className="h-4 w-4 mr-1" /> Not a Match{" "}
                 </Button>
                 <Button
                   variant="default"
@@ -777,21 +647,28 @@ export default function ConnectionReviewTools() {
                   size="sm"
                   onClick={() => handleReviewDecision("ACCEPTED")}
                   disabled={
-                    isAnyOperationPending || isClusterSplit || !selectedEdgeId
+                    isSubmitting ||
+                    isLoadingUI ||
+                    queueStatus === "processing" ||
+                    queueStatus === "pending" ||
+                    isClusterSplit ||
+                    !selectedEdgeId
                   }
                 >
-                  <Check className="h-4 w-4 mr-1" /> Confirm Match
+                  {" "}
+                  <Check className="h-4 w-4 mr-1" /> Confirm Match{" "}
                 </Button>
               </div>
-              {queueStatusForSelectedEdge === "failed" && !isClusterSplit && (
+              {queueStatus === "failed" && !isClusterSplit && (
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={handleRetryQueueItem}
                   className="w-full mt-2 border-amber-500 text-amber-600 hover:bg-amber-50"
-                  disabled={isAnyOperationPending}
+                  disabled={isSubmitting || isLoadingUI}
                 >
-                  <RotateCcw className="h-4 w-4 mr-1" /> Retry Failed Submission
+                  {" "}
+                  <RotateCcw className="h-4 w-4 mr-1" /> Retry Failed Submission{" "}
                 </Button>
               )}
             </div>
@@ -817,16 +694,18 @@ export default function ConnectionReviewTools() {
                     )}
                     <div>
                       <h4 className="font-semibold text-sm">
+                        {" "}
                         {isClusterSplit
                           ? "Cluster Split"
                           : edgeStatus === "CONFIRMED_MATCH"
                           ? "Match Confirmed"
-                          : "Non-Match Confirmed"}
+                          : "Non-Match Confirmed"}{" "}
                       </h4>
                       <p className="text-xs text-muted-foreground">
+                        {" "}
                         {isClusterSplit
                           ? "This cluster has been processed and split."
-                          : "This connection has been reviewed."}
+                          : "This connection has been reviewed."}{" "}
                       </p>
                     </div>
                   </div>
@@ -835,32 +714,26 @@ export default function ConnectionReviewTools() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={handleContinueToNext}
+                onClick={handleSkipToNext}
                 className="w-full"
                 disabled={
-                  Boolean(
-                    isAnyOperationPending ||
-                    (selectedClusterId &&
-                      edgeSelectionInfo.totalUnreviewedEdgesInCluster === 0 &&
-                      queries.getClusterProgress(selectedClusterId)?.isComplete &&
-                      !queries.canAdvanceToNextCluster())
-                  )
+                  isLoadingUI ||
+                  (isLoadingConnectionPageData &&
+                    isPagingActiveForSelectedCluster)
                 }
               >
-                {isContinuing ? (
-                  <Loader2 className="h-4 w-4 mr-1 animate-spin" />
-                ) : (
-                  <SkipForward className="h-4 w-4 mr-1" />
-                )}
-                Continue to Next Unreviewed/Cluster
+                {" "}
+                <SkipForward className="h-4 w-4 mr-1" /> Continue to Next
+                Unreviewed/Cluster{" "}
               </Button>
             </div>
           )}
 
+          {/* Load More Button for Large Clusters */}
           {isPagingActiveForSelectedCluster && canLoadMoreConnections && (
             <Button
               onClick={handleViewNextConnectionPage}
-              disabled={isLoadingConnectionPageData || isAnyOperationPending}
+              disabled={isLoadingConnectionPageData}
               variant="secondary"
               className="w-full mt-2"
             >
@@ -884,49 +757,57 @@ export default function ConnectionReviewTools() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <Card>
+              {" "}
               <CardHeader className="p-3">
-                <CardTitle className="text-sm">{nodeLabel} 1 Details</CardTitle>
-              </CardHeader>
+                {" "}
+                <CardTitle className="text-sm">
+                  {nodeLabel} 1 Details
+                </CardTitle>{" "}
+              </CardHeader>{" "}
               <CardContent className="p-3 pt-0">
-                <NodeAttributesDisplay
-                  nodeDetails={node1Details}
-                  setIsAttributesOpen={setIsAttributesOpen}
-                  isAttributesOpen={isAttributesOpen}
-                />
-              </CardContent>
+                {" "}
+                <NodeAttributesDisplay nodeDetails={node1Details} setIsAttributesOpen={setIsAttributesOpen} isAttributesOpen={isAttributesOpen}/>{" "}
+              </CardContent>{" "}
             </Card>
             <Card>
+              {" "}
               <CardHeader className="p-3">
-                <CardTitle className="text-sm">{nodeLabel} 2 Details</CardTitle>
-              </CardHeader>
+                {" "}
+                <CardTitle className="text-sm">
+                  {nodeLabel} 2 Details
+                </CardTitle>{" "}
+              </CardHeader>{" "}
               <CardContent className="p-3 pt-0">
-                <NodeAttributesDisplay
-                  nodeDetails={node2Details}
-                  setIsAttributesOpen={setIsAttributesOpen}
-                  isAttributesOpen={isAttributesOpen}
-                />
-              </CardContent>
+                {" "}
+                <NodeAttributesDisplay nodeDetails={node2Details} setIsAttributesOpen={setIsAttributesOpen} isAttributesOpen={isAttributesOpen}/>{" "}
+              </CardContent>{" "}
             </Card>
           </div>
 
           <Tabs defaultValue="matching-methods">
             <TabsList className="grid w-full grid-cols-1">
+              {" "}
               <TabsTrigger value="matching-methods">
-                Matching Methods
-              </TabsTrigger>
+                {" "}
+                Matching Methods{" "}
+              </TabsTrigger>{" "}
             </TabsList>
             <TabsContent value="matching-methods" className="space-y-3">
               <Card>
                 <CardHeader className="p-3">
+                  {" "}
                   <CardTitle className="text-sm flex justify-between items-center">
-                    <span>Matching Methods</span>
+                    {" "}
+                    <span>Matching Methods</span>{" "}
                     <span className="text-xs font-normal">
+                      {" "}
                       Overall Confidence:{" "}
                       <span className="font-medium">
-                        {edgeDetails?.edgeWeight?.toFixed(2) ?? "N/A"}
-                      </span>
-                    </span>
-                  </CardTitle>
+                        {" "}
+                        {edgeDetails?.edgeWeight?.toFixed(2) ?? "N/A"}{" "}
+                      </span>{" "}
+                    </span>{" "}
+                  </CardTitle>{" "}
                 </CardHeader>
                 <CardContent className="p-3 pt-0">
                   {resolutionMode === "entity" &&
@@ -968,29 +849,38 @@ export default function ConnectionReviewTools() {
                               }
                               className="grid grid-cols-[1fr_auto_auto_auto] gap-2 items-center text-xs"
                             >
+                              {" "}
                               <div>
+                                {" "}
                                 {method.method_type?.replace(/_/g, " ") ??
-                                  "Unknown Method"}
-                              </div>
+                                  "Unknown Method"}{" "}
+                              </div>{" "}
                               <div className="text-right">
+                                {" "}
                                 <span className="text-xs text-muted-foreground">
+                                  {" "}
                                   Pre-RL:{" "}
-                                </span>
-                                {method.pre_rl_confidence?.toFixed(2) ?? "N/A"}
-                              </div>
+                                </span>{" "}
+                                {method.pre_rl_confidence?.toFixed(2) ??
+                                  "N/A"}{" "}
+                              </div>{" "}
                               <div className="text-right">
+                                {" "}
                                 <span className="text-xs text-muted-foreground">
+                                  {" "}
                                   RL:{" "}
-                                </span>
-                                {method.rl_confidence?.toFixed(2) ?? "N/A"}
-                              </div>
+                                </span>{" "}
+                                {method.rl_confidence?.toFixed(2) ?? "N/A"}{" "}
+                              </div>{" "}
                               <div className="text-right font-medium">
+                                {" "}
                                 <span className="text-xs text-muted-foreground">
+                                  {" "}
                                   Combined:{" "}
-                                </span>
+                                </span>{" "}
                                 {method.combined_confidence?.toFixed(2) ??
-                                  "N/A"}
-                              </div>
+                                  "N/A"}{" "}
+                              </div>{" "}
                             </div>
                           )
                         )}
@@ -1007,29 +897,37 @@ export default function ConnectionReviewTools() {
                             key={group.id || index}
                             className="grid grid-cols-[1fr_auto_auto] gap-2 items-center text-xs"
                           >
+                            {" "}
                             <div>
+                              {" "}
                               {group.methodType?.replace(/_/g, " ") ??
-                                "Unknown Group Method"}
-                            </div>
+                                "Unknown Group Method"}{" "}
+                            </div>{" "}
                             <div className="text-right">
+                              {" "}
                               <span className="text-xs text-muted-foreground">
+                                {" "}
                                 Pre-RL:{" "}
-                              </span>
-                              {group.preRlConfidenceScore?.toFixed(2) ?? "N/A"}
-                            </div>
+                              </span>{" "}
+                              {group.preRlConfidenceScore?.toFixed(2) ??
+                                "N/A"}{" "}
+                            </div>{" "}
                             <div className="text-right font-medium">
+                              {" "}
                               <span className="text-xs text-muted-foreground">
+                                {" "}
                                 Combined:{" "}
-                              </span>
-                              {group.confidenceScore?.toFixed(2) ?? "N/A"}
-                            </div>
+                              </span>{" "}
+                              {group.confidenceScore?.toFixed(2) ?? "N/A"}{" "}
+                            </div>{" "}
                           </div>
                         ))}
                       </div>
                     ) : (
                       <p className="text-xs text-muted-foreground">
+                        {" "}
                         No detailed matching methods or entity groups available
-                        for this connection.
+                        for this connection.{" "}
                       </p>
                     )
                   ) : resolutionMode === "service" &&
@@ -1043,23 +941,26 @@ export default function ConnectionReviewTools() {
                     (currentConnectionData as ServiceConnectionDataResponse)
                       .edge?.details ? (
                       <pre className="text-xs bg-muted p-2 rounded-md overflow-x-auto">
+                        {" "}
                         {JSON.stringify(
                           (
                             currentConnectionData as ServiceConnectionDataResponse
                           ).edge.details,
                           null,
                           2
-                        )}
+                        )}{" "}
                       </pre>
                     ) : (
                       <p className="text-xs text-muted-foreground">
+                        {" "}
                         No specific matching methods detailed for this service
-                        connection.
+                        connection.{" "}
                       </p>
                     )
                   ) : (
                     <p className="text-xs text-muted-foreground">
-                      Matching method details unavailable or mode/data mismatch.
+                      {" "}
+                      Matching method details unavailable or mode/data mismatch.{" "}
                     </p>
                   )}
                 </CardContent>
@@ -1068,9 +969,11 @@ export default function ConnectionReviewTools() {
               {groupsForEdge.length > 0 && (
                 <Card>
                   <CardHeader className="p-3">
+                    {" "}
                     <CardTitle className="text-sm">
-                      Underlying Group Details ({groupsForEdge.length})
-                    </CardTitle>
+                      {" "}
+                      Underlying Group Details ({groupsForEdge.length}){" "}
+                    </CardTitle>{" "}
                   </CardHeader>
                   <CardContent className="p-3 pt-0 space-y-2">
                     {groupsForEdge.map((group) => (
@@ -1078,11 +981,15 @@ export default function ConnectionReviewTools() {
                         key={group.id}
                         className="rounded-md border bg-muted/30 p-2"
                       >
+                        {" "}
                         <div className="flex justify-between items-center mb-1">
+                          {" "}
                           <span className="text-xs font-medium capitalize">
-                            {group.methodType.replace(/_/g, " ")} Match Group
-                          </span>
+                            {" "}
+                            {group.methodType.replace(/_/g, " ")} Match Group{" "}
+                          </span>{" "}
                           <div className="flex gap-2 items-center">
+                            {" "}
                             <Badge
                               variant={
                                 group.confirmedStatus === "CONFIRMED_MATCH"
@@ -1101,33 +1008,38 @@ export default function ConnectionReviewTools() {
                                   : ""
                               }`}
                             >
+                              {" "}
                               {group.confirmedStatus?.replace(/_/g, " ") ??
-                                "Pending"}
-                            </Badge>
+                                "Pending"}{" "}
+                            </Badge>{" "}
                             <span className="text-xs text-muted-foreground">
+                              {" "}
                               Score:{" "}
                               {group.confidenceScore
                                 ? group.confidenceScore.toFixed(3)
-                                : "N/A"}
-                            </span>
-                          </div>
-                        </div>
+                                : "N/A"}{" "}
+                            </span>{" "}
+                          </div>{" "}
+                        </div>{" "}
                         <div className="text-xs text-muted-foreground space-y-0.5">
+                          {" "}
                           {Object.entries(group.matchValues?.values || {})
                             .map(([key, val]) => (
                               <div key={key} className="truncate">
+                                {" "}
                                 <span className="font-medium capitalize">
+                                  {" "}
                                   {key
                                     .replace(/_/g, " ")
                                     .replace(/normalized|original|1|2/gi, "")
-                                    .trim()}
+                                    .trim()}{" "}
                                   :{" "}
-                                </span>
-                                {String(val)}
+                                </span>{" "}
+                                {String(val)}{" "}
                               </div>
                             ))
-                            .slice(0, 3)}
-                        </div>
+                            .slice(0, 3)}{" "}
+                        </div>{" "}
                       </div>
                     ))}
                   </CardContent>

@@ -10,6 +10,7 @@ import {
   EntityGroup,
   EntityLink,
   EntityGroupReviewApiPayload,
+  ServiceCluster,
   ServiceVisualizationDataResponse,
   ServiceGroup,
   ServiceLink,
@@ -28,6 +29,7 @@ import {
   ClusterReviewProgress, 
 } from "@/types/entity-resolution";
 import {
+  getEntityClusters,
   postEntityGroupFeedback,
   triggerEntityClusterFinalization,
   getServiceClusters,
@@ -36,7 +38,6 @@ import {
   getBulkNodeDetails,
   getBulkConnections,
   getBulkVisualizations,
-  getOrganizationClusters,
 } from "@/utils/api-client";
 import {
   createContext,
@@ -115,7 +116,7 @@ export interface EntityResolutionContextType {
   refreshTrigger: number;
   isAutoAdvanceEnabled: boolean;
 
-  clusters: ClustersState<EntityCluster>;
+  clusters: ClustersState<EntityCluster | ServiceCluster>;
   visualizationData: Record<
     string,
     VisualizationState<
@@ -144,7 +145,7 @@ export interface EntityResolutionContextType {
     | EntityConnectionDataResponse
     | ServiceConnectionDataResponse
     | null;
-  selectedClusterDetails: EntityCluster | null;
+  selectedClusterDetails: EntityCluster | ServiceCluster | null;
 
   activelyPagingClusterId: string | null;
   largeClusterConnectionsPage: number; 
@@ -206,7 +207,7 @@ export interface EntityResolutionContextType {
     ) => "pending" | "processing" | "failed" | null;
     getClusterById: (
       clusterId: string
-    ) => EntityCluster | undefined;
+    ) => EntityCluster | ServiceCluster | undefined;
     getNodeDetail: (
       nodeId: string
     ) => NodeDetailResponse | null | "loading" | "error";
@@ -219,7 +220,7 @@ const EntityResolutionContext = createContext<
 
 const MAX_REVIEW_ATTEMPTS = 3;
 
-const initialClustersState: ClustersState<EntityCluster> = {
+const initialClustersState: ClustersState<EntityCluster | ServiceCluster> = {
   data: [],
   total: 0,
   page: 1,
@@ -253,7 +254,7 @@ export function EntityResolutionProvider({
     useState<boolean>(true);
 
   const [clusters, setClusters] =
-    useState<ClustersState<EntityCluster>>(
+    useState<ClustersState<EntityCluster | ServiceCluster>>(
       initialClustersState
     );
   const [visualizationData, setVisualizationData] = useState<
@@ -286,7 +287,7 @@ export function EntityResolutionProvider({
 
 
   const getClusterById = useCallback(
-    (clusterId: string): EntityCluster | undefined => {
+    (clusterId: string): EntityCluster | ServiceCluster | undefined => {
       return clusters.data.find((c) => c.id === clusterId);
     },
     [clusters.data]
@@ -337,7 +338,9 @@ export function EntityResolutionProvider({
 
         if (linksForProgress.length === 0) {
           if (clusterDetails) {
-            const count = clusterDetails.groupCount;
+            const count = resolutionMode === 'entity' 
+              ? (clusterDetails as EntityCluster).groupCount 
+              : (clusterDetails as ServiceCluster).serviceGroupCount;
 
             if (count === 0) { 
               return {
@@ -628,8 +631,10 @@ export function EntityResolutionProvider({
     const connectionRequestItemsForNonLarge: BulkConnectionRequestItem[] = [];
     allFetchedVisualizations.forEach(vizData => {
         const clusterDetail = getClusterById(vizData.clusterId); 
-        const connectionCount = clusterDetail ? (clusterDetail as EntityCluster)?.groupCount : undefined; 
-        if (connectionCount !== undefined && connectionCount !== null && connectionCount <= LARGE_CLUSTER_THRESHOLD) { 
+        const connectionCount = clusterDetail ? (resolutionMode === 'entity' 
+            ? (clusterDetail as EntityCluster)?.groupCount 
+            : (clusterDetail as ServiceCluster)?.serviceGroupCount) : undefined; // Handle undefined clusterDetail
+        if (connectionCount !== undefined && connectionCount !== null && connectionCount <= LARGE_CLUSTER_THRESHOLD) { // If count is undefined, assume not large for safety
             vizData.links.forEach(link => connectionRequestItemsForNonLarge.push({ edgeId: link.id, itemType: resolutionMode }));
         }
     });
@@ -758,7 +763,7 @@ export function EntityResolutionProvider({
         limit,
       }));
       const fetcher =
-        resolutionMode === "entity" ? getOrganizationClusters : getServiceClusters;
+        resolutionMode === "entity" ? getEntityClusters : getServiceClusters;
 
       try {
         const response = await fetcher(page, limit);
@@ -767,7 +772,7 @@ export function EntityResolutionProvider({
           response
         );
         setClusters({
-          data: response.clusters as Array<EntityCluster>,
+          data: response.clusters as Array<EntityCluster | ServiceCluster>,
           total: response.total,
           page,
           limit,
@@ -777,10 +782,12 @@ export function EntityResolutionProvider({
 
         const vizRequestItemsNormal: BulkVisualizationRequestItem[] = [];
         response.clusters.forEach(c => {
-            const clusterDetail = c as EntityCluster;
-            const connectionCount = clusterDetail.groupCount;
+            const clusterDetail = c as EntityCluster | ServiceCluster;
+            const connectionCount = resolutionMode === 'entity' 
+                ? (clusterDetail as EntityCluster).groupCount 
+                : (clusterDetail as ServiceCluster).serviceGroupCount;
 
-            if (connectionCount !== undefined && connectionCount !== null && connectionCount <= LARGE_CLUSTER_THRESHOLD) { 
+            if (connectionCount !== undefined && connectionCount !== null && connectionCount <= LARGE_CLUSTER_THRESHOLD) { // Treat undefined count as not large
                 vizRequestItemsNormal.push({ clusterId: c.id, itemType: resolutionMode });
             } else {
                 console.log(`Cluster ${c.id} is large (${connectionCount} connections). Deferring full data load.`);
@@ -828,7 +835,9 @@ export function EntityResolutionProvider({
 
       if (id) {
         const clusterDetail = getClusterById(id); 
-        const connectionCount = clusterDetail ? clusterDetail.groupCount : undefined;
+        const connectionCount = clusterDetail ? (resolutionMode === 'entity' 
+            ? (clusterDetail as EntityCluster)?.groupCount 
+            : (clusterDetail as ServiceCluster)?.serviceGroupCount) : undefined;
 
         const isLarge = connectionCount !== undefined && connectionCount !== null && connectionCount > LARGE_CLUSTER_THRESHOLD;
 
@@ -1674,7 +1683,7 @@ export function EntityResolutionProvider({
         if (!connDataState?.data && !connDataState?.loading) loadSingleConnectionData(edgeId);
         if (!vizDataState?.data && selectedClusterId && !vizDataState?.loading) {
             const currentCluster = queries.getClusterById(selectedClusterId);
-            const connectionCount = currentCluster ? currentCluster.groupCount : undefined;
+            const connectionCount = currentCluster ? (resolutionMode === 'entity' ? (currentCluster as EntityCluster)?.groupCount : (currentCluster as ServiceCluster)?.serviceGroupCount) : undefined;
             if (connectionCount === undefined || connectionCount === null || connectionCount <= LARGE_CLUSTER_THRESHOLD) { 
                  invalidateVisualizationData(selectedClusterId);
             } else {
@@ -2108,6 +2117,7 @@ export function EntityResolutionProvider({
 
   const selectedClusterDetails = useMemo(():
     | EntityCluster
+    | ServiceCluster
     | null => {
     if (!selectedClusterId) return null;
     return clusters.data.find((c) => c.id === selectedClusterId) || null;
