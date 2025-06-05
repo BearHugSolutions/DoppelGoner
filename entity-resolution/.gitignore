@@ -28,3 +28,31 @@ next-env.d.ts
 
 # lmao
 ./app/api/auth/register/route.ts
+
+# Added by Task Master AI
+# Logs
+logs
+*.log
+dev-debug.log
+# Dependency directories
+node_modules/
+# Environment variables
+.env
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# OS specific
+.DS_Store
+# Task files
+tasks.json
+tasks/ 
+
+# Added by Task Master AI
+.roo
+.taskmaster
+.cursor
