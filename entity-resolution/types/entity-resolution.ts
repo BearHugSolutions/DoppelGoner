@@ -108,11 +108,6 @@ export interface EntityCluster extends BaseCluster {
   groupCount: number | null;
 }
 
-export interface ServiceCluster extends BaseCluster {
-  serviceCount: number | null;
-  serviceGroupCount: number | null;
-}
-
 export interface MatchDecisionDetails {
   id: string;
   groupId: string;
@@ -225,15 +220,13 @@ export interface ClusterFinalizationStatusResponse {
   newClusterIds?: string[];
 }
 
-export interface ClustersResponse<TCluster extends BaseCluster> {
-  clusters: TCluster[];
+export interface ClustersResponse {
+  clusters: EntityCluster[];
   total: number;
   page: number;
   limit: number;
   totalPages?: number;
 }
-export type EntityClustersResponse = ClustersResponse<EntityCluster>;
-export type ServiceClustersResponse = ClustersResponse<ServiceCluster>;
 
 export interface VisualizationData {
   clusterId: string;
