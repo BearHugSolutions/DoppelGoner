@@ -30,7 +30,8 @@ function handleApiError(error: unknown, context?: string): never {
   } else if (typeof error === "string") {
     errorMessage = error;
   }
-  console.error(`API Error${contextMsg}:`, errorMessage, error);
+  // Centralized logging for all API errors
+  console.error(`[API_CLIENT] API Error${contextMsg}:`, errorMessage, error);
   throw new Error(errorMessage);
 }
 
@@ -62,15 +63,17 @@ async function validateResponse<T>(
       `Request failed with status ${response.status}`;
     const fullContext = context ? `${context}: ${errorMessage}` : errorMessage;
     console.error(
-      `API Response Error: ${response.status} ${response.statusText}`,
-      errorData
+      `[API_CLIENT] API Response Error: ${response.status} ${response.statusText}`,
+      { context: context, error: errorData }
     );
     throw new Error(fullContext);
   }
   if (response.status === 204) {
     return {} as T;
   }
-  return response.json() as Promise<T>;
+  const responseData = await response.json();
+  console.log(`[API_CLIENT] Successful response for ${context}:`, responseData);
+  return responseData as T;
 }
 
 // --- Entity Specific Functions ---
@@ -80,46 +83,49 @@ export async function getOrganizationClusters(
   limit: number = 10
 ): Promise<PaginatedClustersResponse<EntityCluster>> {
   const url = `${API_BASE_URL}/clusters?type=entity&page=${page}&limit=${limit}`;
+  const context = `getEntityClusters (url: ${url})`;
   try {
     const response = await fetch(url);
     return await validateResponse<PaginatedClustersResponse<EntityCluster>>(
       response,
-      "getEntityClusters"
+      context
     );
   } catch (error) {
-    return handleApiError(error, `getEntityClusters (url: ${url})`);
+    return handleApiError(error, context);
   }
 }
 
 export async function getOrganizationConnectionData(
   edgeId: string
 ): Promise<EntityConnectionDataResponse> {
+    const context = `getEntityConnectionData for edge ${edgeId}`;
   const url = `${API_BASE_URL}/connections/${edgeId}?type=entity`;
   try {
     const response = await fetch(url);
     return await validateResponse<EntityConnectionDataResponse>(
       response,
-      `getEntityConnectionData for edge ${edgeId}`
+      context
     );
   } catch (error) {
-    return handleApiError(error, `getEntityConnectionData (edgeId: ${edgeId})`);
+    return handleApiError(error, context);
   }
 }
 
 export async function getServiceConnectionData(
   edgeId: string
 ): Promise<EntityConnectionDataResponse> {
+  const context = `getServiceConnectionData for edge ${edgeId}`;
   const url = `${API_BASE_URL}/connections/${edgeId}?type=service`;
   try {
     const response = await fetch(url);
     return await validateResponse<EntityConnectionDataResponse>(
       response,
-      `getServiceConnectionData for edge ${edgeId}`
+      context
     );
   } catch (error) {
     return handleApiError(
       error,
-      `getServiceConnectionData (edgeId: ${edgeId})`
+      context
     );
   }
 }
@@ -127,17 +133,18 @@ export async function getServiceConnectionData(
 export async function getEntityVisualizationData(
   clusterId: string
 ): Promise<EntityVisualizationDataResponse> {
+  const context = `getEntityVisualizationData for cluster ${clusterId}`;
   const url = `${API_BASE_URL}/visualization/${clusterId}?type=entity`;
   try {
     const response = await fetch(url);
     return await validateResponse<EntityVisualizationDataResponse>(
       response,
-      `getEntityVisualizationData for cluster ${clusterId}`
+      context
     );
   } catch (error) {
     return handleApiError(
       error,
-      `getEntityVisualizationData (clusterId: ${clusterId})`
+      context
     );
   }
 }
@@ -145,17 +152,18 @@ export async function getEntityVisualizationData(
 export async function getServiceVisualizationData(
   clusterId: string
 ): Promise<EntityVisualizationDataResponse> {
+  const context = `getServiceVisualizationData for cluster ${clusterId}`;
   const url = `${API_BASE_URL}/visualization/${clusterId}?type=service`;
   try {
     const response = await fetch(url);
     return await validateResponse<EntityVisualizationDataResponse>(
       response,
-      `getServiceVisualizationData for cluster ${clusterId}`
+      context
     );
   } catch (error) {
     return handleApiError(
       error,
-      `getServiceVisualizationData (clusterId: ${clusterId})`
+      context
     );
   }
 }
@@ -164,6 +172,7 @@ export async function postEntityGroupFeedback(
   groupId: string,
   payload: any
 ): Promise<GroupReviewApiResponse> {
+  const context = `postEntityGroupFeedback for group ${groupId}`;
   const url = `${API_BASE_URL}/entity-groups/${groupId}/review`;
   try {
     const response = await fetch(url, {
@@ -173,12 +182,12 @@ export async function postEntityGroupFeedback(
     });
     return await validateResponse<GroupReviewApiResponse>(
       response,
-      `postEntityGroupFeedback for group ${groupId}`
+      context
     );
   } catch (error) {
     return handleApiError(
       error,
-      `postEntityGroupFeedback (groupId: ${groupId})`
+      context
     );
   }
 }
@@ -187,6 +196,7 @@ export async function postServiceGroupFeedback(
   groupId: string,
   payload: any
 ): Promise<GroupReviewApiResponse> {
+  const context = `postServiceGroupFeedback for group ${groupId}`;
   const url = `${API_BASE_URL}/service-groups/${groupId}/review`;
   try {
     const response = await fetch(url, {
@@ -196,12 +206,12 @@ export async function postServiceGroupFeedback(
     });
     return await validateResponse<GroupReviewApiResponse>(
       response,
-      `postServiceGroupFeedback for group ${groupId}`
+      context
     );
   } catch (error) {
     return handleApiError(
       error,
-      `postServiceGroupFeedback (groupId: ${groupId})`
+      context
     );
   }
 }
@@ -209,60 +219,68 @@ export async function postServiceGroupFeedback(
 export async function triggerEntityClusterFinalization(
   clusterId: string
 ): Promise<ClusterFinalizationStatusResponse> {
+  const context = `triggerEntityClusterFinalization for cluster ${clusterId}`;
   const url = `${API_BASE_URL}/clusters/${clusterId}/finalize-review?type=entity`;
+  console.log(`[API_CLIENT] Triggering finalization: POST ${url}`);
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
+    // The validateResponse function will log the successful response object
     return await validateResponse<ClusterFinalizationStatusResponse>(
       response,
-      `triggerEntityClusterFinalization for cluster ${clusterId}`
+      context
     );
   } catch (error) {
+    // The handleApiError function will log the error
     return handleApiError(
       error,
-      `triggerEntityClusterFinalization (clusterId: ${clusterId})`
+      context
     );
   }
 }
 
 // --- Service Specific Functions ---
 
-// UPDATED: Now returns a promise with EntityCluster, matching the unified API response.
 export async function getServiceClusters(
   page: number = 1,
   limit: number = 10
 ): Promise<PaginatedClustersResponse<EntityCluster>> {
+  const context = `getServiceClusters (page: ${page}, limit: ${limit})`;
   const url = `${API_BASE_URL}/clusters?type=service&page=${page}&limit=${limit}`;
   try {
     const response = await fetch(url);
     return await validateResponse<PaginatedClustersResponse<EntityCluster>>(
       response,
-      "getServiceClusters"
+      context
     );
   } catch (error) {
-    return handleApiError(error, `getServiceClusters (url: ${url})`);
+    return handleApiError(error, context);
   }
 }
 
 export async function triggerServiceClusterFinalization(
   clusterId: string
 ): Promise<ClusterFinalizationStatusResponse> {
+  const context = `triggerServiceClusterFinalization for cluster ${clusterId}`;
   const url = `${API_BASE_URL}/clusters/${clusterId}/finalize-review?type=service`;
+  console.log(`[API_CLIENT] Triggering finalization: POST ${url}`);
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
+    // The validateResponse function will log the successful response object
     return await validateResponse<ClusterFinalizationStatusResponse>(
       response,
-      `triggerServiceClusterFinalization for cluster ${clusterId}`
+      context
     );
   } catch (error) {
+    // The handleApiError function will log the error
     return handleApiError(
       error,
-      `triggerServiceClusterFinalization (clusterId: ${clusterId})`
+      context
     );
   }
 }
@@ -272,8 +290,10 @@ export async function triggerServiceClusterFinalization(
 export async function getBulkNodeDetails(
   payload: BulkNodeDetailsRequest
 ): Promise<NodeDetailResponse[]> {
+  const context = 'getBulkNodeDetails';
   const url = `${API_BASE_URL}/bulk-node-details`;
   try {
+    console.log(`[API_CLIENT] Requesting bulk node details:`, payload);
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -281,10 +301,10 @@ export async function getBulkNodeDetails(
     });
     return await validateResponse<NodeDetailResponse[]>(
       response,
-      "getBulkNodeDetails"
+      context
     );
   } catch (error) {
-    return handleApiError(error, "getBulkNodeDetails");
+    return handleApiError(error, context);
   }
 }
 
@@ -293,29 +313,29 @@ export async function getBulkNodeDetails(
 export async function getBulkConnections(
   payload: BulkConnectionsRequest
 ): Promise<BulkConnectionsResponse> {
+    const context = 'getBulkConnections';
   const url = `${API_BASE_URL}/bulk-connections`;
   try {
+    console.log(`[API_CLIENT] Requesting bulk connections:`, payload);
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-
-    // console.log("Bulk connections response:", response.json());
-
     return await validateResponse<BulkConnectionsResponse>(
       response,
-      "getBulkConnections"
+      context
     );
   } catch (error) {
-    return handleApiError(error, "getBulkConnections");
+    return handleApiError(error, context);
   }
 }
 
 export async function getBulkVisualizations(
   payload: BulkVisualizationsRequest
 ): Promise<BulkVisualizationsResponse> {
-  console.log("Bulk visualizations payload:", payload);
+    const context = 'getBulkVisualizations';
+    console.log("[API_CLIENT] Requesting bulk visualizations:", payload);
   const url = `${API_BASE_URL}/bulk-visualizations`;
   try {
     const response = await fetch(url, {
@@ -323,14 +343,11 @@ export async function getBulkVisualizations(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-
-    // console.log("Bulk visualizations response:", response.json());
-
     return await validateResponse<BulkVisualizationsResponse>(
       response,
-      "getBulkVisualizations"
+      context
     );
   } catch (error) {
-    return handleApiError(error, "getBulkVisualizations");
+    return handleApiError(error, context);
   }
 }
