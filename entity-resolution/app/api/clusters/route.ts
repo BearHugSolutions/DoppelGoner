@@ -19,8 +19,6 @@ export async function GET(request: NextRequest) {
   const type = searchParams.get('type') || 'entity'; // Default to 'entity'
 
   try {
-    // Call the Rust gateway
-    // The gateway is expected to handle pagination and type filtering based on query params
     const gatewayResponse = await fetchFromGateway(
       '/clusters',
       {
@@ -29,13 +27,11 @@ export async function GET(request: NextRequest) {
           page,
           limit,
           type,
-          // userSchema: userSchema // Pass userSchema if your gateway expects it as a query param
         },
       },
-      userSchema // Pass userSchema as a header if your gateway expects it that way
+      userSchema
     );
 
-    // The gateway response is assumed to match the structure previously returned
     return NextResponse.json(gatewayResponse);
 
   } catch (error: any) {

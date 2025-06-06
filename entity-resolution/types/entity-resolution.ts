@@ -32,100 +32,167 @@ export interface BulkVisualizationsRequest {
   items: BulkVisualizationRequestItem[];
 }
 
-
 // Base entity and cluster types
-export interface Entity {
+export interface Organization {
   id: string;
   organizationId: string | null;
   name: string | null;
-  createdAt: Date | string | null; // NaiveDateTime from Rust becomes string
-  updatedAt: Date | string | null; // NaiveDateTime from Rust becomes string
-  source_system: string | null;
-  source_id: string | null;
+  createdAt: string | null; // NaiveDateTime from Rust becomes string
+  updatedAt: string | null; // NaiveDateTime from Rust becomes string
+  sourceSystem: string | null;
+  sourceId: string | null;
 }
 
 export interface Service {
   id: string;
   name: string | null;
-  organizationId?: string | null; 
-  createdAt: Date | string | null; 
-  updatedAt: Date | string | null; 
-  source_system: string | null;
-  source_id: string | null;
+  organizationId?: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  sourceSystem: string | null;
+  sourceId: string | null;
+}
+
+/**
+ * Represents a phone number associated with a node, as seen in the 'Node phone' log.
+ */
+export interface NodePhone {
+  id: string;
+  locationId: string | null;
+  serviceId: string | null;
+  organizationId: string | null;
+  contactId: string | null;
+  serviceAtLocationId: string | null; // Based on logs, can be a string
+  number: string;
+  extension: string | null;
+  type: string;
+  language: string;
+  description: string | null;
+  priority: number | null;
+  lastModified: string;
+  created: string;
+  originalId: string;
+  originalTranslationsId: string;
+  contributorId: string | null;
+}
+
+/**
+ * Represents a service listed in the attributes of a node, from the 'Node services' log.
+ * This is different from the top-level Service type.
+ */
+export interface NodeServiceAttribute {
+  id: string;
+  name: string;
+  organizationId: string;
+  createdAt: string;
+  updatedAt: string;
+  sourceSystem: string;
+}
+
+/**
+ * Represents a location associated with a node, from the 'Node locations' log.
+ */
+export interface NodeLocation {
+  id: string;
+  organizationId: string;
+  name: string;
+  alternateName: string | null;
+  description: string | null;
+  shortDescription: string | null;
+  transportation: string | null;
+  latitude: number;
+  longitude: number;
+  locationType: string;
+  lastModified: string;
+  created: string;
+  originalId: string;
+  originalTranslationsId: string;
+  contributorId: string | null;
+}
+
+/**
+ * Represents a postal address associated with a location, from the 'Node addresses' log.
+ */
+export interface NodeAddress {
+  id: string;
+  locationId: string;
+  attention: string | null;
+  address1: string;
+  address2: string | null;
+  city: string;
+  region: string | null;
+  stateProvince: string;
+  postalCode: string;
+  country: string;
+  addressType: string;
+  lastModified: string;
+  created: string;
+  originalId: string;
+  contributorId: string | null;
 }
 
 export interface MatchValues {
   type?: string;
-  values: Record<string, any>; 
+  values: Record<string, any>;
 }
 
 export interface EntityGroup {
   id: string;
   entityId1: string;
   entityId2: string;
-  confidenceScore: number | null; 
-  preRlConfidenceScore: number | null;
-  methodType: string;
-  matchValues: MatchValues | null; 
-  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | 'DENIED' | string;
-  createdAt: Date | string | null; 
-  updatedAt: Date | string | null; 
-  groupClusterId?: string | null;
-  reviewedAt?: Date | string | null; 
-  reviewerId?: string | null;
-  notes?: string | null;
-}
-
-export interface ServiceGroup {
-  id: string;
-  serviceId1: string;
-  serviceId2: string;
   confidenceScore: number | null;
   preRlConfidenceScore: number | null;
   methodType: string;
-  matchValues: MatchValues | null; 
-  confirmedStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | 'REJECTED' | string; 
-  createdAt: Date | string | null; 
-  updatedAt: Date | string | null; 
+  matchValues: MatchValues | null;
+  confirmedStatus:
+    | "PENDING_REVIEW"
+    | "CONFIRMED_MATCH"
+    | "CONFIRMED_NON_MATCH"
+    | "DENIED"
+    | string;
+  createdAt: string | null;
+  updatedAt: string | null;
   groupClusterId?: string | null;
-  reviewedAt?: Date | string | null; 
+  reviewedAt?: string | null;
   reviewerId?: string | null;
   notes?: string | null;
 }
 
+// More accurately reflects optional fields from Rust backend
 export interface BaseCluster {
   id: string;
-  name: string | null;
-  description: string | null;
+  name?: string | null;
+  description?: string | null;
   averageCoherenceScore: number | null;
-  createdAt: Date | string | null;
-  updatedAt: Date | string | null;
+  createdAt?: string | null; // NaiveDateTime serializes to string
+  updatedAt?: string | null;
   wasSplit?: boolean | null;
 }
 
+// This now perfectly matches the Rust `EntityClusterItem` and is used for both modes
 export interface EntityCluster extends BaseCluster {
-  entityCount: number | null;
-  groupCount: number | null;
+  entityCount?: number | null;
+  groupCount?: number | null;
 }
 
 export interface MatchDecisionDetails {
   id: string;
   groupId: string;
   pipelineRunId: string | null;
-  snapshottedFeatures: Record<string, unknown>; 
+  snapshottedFeatures: Record<string, unknown>;
   methodTypeAtDecision: string;
   preRlConfidenceAtDecision: number;
   tunedConfidenceAtDecision: number;
   confidenceTunerVersionAtDecision: number | null;
-  createdAt: Date | string; 
+  createdAt: string;
 }
 
 export interface HumanFeedbackBase {
   reviewerId: string;
-  feedbackTimestamp: Date | string; 
+  feedbackTimestamp: string;
   isMatchCorrect: boolean;
   notes: string | null;
-  processedForTunerUpdateAt: Date | string | null; 
+  processedForTunerUpdateAt: string | null;
   matchDecisionId: string;
 }
 
@@ -144,23 +211,23 @@ export interface BaseNode {
   sourceSystem?: string | null;
   sourceId?: string | null;
   organizationId?: string | null;
-  contributorId?: string | null; 
+  contributorId?: string | null;
 }
-export type EntityNode = BaseNode;
-export type ServiceNode = BaseNode;
 
 export interface BaseLink {
   id: string;
-  source: string; 
-  target: string; 
+  source: string;
+  target: string;
   weight: number;
-  status?: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
-  details?: Record<string, any> | null; 
-  createdAt?: Date | string | null; 
+  status?:
+    | "PENDING_REVIEW"
+    | "CONFIRMED_MATCH"
+    | "CONFIRMED_NON_MATCH"
+    | string;
+  details?: Record<string, any> | null;
+  createdAt?: string | null;
   clusterId: string;
 }
-export type EntityLink = BaseLink;
-export type ServiceLink = BaseLink;
 
 export interface VisualizationEntityEdge {
   id: string;
@@ -168,41 +235,22 @@ export interface VisualizationEntityEdge {
   entityId1: string;
   entityId2: string;
   edgeWeight: number;
-  details: Record<string, any> | null; 
+  details: Record<string, any> | null;
   pipelineRunId: string | null;
-  createdAt: string; 
-  confirmedStatus: string | null; 
+  createdAt: string;
+  confirmedStatus: string | null;
   entity1Name: string | null;
   entity2Name: string | null;
-  status: string | null; 
+  status: string | null;
   displayWeight: number | null;
   color: string | null;
 }
-
-export interface VisualizationServiceEdge {
-  id: string;
-  clusterId: string; 
-  serviceId1: string;
-  serviceId2: string;
-  edgeWeight: number;
-  details: Record<string, any> | null; 
-  pipelineRunId: string | null; 
-  createdAt: string; 
-  service1Name?: string | null;
-  service2Name?: string | null;
-  status?: string | null; 
-  displayWeight?: number | null;
-  color?: string | null;
-}
-
 
 export interface GroupReviewApiPayloadBase {
   decision: GroupReviewDecision;
   reviewerId: string;
   notes?: string;
 }
-export type EntityGroupReviewApiPayload = GroupReviewApiPayloadBase;
-export type ServiceGroupReviewApiPayload = GroupReviewApiPayloadBase;
 
 export interface GroupReviewApiResponse {
   message: string;
@@ -211,70 +259,57 @@ export interface GroupReviewApiResponse {
   updatedEdgesInUserSchema?: number | null;
 }
 
-export type GroupReviewDecision = 'ACCEPTED' | 'REJECTED' | string;
+export type GroupReviewDecision = "ACCEPTED" | "REJECTED" | string;
 
 export interface ClusterFinalizationStatusResponse {
-  status: 'COMPLETED_NO_SPLIT_NEEDED' | 'COMPLETED_SPLIT_DETECTED' | 'PENDING_FULL_REVIEW' | 'CLUSTER_NOT_FOUND' | 'ERROR' | string;
+  status:
+    | "COMPLETED_NO_SPLIT_NEEDED"
+    | "COMPLETED_SPLIT_DETECTED"
+    | "PENDING_FULL_REVIEW"
+    | "CLUSTER_NOT_FOUND"
+    | "ERROR"
+    | string;
   message: string;
   originalClusterId: string;
   newClusterIds?: string[];
 }
 
-export interface ClustersResponse {
-  clusters: EntityCluster[];
+// Generic response type to match Rust's `TypedClusterListResponse<T>`
+export interface PaginatedClustersResponse<T> {
+  clusters: T[];
   total: number;
   page: number;
   limit: number;
-  totalPages?: number;
+  totalPages: number;
 }
 
 export interface VisualizationData {
   clusterId: string;
-  nodes: BaseNode[]; 
-  links: BaseLink[]; 
-  groups: EntityGroup[] | ServiceGroup[] | Record<string, any>; 
+  nodes: BaseNode[];
+  links: BaseLink[];
+  groups: EntityGroup[] | Record<string, any>;
 }
 export type EntityVisualizationDataResponse = VisualizationData;
-export type ServiceVisualizationDataResponse = VisualizationData;
 export type BulkVisualizationsResponse = VisualizationData[];
 
 export interface EntityConnectionDataResponse {
   edge: VisualizationEntityEdge;
-  entity1: Entity;
-  entity2: Entity;
+  entity1: Organization | Service;
+  entity2: Organization | Service;
   entityGroups: EntityGroup[];
   clusterId: string;
   matchDecisions?: MatchDecisionDetails[] | null;
 }
 
-export interface ServiceConnectionDataResponse {
-  edge: VisualizationServiceEdge;
-  service1: Service; 
-  service2: Service; 
-  serviceGroups: ServiceGroup[]; 
-  clusterId: string;
-  matchDecisions?: MatchDecisionDetails[] | null;
-}
-
-export type BulkConnectionResponseItem = EntityConnectionDataResponse | ServiceConnectionDataResponse;
+export type BulkConnectionResponseItem = EntityConnectionDataResponse;
 export type BulkConnectionsResponse = BulkConnectionResponseItem[];
-
 
 export function isEntityConnectionData(
   data: BulkConnectionResponseItem,
-  mode?: ResolutionMode 
-): data is EntityConnectionDataResponse {
-  return 'entity1' in data && 'entityGroups' in data;
-}
-
-export function isServiceConnectionData(
-  data: BulkConnectionResponseItem,
   mode?: ResolutionMode
-): data is ServiceConnectionDataResponse {
-  return 'service1' in data && 'serviceGroups' in data;
+): data is EntityConnectionDataResponse {
+  return "entity1" in data && "entityGroups" in data;
 }
-
-
 export interface SuggestedAction {
   id: string;
   pipelineRunId: string | null;
@@ -284,21 +319,25 @@ export interface SuggestedAction {
   groupId2: string | null;
   clusterId: string | null;
   triggeringConfidence: number | null;
-  details: Record<string, unknown> | null; 
+  details: Record<string, unknown> | null;
   reasonCode: string | null;
   reasonMessage: string | null;
   priority: number;
   status: string;
   reviewerId: string | null;
-  reviewedAt: Date | string | null; 
+  reviewedAt: string | null;
   reviewNotes: string | null;
-  createdAt: Date | string; 
-  updatedAt: Date | string; 
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ReviewOperationBase {
   groupId: string;
-  originalGroupStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  originalGroupStatus:
+    | "PENDING_REVIEW"
+    | "CONFIRMED_MATCH"
+    | "CONFIRMED_NON_MATCH"
+    | string;
 }
 
 export interface QueuedReviewBatch {
@@ -308,9 +347,21 @@ export interface QueuedReviewBatch {
   decision: GroupReviewDecision;
   reviewerId: string;
   operations: ReviewOperationBase[];
-  originalEdgeStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
-  optimisticEdgeStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
-  optimisticGroupStatus: 'PENDING_REVIEW' | 'CONFIRMED_MATCH' | 'CONFIRMED_NON_MATCH' | string;
+  originalEdgeStatus:
+    | "PENDING_REVIEW"
+    | "CONFIRMED_MATCH"
+    | "CONFIRMED_NON_MATCH"
+    | string;
+  optimisticEdgeStatus:
+    | "PENDING_REVIEW"
+    | "CONFIRMED_MATCH"
+    | "CONFIRMED_NON_MATCH"
+    | string;
+  optimisticGroupStatus:
+    | "PENDING_REVIEW"
+    | "CONFIRMED_MATCH"
+    | "CONFIRMED_NON_MATCH"
+    | string;
   attempt: number;
   error?: string;
   processedOperations: Set<string>;
@@ -331,7 +382,13 @@ export interface ClusterReviewProgress {
 
 export interface NodeDetailResponse {
   id: string;
-  nodeType: 'entity' | 'service';
-  baseData: Record<string, any>; 
-  attributes: Record<string, any[]>; 
+  nodeType: "entity" | "service";
+  baseData: Organization | Service; // This remains flexible for both node types
+  attributes: {
+    // These properties are optional because they are not present in every node response
+    phones?: NodePhone[];
+    services?: NodeServiceAttribute[];
+    locations?: NodeLocation[];
+    addresses?: NodeAddress[];
+  };
 }

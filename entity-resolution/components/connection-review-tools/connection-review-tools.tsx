@@ -28,24 +28,17 @@ import {
   RotateCcw,
   ChevronLeft,
   ChevronRight,
-  DownloadCloud, // For fetch connections button
-  ChevronsRight, // For load more connections
+  DownloadCloud,
+  ChevronsRight,
 } from "lucide-react";
 import type {
   VisualizationEntityEdge,
   EntityGroup,
-  Entity,
   GroupReviewDecision,
   QueuedReviewBatch,
-  ServiceGroup,
-  VisualizationServiceEdge,
   Service,
   EntityConnectionDataResponse,
-  ServiceConnectionDataResponse,
-} from "@/types/entity-resolution";
-import {
-  isEntityConnectionData,
-  isServiceConnectionData,
+  Organization,
 } from "@/types/entity-resolution";
 import { useToast } from "@/hooks/use-toast";
 import NodeAttributesDisplay from "./node-attribute-display";
@@ -59,21 +52,21 @@ export default function ConnectionReviewTools() {
     selectedClusterId,
     selectedEdgeId,
     currentConnectionData,
-    currentVisualizationData, // This is the *paged* visualization data for large clusters
+    currentVisualizationData,
     selectedClusterDetails,
     actions,
     queries,
-    reviewQueue, // Added for checking processing state
+    reviewQueue,
     edgeSelectionInfo,
     activelyPagingClusterId,
     largeClusterConnectionsPage,
     isLoadingConnectionPageData,
-    isProcessingQueue, // Global queue processing status
+    isProcessingQueue,
   } = useEntityResolution();
   const { toast } = useToast();
 
-  const [isSubmitting, setIsSubmitting] = useState(false); // For accept/reject actions
-  const [isContinuing, setIsContinuing] = useState(false); // For the "Continue" button's action
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isContinuing, setIsContinuing] = useState(false);
   const [isExpanded, setIsExpanded] = useState(true);
   const [isAttributesOpen, setIsAttributesOpen] = useState(false);
 
@@ -108,7 +101,6 @@ export default function ConnectionReviewTools() {
         });
         return;
       }
-      // It's okay to access isClusterSplit here as it's derived from context props.
       if (selectedClusterDetails?.wasSplit) {
         toast({
           title: "Info",
@@ -116,7 +108,6 @@ export default function ConnectionReviewTools() {
         });
         return;
       }
-      // It's okay to access isEdgeReviewed and queueStatusForSelectedEdge here.
       const currentEdgeIsReviewed = selectedEdgeId
         ? queries.isEdgeReviewed(selectedEdgeId)
         : false;
@@ -159,27 +150,28 @@ export default function ConnectionReviewTools() {
   );
 
   const handleRetryLoadConnection = useCallback(() => {
-    if (selectedEdgeId && selectedClusterDetails && selectedClusterDetails.groupCount) {
-      const isLarge = selectedClusterDetails.groupCount > LARGE_CLUSTER_THRESHOLD;
-
+    if (
+      selectedEdgeId &&
+      selectedClusterDetails &&
+      selectedClusterDetails.groupCount
+    ) {
+      const isLarge =
+        selectedClusterDetails.groupCount > LARGE_CLUSTER_THRESHOLD;
       const isPaging =
         selectedClusterId === activelyPagingClusterId &&
         largeClusterConnectionsPage > 0;
 
-      if (isLarge && isPaging) {
-        // selectedClusterId is checked by isPaging and also implicitly by selectedClusterDetails being non-null
-        actions.viewNextConnectionPage(selectedClusterId!);
+      if (isLarge && isPaging && selectedClusterId) {
+        actions.viewNextConnectionPage(selectedClusterId);
       } else {
         actions.invalidateConnectionData(selectedEdgeId);
       }
     } else if (selectedEdgeId) {
-      // Fallback if selectedClusterDetails is null but we have an edgeId, just invalidate connection
       actions.invalidateConnectionData(selectedEdgeId);
     }
   }, [
     selectedEdgeId,
-    selectedClusterDetails, // Now a direct dependency
-    resolutionMode,
+    selectedClusterDetails,
     selectedClusterId,
     activelyPagingClusterId,
     largeClusterConnectionsPage,
@@ -238,7 +230,7 @@ export default function ConnectionReviewTools() {
         if (unreviewedInCurrentView.length > 0) {
           const currentSelectedEdgeIsReviewed = selectedEdgeId
             ? queries.isEdgeReviewed(selectedEdgeId)
-            : true; // Treat null selectedEdgeId as if it's reviewed for this logic block
+            : true;
           if (selectedEdgeId && !currentSelectedEdgeIsReviewed) {
             const otherUnreviewedInView = unreviewedInCurrentView.filter(
               (l) => l.id !== selectedEdgeId
@@ -365,33 +357,49 @@ export default function ConnectionReviewTools() {
     actions.selectNextUnreviewedInCluster();
   }, [actions]);
 
-  // Moved isAnyOperationPending useMemo hook and its dependent variable definitions here
-  // Ensure variables used by isAnyOperationPending are defined before it.
   const isLoadingUI = selectedEdgeId
     ? queries.isConnectionDataLoading(selectedEdgeId)
     : false;
-  const isPagingActiveForSelectedCluster =
-    selectedClusterId === activelyPagingClusterId &&
-    largeClusterConnectionsPage > 0;
 
-  const isAnyOperationPending = useMemo(() => {
+  const isAnyGeneralOperationPending = useMemo(() => {
+    const isPagingActiveForSelectedCluster =
+      selectedClusterId === activelyPagingClusterId &&
+      largeClusterConnectionsPage > 0;
     return (
       isSubmitting ||
       isLoadingUI ||
       (isLoadingConnectionPageData && isPagingActiveForSelectedCluster) ||
-      isContinuing ||
       isProcessingQueue
     );
   }, [
     isSubmitting,
     isLoadingUI,
     isLoadingConnectionPageData,
-    isPagingActiveForSelectedCluster,
-    isContinuing,
+    selectedClusterId,
+    activelyPagingClusterId,
+    largeClusterConnectionsPage,
     isProcessingQueue,
   ]);
 
-  // Conditional returns start here. All hooks must be above this line.
+  const isContinueButtonDisabled = useMemo(() => {
+    if (isContinuing) return true;
+
+    if (
+      selectedClusterId &&
+      edgeSelectionInfo.totalUnreviewedEdgesInCluster === 0 &&
+      queries.getClusterProgress(selectedClusterId)?.isComplete &&
+      !queries.canAdvanceToNextCluster()
+    ) {
+      return true;
+    }
+    return false;
+  }, [
+    isContinuing,
+    selectedClusterId,
+    edgeSelectionInfo.totalUnreviewedEdgesInCluster,
+    queries,
+  ]);
+
   if (!selectedClusterId) {
     return (
       <div className="flex justify-center items-center h-[100px] text-muted-foreground p-4 border rounded-md bg-card shadow">
@@ -401,8 +409,11 @@ export default function ConnectionReviewTools() {
   }
 
   const connectionCount = selectedClusterDetails?.groupCount || 0;
-  const isSelectedClusterLarge =
-    connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD;
+  const isSelectedClusterLarge = connectionCount > LARGE_CLUSTER_THRESHOLD;
+
+  const isPagingActiveForSelectedCluster =
+    selectedClusterId === activelyPagingClusterId &&
+    largeClusterConnectionsPage > 0;
 
   if (isSelectedClusterLarge && !isPagingActiveForSelectedCluster) {
     return (
@@ -421,7 +432,9 @@ export default function ConnectionReviewTools() {
           </p>
           <Button
             onClick={handleInitializeLargeClusterPaging}
-            disabled={isLoadingConnectionPageData || isAnyOperationPending}
+            disabled={
+              isLoadingConnectionPageData || isAnyGeneralOperationPending
+            }
             size="lg"
             className="w-full"
           >
@@ -496,7 +509,7 @@ export default function ConnectionReviewTools() {
               variant="outline"
               size="sm"
               onClick={handleRetryLoadConnection}
-              disabled={isAnyOperationPending}
+              disabled={isAnyGeneralOperationPending}
             >
               <RefreshCw className="h-4 w-4 mr-1" /> Retry
             </Button>
@@ -504,7 +517,7 @@ export default function ConnectionReviewTools() {
               variant="outline"
               size="sm"
               onClick={() => actions.setSelectedEdgeId(null)}
-              disabled={isAnyOperationPending}
+              disabled={isAnyGeneralOperationPending}
             >
               Clear Selection
             </Button>
@@ -526,33 +539,13 @@ export default function ConnectionReviewTools() {
     return null;
   }
 
-  let edgeDetails:
-    | VisualizationEntityEdge
-    | VisualizationServiceEdge
-    | undefined;
-  let groupsForEdge: Array<EntityGroup | ServiceGroup> = [];
-  let node1: Entity | Service | undefined;
-  let node2: Entity | Service | undefined;
-
-  if (currentConnectionData) {
-    const data: EntityConnectionDataResponse | ServiceConnectionDataResponse =
-      currentConnectionData;
-    if (isEntityConnectionData(data, resolutionMode)) {
-      edgeDetails = data.edge;
-      groupsForEdge = data.entityGroups;
-      node1 = data.entity1;
-      node2 = data.entity2;
-    } else if (isServiceConnectionData(data, resolutionMode)) {
-      edgeDetails = data.edge;
-      groupsForEdge = data.serviceGroups;
-      node1 = data.service1;
-      node2 = data.service2;
-    } else {
-      console.error(
-        "Connection data type and resolution mode mismatch or data is of an unexpected non-null type."
-      );
-    }
-  }
+  // Simplified data handling: No more checks for `isEntityConnectionData` are needed here,
+  // as the context now provides a consistent `EntityConnectionDataResponse`.
+  const data = currentConnectionData;
+  const edgeDetails = data?.edge as VisualizationEntityEdge | undefined;
+  const groupsForEdge = data?.entityGroups || [];
+  const node1 = data?.entity1;
+  const node2 = data?.entity2;
 
   if (!node1 || !node2 || !edgeDetails) {
     if (
@@ -584,7 +577,7 @@ export default function ConnectionReviewTools() {
             size="sm"
             onClick={handleRetryLoadConnection}
             className="mt-2"
-            disabled={isAnyOperationPending}
+            disabled={isAnyGeneralOperationPending}
           >
             <RefreshCw className="h-4 w-4 mr-1" /> Retry Load
           </Button>
@@ -696,7 +689,11 @@ export default function ConnectionReviewTools() {
           )}
         </div>
         <CollapsibleTrigger asChild>
-          <Button variant="ghost" size="sm" disabled={isAnyOperationPending}>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={isAnyGeneralOperationPending || isContinuing}
+          >
             {isExpanded ? (
               <ChevronUp className="h-4 w-4" />
             ) : (
@@ -723,7 +720,8 @@ export default function ConnectionReviewTools() {
                       size="icon"
                       onClick={handlePreviousUnreviewed}
                       disabled={
-                        isAnyOperationPending ||
+                        isAnyGeneralOperationPending ||
+                        isContinuing ||
                         edgeSelectionInfo.totalEdges <= 0
                       }
                       aria-label="Previous unreviewed connection in view"
@@ -749,7 +747,8 @@ export default function ConnectionReviewTools() {
                       size="icon"
                       onClick={handleNextUnreviewed}
                       disabled={
-                        isAnyOperationPending ||
+                        isAnyGeneralOperationPending ||
+                        isContinuing ||
                         edgeSelectionInfo.totalEdges <= 0
                       }
                       aria-label="Next unreviewed connection in view"
@@ -766,7 +765,9 @@ export default function ConnectionReviewTools() {
                   size="sm"
                   onClick={() => handleReviewDecision("REJECTED")}
                   disabled={
-                    isAnyOperationPending || isClusterSplit || !selectedEdgeId
+                    isAnyGeneralOperationPending ||
+                    isClusterSplit ||
+                    !selectedEdgeId
                   }
                 >
                   <X className="h-4 w-4 mr-1" /> Not a Match
@@ -777,7 +778,9 @@ export default function ConnectionReviewTools() {
                   size="sm"
                   onClick={() => handleReviewDecision("ACCEPTED")}
                   disabled={
-                    isAnyOperationPending || isClusterSplit || !selectedEdgeId
+                    isAnyGeneralOperationPending ||
+                    isClusterSplit ||
+                    !selectedEdgeId
                   }
                 >
                   <Check className="h-4 w-4 mr-1" /> Confirm Match
@@ -789,7 +792,7 @@ export default function ConnectionReviewTools() {
                   size="sm"
                   onClick={handleRetryQueueItem}
                   className="w-full mt-2 border-amber-500 text-amber-600 hover:bg-amber-50"
-                  disabled={isAnyOperationPending}
+                  disabled={isAnyGeneralOperationPending}
                 >
                   <RotateCcw className="h-4 w-4 mr-1" /> Retry Failed Submission
                 </Button>
@@ -837,22 +840,14 @@ export default function ConnectionReviewTools() {
                 size="sm"
                 onClick={handleContinueToNext}
                 className="w-full"
-                disabled={
-                  Boolean(
-                    isAnyOperationPending ||
-                    (selectedClusterId &&
-                      edgeSelectionInfo.totalUnreviewedEdgesInCluster === 0 &&
-                      queries.getClusterProgress(selectedClusterId)?.isComplete &&
-                      !queries.canAdvanceToNextCluster())
-                  )
-                }
+                disabled={isContinueButtonDisabled}
               >
                 {isContinuing ? (
                   <Loader2 className="h-4 w-4 mr-1 animate-spin" />
                 ) : (
                   <SkipForward className="h-4 w-4 mr-1" />
                 )}
-                Continue to Next Unreviewed/Cluster
+                Continue to Next Unreviewed Connection or Cluster
               </Button>
             </div>
           )}
@@ -860,7 +855,11 @@ export default function ConnectionReviewTools() {
           {isPagingActiveForSelectedCluster && canLoadMoreConnections && (
             <Button
               onClick={handleViewNextConnectionPage}
-              disabled={isLoadingConnectionPageData || isAnyOperationPending}
+              disabled={
+                isLoadingConnectionPageData ||
+                isAnyGeneralOperationPending ||
+                isContinuing
+              }
               variant="secondary"
               className="w-full mt-2"
             >
@@ -929,137 +928,108 @@ export default function ConnectionReviewTools() {
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="p-3 pt-0">
-                  {resolutionMode === "entity" &&
-                  currentConnectionData &&
-                  isEntityConnectionData(
-                    currentConnectionData as
-                      | EntityConnectionDataResponse
-                      | ServiceConnectionDataResponse,
-                    resolutionMode
-                  ) ? (
-                    (
-                      (currentConnectionData as EntityConnectionDataResponse)
-                        .edge as VisualizationEntityEdge
-                    ).details?.methods &&
-                    (
-                      (currentConnectionData as EntityConnectionDataResponse)
-                        .edge as VisualizationEntityEdge
-                    ).details!.methods.length > 0 ? (
-                      <div className="space-y-1">
-                        {(
-                          (
-                            currentConnectionData as EntityConnectionDataResponse
-                          ).edge as VisualizationEntityEdge
-                        ).details!.methods.map(
-                          (
-                            method: {
-                              method_type: string;
-                              pre_rl_confidence: number;
-                              rl_confidence: number;
-                              combined_confidence: number;
-                            },
-                            index: Key | null | undefined
-                          ) => (
-                            <div
-                              key={
-                                method.method_type
-                                  ? `${method.method_type}-${index}`
-                                  : index
-                              }
-                              className="grid grid-cols-[1fr_auto_auto_auto] gap-2 items-center text-xs"
-                            >
-                              <div>
-                                {method.method_type?.replace(/_/g, " ") ??
-                                  "Unknown Method"}
-                              </div>
-                              <div className="text-right">
-                                <span className="text-xs text-muted-foreground">
-                                  Pre-RL:{" "}
-                                </span>
-                                {method.pre_rl_confidence?.toFixed(2) ?? "N/A"}
-                              </div>
-                              <div className="text-right">
-                                <span className="text-xs text-muted-foreground">
-                                  RL:{" "}
-                                </span>
-                                {method.rl_confidence?.toFixed(2) ?? "N/A"}
-                              </div>
-                              <div className="text-right font-medium">
-                                <span className="text-xs text-muted-foreground">
-                                  Combined:{" "}
-                                </span>
-                                {method.combined_confidence?.toFixed(2) ??
-                                  "N/A"}
-                              </div>
-                            </div>
-                          )
-                        )}
-                      </div>
-                    ) : (currentConnectionData as EntityConnectionDataResponse)
-                        .entityGroups.length > 0 ? (
-                      <div className="space-y-1">
-                        {(
-                          (
-                            currentConnectionData as EntityConnectionDataResponse
-                          ).entityGroups as EntityGroup[]
-                        ).map((group, index) => (
-                          <div
-                            key={group.id || index}
-                            className="grid grid-cols-[1fr_auto_auto] gap-2 items-center text-xs"
-                          >
-                            <div>
-                              {group.methodType?.replace(/_/g, " ") ??
-                                "Unknown Group Method"}
-                            </div>
-                            <div className="text-right">
-                              <span className="text-xs text-muted-foreground">
-                                Pre-RL:{" "}
-                              </span>
-                              {group.preRlConfidenceScore?.toFixed(2) ?? "N/A"}
-                            </div>
-                            <div className="text-right font-medium">
-                              <span className="text-xs text-muted-foreground">
-                                Combined:{" "}
-                              </span>
-                              {group.confidenceScore?.toFixed(2) ?? "N/A"}
-                            </div>
+                  {currentConnectionData ? (
+                    (() => {
+                      const edge =
+                        currentConnectionData.edge as VisualizationEntityEdge;
+                      const methods = edge.details?.methods;
+                      const groups = currentConnectionData.entityGroups;
+
+                      if (
+                        methods &&
+                        Array.isArray(methods) &&
+                        methods.length > 0
+                      ) {
+                        return (
+                          <div className="space-y-1">
+                            {methods.map(
+                              (
+                                method: {
+                                  method_type: string;
+                                  pre_rl_confidence: number;
+                                  rl_confidence: number;
+                                  combined_confidence: number;
+                                },
+                                index: React.Key
+                              ) => (
+                                <div
+                                  key={
+                                    method.method_type
+                                      ? `${method.method_type}-${index}`
+                                      : index
+                                  }
+                                  className="grid grid-cols-[1fr_auto_auto_auto] gap-2 items-center text-xs"
+                                >
+                                  <div className="truncate">
+                                    {method.method_type?.replace(/_/g, " ") ??
+                                      "Unknown Method"}
+                                  </div>
+                                  <div className="text-right">
+                                    <span className="text-xs text-muted-foreground">
+                                      Pre-RL:{" "}
+                                    </span>
+                                    {method.pre_rl_confidence?.toFixed(2) ??
+                                      "N/A"}
+                                  </div>
+                                  <div className="text-right">
+                                    <span className="text-xs text-muted-foreground">
+                                      RL:{" "}
+                                    </span>
+                                    {method.rl_confidence?.toFixed(2) ?? "N/A"}
+                                  </div>
+                                  <div className="text-right font-medium">
+                                    <span className="text-xs text-muted-foreground">
+                                      Combined:{" "}
+                                    </span>
+                                    {method.combined_confidence?.toFixed(2) ??
+                                      "N/A"}
+                                  </div>
+                                </div>
+                              )
+                            )}
                           </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-xs text-muted-foreground">
-                        No detailed matching methods or entity groups available
-                        for this connection.
-                      </p>
-                    )
-                  ) : resolutionMode === "service" &&
-                    currentConnectionData &&
-                    isServiceConnectionData(
-                      currentConnectionData as
-                        | EntityConnectionDataResponse
-                        | ServiceConnectionDataResponse,
-                      resolutionMode
-                    ) ? (
-                    (currentConnectionData as ServiceConnectionDataResponse)
-                      .edge?.details ? (
-                      <pre className="text-xs bg-muted p-2 rounded-md overflow-x-auto">
-                        {JSON.stringify(
-                          (
-                            currentConnectionData as ServiceConnectionDataResponse
-                          ).edge.details,
-                          null,
-                          2
-                        )}
-                      </pre>
-                    ) : (
-                      <p className="text-xs text-muted-foreground">
-                        No specific matching methods detailed for this service
-                        connection.
-                      </p>
-                    )
+                        );
+                      } else if (groups && groups.length > 0) {
+                        return (
+                          <div className="space-y-1">
+                            {groups.map((group, index) => (
+                              <div
+                                key={group.id || index}
+                                className="grid grid-cols-[1fr_auto_auto] gap-2 items-center text-xs"
+                              >
+                                <div className="truncate">
+                                  {group.methodType?.replace(/_/g, " ") ??
+                                    "Unknown Group Method"}
+                                </div>
+                                <div className="text-right">
+                                  <span className="text-xs text-muted-foreground">
+                                    Pre-RL:{" "}
+                                  </span>
+                                  {group.preRlConfidenceScore?.toFixed(2) ??
+                                    "N/A"}
+                                </div>
+                                <div className="text-right font-medium">
+                                  <span className="text-xs text-muted-foreground">
+                                    Combined:{" "}
+                                  </span>
+                                  {group.confidenceScore?.toFixed(2) ?? "N/A"}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        );
+                      } else {
+                        return (
+                          <p className="text-xs text-muted-foreground">
+                            No detailed matching methods or entity groups
+                            available for this connection.
+                          </p>
+                        );
+                      }
+                    })()
                   ) : (
                     <p className="text-xs text-muted-foreground">
-                      Matching method details unavailable or mode/data mismatch.
+                      Matching method details unavailable.
                     </p>
                   )}
                 </CardContent>
@@ -1079,10 +1049,10 @@ export default function ConnectionReviewTools() {
                         className="rounded-md border bg-muted/30 p-2"
                       >
                         <div className="flex justify-between items-center mb-1">
-                          <span className="text-xs font-medium capitalize">
+                          <span className="text-xs font-medium capitalize truncate">
                             {group.methodType.replace(/_/g, " ")} Match Group
                           </span>
-                          <div className="flex gap-2 items-center">
+                          <div className="flex gap-2 items-center flex-shrink-0">
                             <Badge
                               variant={
                                 group.confirmedStatus === "CONFIRMED_MATCH"

@@ -51,7 +51,7 @@ export async function POST(request: NextRequest) {
       },
       userSchema // Pass userSchema as a header
     );
-
+    
     // Return the gateway's response
     return NextResponse.json(gatewayResponse);
 
