@@ -4,18 +4,10 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import type {
-  // EntityNode, // Not directly used, BaseNode is sufficient
-  // EntityLink, // Not directly used, BaseLink is sufficient
   EntityGroup,
-  // ServiceNode, // Not directly used, BaseNode is sufficient
-  // ServiceLink, // Not directly used, BaseLink is sufficient
-  ServiceGroup,
   BaseNode,
   BaseLink,
-  EntityVisualizationDataResponse, // Used for typing currentVisualizationData
-  ServiceVisualizationDataResponse, // Used for typing currentVisualizationData
-  // The user provided VisualizationData interface which seems to be the actual data structure
-  // for the 'data' part of EntityVisualizationDataResponse/ServiceVisualizationDataResponse
+  EntityVisualizationDataResponse,
 } from "@/types/entity-resolution";
 import * as d3 from "d3";
 import {
@@ -36,21 +28,12 @@ import { useResizeObserver } from "@/hooks/use-resize-observer";
 
 export const LARGE_CLUSTER_THRESHOLD = 100; // Threshold for warning
 
-// Define a type that represents the structure of currentVisualizationData based on user's feedback
-// This includes the 'groups' property.
-interface EffectiveVisualizationData {
-  clusterId: string;
-  nodes: BaseNode[];
-  links: BaseLink[];
-  groups: EntityGroup[] | ServiceGroup[] | Record<string, any>;
-}
-
 export default function GraphVisualizer() {
   const {
     resolutionMode,
     selectedClusterId,
     selectedEdgeId,
-    currentVisualizationData, // This is EntityVisualizationDataResponse | ServiceVisualizationDataResponse | null
+    currentVisualizationData, // This is EntityVisualizationDataResponse | null
     actions,
     queries,
   } = useEntityResolution();
@@ -67,9 +50,8 @@ export default function GraphVisualizer() {
 
   const [nodes, setNodes] = useState<BaseNode[]>([]);
   const [links, setLinks] = useState<BaseLink[]>([]);
-  const [displayGroups, setDisplayGroups] = useState<
-    EntityGroup[] | ServiceGroup[]
-  >([]);
+  // REFACTOR: Simplified state to only handle EntityGroup, as ServiceGroup is deprecated.
+  const [displayGroups, setDisplayGroups] = useState<EntityGroup[]>([]);
 
   const [hoverNode, setHoverNode] = useState<string | null>(null);
   const [hoverLink, setHoverLink] = useState<string | null>(null);
@@ -93,9 +75,10 @@ export default function GraphVisualizer() {
   > | null>(null);
   const isProgrammaticZoomRef = useRef(false);
 
+  // REFACTOR: Simplified data processing logic.
+  // The backend now returns EntityGroup for both resolution modes, so the conditional logic is removed.
   const processVisualizationData = useCallback(() => {
-    // Cast currentVisualizationData to the effective structure that includes 'groups'
-    const data = currentVisualizationData as EffectiveVisualizationData | null;
+    const data = currentVisualizationData;
 
     if (!data) {
       setNodes([]);
@@ -110,41 +93,25 @@ export default function GraphVisualizer() {
     const allGroups = data.groups || [];
 
     if (Array.isArray(allGroups)) {
-      if (resolutionMode === "entity") {
-        setDisplayGroups(
-          allGroups.filter(
-            (g): g is EntityGroup =>
-              typeof g === "object" &&
-              g !== null &&
-              "entityId1" in g && // Check for a distinguishing property of EntityGroup
-              "entityId2" in g
-          )
-        );
-      } else if (resolutionMode === "service") {
-        setDisplayGroups(
-          allGroups.filter(
-            (g): g is ServiceGroup =>
-              typeof g === "object" &&
-              g !== null &&
-              "serviceId1" in g && // Check for a distinguishing property of ServiceGroup
-              "serviceId2" in g
-          )
-        );
-      } else {
-        setDisplayGroups([]);
-      }
+      // Filter for valid EntityGroup objects, regardless of resolutionMode.
+      const validGroups = allGroups.filter(
+        (g): g is EntityGroup =>
+          typeof g === "object" &&
+          g !== null &&
+          "entityId1" in g &&
+          "entityId2" in g
+      );
+      setDisplayGroups(validGroups);
     } else {
-      // Handle cases where groups might be Record<string, any>
-      // For now, if it's not an array, we clear displayGroups.
-      // You might need more specific logic if Record<string, any> is a valid format for displayable groups.
       console.warn("Visualization groups data is not an array:", allGroups);
       setDisplayGroups([]);
     }
-  }, [currentVisualizationData, resolutionMode]);
+  }, [currentVisualizationData]);
 
+  // REFACTOR: Simplified contact info computation.
+  // Removed conditional logic for ServiceGroup as it's no longer a distinct type.
   const computeAllNodeContactInfo = useCallback(() => {
-    const data = currentVisualizationData as EffectiveVisualizationData | null;
-    if (!data) return;
+    if (!currentVisualizationData) return;
 
     const allContactInfo: Record<
       string,
@@ -152,7 +119,6 @@ export default function GraphVisualizer() {
     > = {};
 
     for (const node of nodes) {
-      // nodes state is already set by processVisualizationData
       const contactInfo: {
         email?: string;
         phone?: string;
@@ -160,38 +126,15 @@ export default function GraphVisualizer() {
         url?: string;
       } = {};
 
-      // displayGroups state is also set by processVisualizationData
       for (const group of displayGroups) {
         const values = group.matchValues?.values;
-        let isNodeInGroup = false;
-
-        if (resolutionMode === "entity" && "entityId1" in group) {
-          const eg = group as EntityGroup;
-          isNodeInGroup = eg.entityId1 === node.id || eg.entityId2 === node.id;
-        } else if (resolutionMode === "service" && "serviceId1" in group) {
-          const sg = group as ServiceGroup;
-          isNodeInGroup =
-            sg.serviceId1 === node.id || sg.serviceId2 === node.id;
-        }
+        const isNodeInGroup =
+          group.entityId1 === node.id || group.entityId2 === node.id;
 
         if (!isNodeInGroup) continue;
 
-        // Determine which set of values to use (e.g., _1 or _2)
-        // This logic might need refinement if node's role (e.g. entity1 vs entity2) is important for contact info
-        let useSuffix1 = true; // Default assumption
-        if (
-          resolutionMode === "entity" &&
-          "entityId1" in group &&
-          (group as EntityGroup).entityId2 === node.id
-        ) {
-          useSuffix1 = false;
-        } else if (
-          resolutionMode === "service" &&
-          "serviceId1" in group &&
-          (group as ServiceGroup).serviceId2 === node.id
-        ) {
-          useSuffix1 = false;
-        }
+        // Determine which set of values to use (_1 or _2) based on the node's position in the group.
+        const useSuffix1 = group.entityId1 === node.id;
 
         switch (group.matchValues?.type?.toLowerCase()) {
           case "email":
@@ -222,13 +165,13 @@ export default function GraphVisualizer() {
       };
     }
     setNodeContactInfo(allContactInfo);
-  }, [nodes, displayGroups, resolutionMode, currentVisualizationData]);
+  }, [nodes, displayGroups, currentVisualizationData]);
 
   useEffect(() => {
-    if (nodes.length > 0 && (displayGroups.length > 0 || resolutionMode)) {
+    if (nodes.length > 0 && displayGroups.length > 0) {
       computeAllNodeContactInfo();
     }
-  }, [computeAllNodeContactInfo]);
+  }, [computeAllNodeContactInfo, nodes, displayGroups]);
 
   useResizeObserver(containerRef, (entry) => {
     if (entry) {
@@ -250,7 +193,7 @@ export default function GraphVisualizer() {
   }, [selectedClusterId]);
 
   useEffect(() => {
-    const data = currentVisualizationData as EffectiveVisualizationData | null;
+    const data = currentVisualizationData;
     if (!data) {
       setNodes([]);
       setLinks([]);
@@ -650,24 +593,13 @@ export default function GraphVisualizer() {
             ? d_link.target
             : (d_link.target as BaseNode).id;
 
-        const linkSpecificGroups = displayGroups.filter((group) => {
-          if (resolutionMode === "entity" && "entityId1" in group) {
-            const eg = group as EntityGroup;
-            return (
-              (eg.entityId1 === linkSourceId &&
-                eg.entityId2 === linkTargetId) ||
-              (eg.entityId1 === linkTargetId && eg.entityId2 === linkSourceId)
-            );
-          } else if (resolutionMode === "service" && "serviceId1" in group) {
-            const sg = group as ServiceGroup;
-            return (
-              (sg.serviceId1 === linkSourceId &&
-                sg.serviceId2 === linkTargetId) ||
-              (sg.serviceId1 === linkTargetId && sg.serviceId2 === linkSourceId)
-            );
-          }
-          return false;
-        });
+        // REFACTOR: Simplified group filtering logic, as all groups are now EntityGroup.
+        const linkSpecificGroups = displayGroups.filter(
+          (group) =>
+            (group.entityId1 === linkSourceId &&
+              group.entityId2 === linkTargetId) ||
+            (group.entityId1 === linkTargetId && group.entityId2 === linkSourceId)
+        );
 
         let statusHtml = "";
         if (d_link.status === "CONFIRMED_MATCH")
@@ -681,11 +613,9 @@ export default function GraphVisualizer() {
         if (linkSpecificGroups.length > 0) {
           groupsHtml = `<div style="margin-top: 8px;"><div style="font-size: 10px; font-weight: 500; color: #6b7280; margin-bottom: 4px;">Match Methods:</div><div style="max-height: 150px; overflow-y: auto; space-y: 4px; padding-right: 5px;">${linkSpecificGroups
             .map((group) => {
-              const confidence = (group as EntityGroup | ServiceGroup)
-                .confidenceScore // Use confidenceScore
-                ? (
-                    group as EntityGroup | ServiceGroup
-                  ).confidenceScore!.toFixed(3) // Add ! for non-null assertion if sure
+              // REFACTOR: No need to cast to a union type. 'group' is EntityGroup.
+              const confidence = group.confidenceScore
+                ? group.confidenceScore.toFixed(3)
                 : "N/A";
               const matchValuesDisplay = Object.entries(
                 group.matchValues?.values || {}
@@ -911,7 +841,7 @@ export default function GraphVisualizer() {
   }
 
   if (showLargeGraphWarning && !forceRenderLargeGraph) {
-    const data = currentVisualizationData as EffectiveVisualizationData | null;
+    const data = currentVisualizationData;
     return (
       <div className="flex flex-col justify-center items-center h-full text-orange-500 p-4">
         <AlertTriangle className="h-12 w-12 mb-4" />

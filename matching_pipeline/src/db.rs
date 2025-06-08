@@ -12,7 +12,7 @@ use tokio_postgres::{Config, GenericClient, NoTls, Row as PgRow, Transaction}; /
 use uuid::Uuid;
 
 use crate::{
-    models::{EntityId, MatchValues, NewClusterFormationEdge, NewSuggestedAction, ServiceId},
+    models::{EntityId, MatchValues, NewClusterFormationEdge, NewSuggestedAction, ServiceId, VisualizationEdgeData},
     MatchMethodType,
 };
 
@@ -1262,4 +1262,101 @@ pub async fn upsert_service_signature(
     ).await.context("Failed to upsert service_data_signature")?;
     debug!("Upserted service signature for service_id: {}", service_id);
     Ok(())
+}
+
+/// This function is moved from `cluster_visualization.rs` and generalized to be
+/// part of the shared DB module. It efficiently inserts visualization edges in batches.
+pub async fn bulk_insert_visualization_edges(pool: &PgPool, edges: &[VisualizationEdgeData]) -> Result<()> {
+    if edges.is_empty() {
+        return Ok(());
+    }
+
+    const BATCH_SIZE: usize = 1000;
+    let client = pool.get().await.context("Failed to get DB connection for bulk insert")?;
+
+    for chunk in edges.chunks(BATCH_SIZE) {
+        let mut id_vec = Vec::with_capacity(chunk.len());
+        let mut cluster_id_vec = Vec::with_capacity(chunk.len());
+        let mut entity_id_1_vec = Vec::with_capacity(chunk.len());
+        let mut entity_id_2_vec = Vec::with_capacity(chunk.len());
+        let mut edge_weight_vec = Vec::with_capacity(chunk.len());
+        let mut details_vec = Vec::with_capacity(chunk.len());
+        let mut pipeline_run_id_vec = Vec::with_capacity(chunk.len());
+
+        for edge in chunk {
+            id_vec.push(Uuid::new_v4().to_string());
+            cluster_id_vec.push(edge.cluster_id.clone());
+            entity_id_1_vec.push(edge.entity_id_1.clone());
+            entity_id_2_vec.push(edge.entity_id_2.clone());
+            edge_weight_vec.push(edge.edge_weight);
+            details_vec.push(edge.details.clone());
+            pipeline_run_id_vec.push(edge.pipeline_run_id.clone());
+        }
+
+        client.execute(
+            "INSERT INTO public.entity_edge_visualization
+             (id, cluster_id, entity_id_1, entity_id_2, edge_weight, details, pipeline_run_id)
+             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::jsonb[], $7::text[])",
+            &[
+                &id_vec,
+                &cluster_id_vec,
+                &entity_id_1_vec,
+                &entity_id_2_vec,
+                &edge_weight_vec,
+                &details_vec,
+                &pipeline_run_id_vec,
+            ],
+        )
+        .await
+        .context("Failed to insert visualization entity edges in batch")?;
+    }
+
+    Ok(())
+}
+
+/// Counts the number of visualization edges for a given pipeline run.
+pub async fn count_visualization_edges(pool: &PgPool, pipeline_run_id: &str) -> Result<i64> {
+    let client = pool.get().await.context("Failed to get DB connection")?;
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM public.entity_edge_visualization WHERE pipeline_run_id = $1",
+            &[&pipeline_run_id],
+        )
+        .await
+        .context("Failed to count visualization edges")?;
+    Ok(row.get(0))
+}
+
+/// Determine the proper weighting between RL and pre-RL confidence scores
+/// based on historical human feedback. This is moved here to be a shared utility.
+pub async fn get_rl_weight_from_feedback(pool: &PgPool) -> Result<f64> {
+    let client = pool.get().await.context("DB connection failed for RL weight")?;
+    let query = "
+        SELECT
+            COUNT(CASE WHEN is_match_correct = true THEN 1 END) as correct_count,
+            COUNT(CASE WHEN is_match_correct = false THEN 1 END) as incorrect_count
+        FROM clustering_metadata.human_feedback
+        WHERE reviewer_id != 'ml_system'
+    ";
+
+    let result = client.query_opt(query, &[]).await;
+    match result {
+        Ok(Some(row)) => {
+            let correct_count: i64 = row.get("correct_count");
+            let incorrect_count: i64 = row.get("incorrect_count");
+
+            if correct_count + incorrect_count > 0 {
+                let accuracy = correct_count as f64 / (correct_count + incorrect_count) as f64;
+                // Give more weight to RL if it has proven to be accurate
+                let rl_weight = 0.5 + (0.4 * accuracy); // Scale from 0.5 to 0.9
+                Ok(rl_weight.min(0.9))
+            } else {
+                Ok(0.6) // Default weight if no feedback
+            }
+        }
+        _ => {
+            debug!("Could not query human feedback, using default RL weight of 0.6");
+            Ok(0.6)
+        }
+    }
 }

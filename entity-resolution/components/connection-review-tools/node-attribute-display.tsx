@@ -6,10 +6,20 @@ import {
   ChevronUp,
   Phone,
   Briefcase,
-  MapPin, // Added MapPin icon
-  AlertTriangle, // Added for error state
+  MapPin,
+  AlertTriangle,
 } from "lucide-react";
-import type { NodeDetailResponse } from "@/types/entity-resolution"; // Assuming this path is correct
+
+// Import the new detailed types along with the main response type
+import type { 
+    NodeDetailResponse,
+    NodePhone,
+    NodeServiceAttribute,
+    NodeLocation,
+    NodeAddress,
+    Organization,
+    Service
+} from "@/types/entity-resolution"; // Assuming this path is correct
 
 // Assuming your Radix-based Collapsible components are here:
 import {
@@ -18,59 +28,45 @@ import {
   CollapsibleContent,
 } from "@/components/ui/collapsible"; // Adjust path if necessary
 
-// Define a list of high-priority keys for each attribute type
+// UPDATED: Priority fields now use camelCase to match the new types
 const PRIORITY_FIELDS: Record<string, string[]> = {
   location: [
     "name",
     "latitude",
     "longitude",
     "transportation",
-    "location_type",
+    "locationType",
   ],
   phone: ["number", "type", "language", "description"],
-  service: [
-    "name",
-    "description",
-    "short_description",
-    "application_process",
-    "eligibility_description",
-    "url",
-    "email",
-    "alternate_name",
-    "status",
-    "alert",
-  ],
-  organization: ["name", "id"],
+  // Simplified service fields to match available data in NodeServiceAttribute
+  service: ["name", "sourceSystem", "updatedAt"], 
   address: [
-    "address_1",
-    "address_2",
+    "address1",
+    "address2",
     "city",
-    "state_province",
-    "postal_code",
+    "stateProvince",
+    "postalCode",
     "country",
-    "address_type",
+    "addressType",
     "attention",
   ],
 };
 
 const LOW_PRIORITY_COMMON_FIELDS = [
   "id",
-  "original_id",
-  "original_translations_id",
-  "contributor_id",
-  "organization_id",
-  "service_id",
+  "originalId",
+  "originalTranslationsId",
+  "contributorId",
+  "organizationId",
+  "serviceId",
   "created",
-  "created_at",
-  "last_modified",
-  "updated_at",
-  "embedding_v2_updated_at",
-  "maximum_age",
-  "fees_description",
+  "createdAt",
+  "lastModified",
+  "updatedAt",
 ];
 
 interface NodeAttributesDisplayProps {
-  nodeDetails: NodeDetailResponse | null | "loading" | "error"; // Updated to include "error"
+  nodeDetails: NodeDetailResponse | null | "loading" | "error";
   isAttributesOpen: boolean;
   setIsAttributesOpen: (open: boolean) => void;
 }
@@ -80,8 +76,6 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
   isAttributesOpen,
   setIsAttributesOpen,
 }) => {
-  
-
   if (nodeDetails === "loading") {
     return (
       <div className="text-xs text-muted-foreground flex items-center">
@@ -89,7 +83,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       </div>
     );
   }
-  // Handle error state
+  
   if (nodeDetails === "error") {
     return (
       <div className="text-xs text-destructive-foreground flex items-center bg-destructive/10 p-2 rounded-md">
@@ -97,6 +91,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       </div>
     );
   }
+
   if (!nodeDetails) {
     return (
       <div className="text-xs text-muted-foreground">Details unavailable.</div>
@@ -112,74 +107,67 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       return value.toLocaleDateString() + " " + value.toLocaleTimeString();
     if (
       typeof value === "string" &&
-      /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(value)
+      /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(value)
     ) {
       try {
         const date = new Date(value);
         return date.toLocaleDateString() + " " + date.toLocaleTimeString();
-      } catch {}
+      } catch {
+        // Fallback for invalid date strings
+        return value;
+      }
     }
     return String(value);
   };
+  
+  // Helper to convert camelCase to Title Case (e.g., postalCode -> Postal Code)
+  const camelCaseToTitleCase = (text: string) => {
+    const result = text.replace(/([A-Z])/g, " $1");
+    return result.charAt(0).toUpperCase() + result.slice(1);
+  };
+
 
   let primaryPhoneNumber: string | null = null;
-  if (
-    attributes?.phone &&
-    Array.isArray(attributes.phone) &&
-    attributes.phone.length > 0
-  ) {
-    const voicePhone = attributes.phone.find(
-      (p) => p.type === "voice" && p.number
-    );
-    if (voicePhone) {
-      primaryPhoneNumber = voicePhone.number;
-    } else if (attributes.phone[0]?.number) {
-      primaryPhoneNumber = attributes.phone[0].number;
-    }
+  if (attributes?.phones && attributes.phones.length > 0) {
+    const voicePhone = attributes.phones.find((p) => p.type === "voice" && p.number);
+    primaryPhoneNumber = voicePhone?.number || attributes.phones[0]?.number || null;
   }
 
   let serviceNames: string[] = [];
-  if (attributes?.service && Array.isArray(attributes.service)) {
-    serviceNames = attributes.service.map((s) => s.name).filter((name) => name);
+  if (attributes?.services && attributes.services.length > 0) {
+    serviceNames = attributes.services.map((s) => s.name).filter(Boolean);
   }
 
-  // Extract primary address for Core Information
   let primaryAddressString: string | null = null;
-  if (
-    attributes?.address &&
-    Array.isArray(attributes.address) &&
-    attributes.address.length > 0
-  ) {
-    const addr = attributes.address[0]; // Take the first address
+  if (attributes?.addresses && attributes.addresses.length > 0) {
+    const addr = attributes.addresses[0]; // Take the first address
     const addressParts: string[] = [];
 
-    // Street part (address_1 and optional address_2)
-    if (addr.address_1) {
-      let streetPart = addr.address_1;
-      if (addr.address_2) {
-        streetPart += `, ${addr.address_2}`;
+    // FIXED: Use camelCase properties (address1, address2)
+    if (addr.address1) {
+      let streetPart = addr.address1;
+      if (addr.address2) {
+        streetPart += `, ${addr.address2}`;
       }
       addressParts.push(streetPart);
     }
 
-    // City, State ZIP part
+    // FIXED: Use camelCase properties (city, stateProvince, postalCode)
     let cityStateZipPart = "";
     if (addr.city) {
       cityStateZipPart += addr.city;
     }
-    if (addr.state_province) {
-      cityStateZipPart += (cityStateZipPart ? ", " : "") + addr.state_province;
+    if (addr.stateProvince) {
+      cityStateZipPart += (cityStateZipPart ? ", " : "") + addr.stateProvince;
     }
-    if (addr.postal_code) {
-      // Add space if state_province was just added, otherwise add a comma if cityStateZipPart is not empty
-      const prefix = (cityStateZipPart && cityStateZipPart.endsWith(addr.state_province || '')) ? " " : (cityStateZipPart ? ", " : "");
-      cityStateZipPart += prefix + addr.postal_code;
+    if (addr.postalCode) {
+      const prefix = (cityStateZipPart && addr.stateProvince) ? " " : (cityStateZipPart ? ", " : "");
+      cityStateZipPart += prefix + addr.postalCode;
     }
     if (cityStateZipPart) {
       addressParts.push(cityStateZipPart);
     }
     
-    // Country part
     if (addr.country) {
       addressParts.push(addr.country);
     }
@@ -187,14 +175,13 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
     primaryAddressString = addressParts.filter(Boolean).join(', ');
   }
 
-
   const renderAttributeItem = (
-    item: any,
+    item: NodePhone | NodeServiceAttribute | NodeLocation | NodeAddress,
     attributeKey: string,
     itemIndex: number
   ) => {
     const itemKeys = Object.keys(item).filter(
-      (key) => item[key] !== null && item[key] !== ""
+      (key) => item[key as keyof typeof item] !== null && item[key as keyof typeof item] !== ""
     );
     const prioritySubKeys = PRIORITY_FIELDS[attributeKey] || [];
 
@@ -202,19 +189,11 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
     const secondaryContent: JSX.Element[] = [];
 
     itemKeys.forEach((subKey) => {
-      const formattedSubKey = subKey
-        .replace(/_/g, " ")
-        .replace(/([A-Z])/g, " $1")
-        .trim();
-      const displayValue = formatValue(item[subKey]);
+      // FIXED: Use camelCaseToTitleCase for better display names
+      const formattedSubKey = camelCaseToTitleCase(subKey);
+      const displayValue = formatValue(item[subKey as keyof typeof item]);
 
-      if (
-        displayValue === "N/A" &&
-        !prioritySubKeys.includes(subKey) &&
-        subKey !== "alternate_name" &&
-        subKey !== "description" &&
-        subKey !== "short_description"
-      ) {
+      if (displayValue === "N/A" && !prioritySubKeys.includes(subKey)) {
         return;
       }
 
@@ -227,66 +206,16 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
         </div>
       );
 
-      if (
-        prioritySubKeys.includes(subKey) ||
-        (!LOW_PRIORITY_COMMON_FIELDS.includes(subKey) &&
-          !subKey.endsWith("_id") &&
-          !subKey.includes("date") &&
-          !subKey.includes("created") &&
-          !subKey.includes("modified") &&
-          subKey !== "geom")
-      ) {
+      if (prioritySubKeys.includes(subKey) || !LOW_PRIORITY_COMMON_FIELDS.includes(subKey)) {
         primaryContent.push(element);
       } else {
-        if (subKey !== "geom") {
-          secondaryContent.push(element);
-        }
+        secondaryContent.push(element);
       }
     });
 
-    if (
-      attributeKey === "service" &&
-      item.alternate_name &&
-      typeof item.alternate_name === "string"
-    ) {
-      const altNamesRaw = item.alternate_name.split(",");
-      if (altNamesRaw.length > 1 || item.alternate_name.length > 100) {
-        const altNames = altNamesRaw
-          .map((an: string) => an.trim())
-          .filter((an: string) => an);
-        if (altNames.length > 0) {
-          const altNameIndex = primaryContent.findIndex(
-            (el) => el.key === "alternate_name"
-          );
-          const contentToReplaceWithList = (
-            <div key="alternate_name_list" className="mt-1 w-full">
-              <span className="font-medium capitalize text-gray-700">
-                Alternate Names:
-              </span>
-              <ul className="list-disc list-inside ml-1 space-y-0.5">
-                {altNames.map((an: string, i: number) => (
-                  <li
-                    key={`${attributeKey}-altname-${itemIndex}-${i}`}
-                    className="text-gray-600 text-xs"
-                  >
-                    {an}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          );
-          if (altNameIndex !== -1) {
-            primaryContent[altNameIndex] = contentToReplaceWithList;
-          } else {
-            primaryContent.push(contentToReplaceWithList);
-          }
-        }
-      }
-    }
-
     return (
       <li
-        key={item.id || `${attributeKey}-${itemIndex}`}
+        key={'id' in item ? item.id : `${attributeKey}-${itemIndex}`}
         className="py-2 px-3 mb-2 bg-slate-50 rounded-md shadow-sm border border-slate-200"
       >
         <div className="space-y-1">{primaryContent}</div>
@@ -300,7 +229,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       </li>
     );
   };
-
+  
   const CollapsibleItem: React.FC<{
     title: string;
     children: React.ReactNode;
@@ -327,11 +256,9 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
 
   const displayedAttributesCount = attributes
     ? Object.entries(attributes).filter(([attrKey, attrValues]) => {
-        if (attrKey === "phone" && primaryPhoneNumber) return false;
-        if (attrKey === "service" && serviceNames.length > 0) return false;
-        // If primaryAddressString is set, it means attributes.address[0] is shown in Core Info.
-        // So, we skip the 'address' key from "Additional Attributes" count and rendering.
-        if (attrKey === "address" && primaryAddressString) return false;
+        if (attrKey === "phones" && primaryPhoneNumber) return false;
+        if (attrKey === "services" && serviceNames.length > 0) return false;
+        if (attrKey === "addresses" && primaryAddressString) return false;
         return Array.isArray(attrValues) && attrValues.length > 0;
       }).length
     : 0;
@@ -355,8 +282,9 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
           </div>
           <div>
             <span className="font-medium text-slate-600">Source System:</span>
+            {/* FIXED: Use camelCase sourceSystem and sourceId */}
             <span className="text-slate-500 ml-1">
-              {baseData.source_system || "N/A"} ({baseData.source_id || "N/A"})
+              {baseData.sourceSystem || "N/A"} ({baseData.sourceId || "N/A"})
             </span>
           </div>
           {primaryPhoneNumber && (
@@ -368,7 +296,6 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
               <span className="text-slate-700 ml-1">{primaryPhoneNumber}</span>
             </div>
           )}
-          {/* Display Primary Address */}
           {primaryAddressString && (
             <div className="sm:col-span-2">
               <span className="font-medium text-slate-600 flex items-center">
@@ -391,23 +318,6 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
                       serviceNames.length - 2
                     } more`}
               </span>
-              {serviceNames.length > 2 && (
-                <CollapsibleItem
-                  title="View all services"
-                  initiallyOpen={false}
-                >
-                  <ul className="list-disc list-inside ml-2 mt-1">
-                    {serviceNames.map((name, index) => (
-                      <li
-                        key={`service-name-${index}`}
-                        className="text-slate-600"
-                      >
-                        {name}
-                      </li>
-                    ))}
-                  </ul>
-                </CollapsibleItem>
-              )}
             </div>
           )}
         </div>
@@ -432,18 +342,15 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
           <CollapsibleContent>
             <div className="space-y-3 mt-2 pt-3 border-t border-gray-200">
               {Object.entries(attributes).map(([attrKey, attrValues]) => {
-                if (attrKey === "phone" && primaryPhoneNumber) return null;
-                if (attrKey === "service" && serviceNames.length > 0) return null;
-                // If primaryAddressString is set, skip rendering 'address' in additional attributes
-                if (attrKey === "address" && primaryAddressString) return null;
+                // FIXED: Check correct keys ('phones', 'services', 'addresses')
+                if (attrKey === "phones" && primaryPhoneNumber) return null;
+                if (attrKey === "services" && serviceNames.length > 0) return null;
+                if (attrKey === "addresses" && primaryAddressString) return null;
 
                 if (!Array.isArray(attrValues) || attrValues.length === 0) {
                   return null;
                 }
-                const humanReadableAttrKey = attrKey
-                  .replace(/_/g, " ")
-                  .replace(/([A-Z])/g, " $1")
-                  .trim();
+                const humanReadableAttrKey = camelCaseToTitleCase(attrKey);
                 return (
                   <div key={attrKey} className="pt-2">
                     <h5 className="font-semibold capitalize text-slate-800 mb-1 text-base">
@@ -454,7 +361,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
                       </span>
                     </h5>
                     <ul className="space-y-0 list-none p-0">
-                      {attrValues.map((val: any, valIndex: number) =>
+                      {attrValues.map((val, valIndex) =>
                         renderAttributeItem(val, attrKey, valIndex)
                       )}
                     </ul>

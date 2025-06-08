@@ -5,8 +5,8 @@ const GATEWAY_BASE_URL =
   process.env.GATEWAY_BASE_URL || "http://localhost:4001/v1";
 const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY;
 
-console.log("GATEWAY_BASE_URL", GATEWAY_BASE_URL);
-console.log("GATEWAY_API_KEY", GATEWAY_API_KEY);
+// console.log("GATEWAY_BASE_URL", GATEWAY_BASE_URL);
+// console.log("GATEWAY_API_KEY", GATEWAY_API_KEY);
 
 interface FetchOptions extends RequestInit {
   params?: Record<string, string | number | boolean | undefined>;

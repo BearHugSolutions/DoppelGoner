@@ -51,6 +51,7 @@ export async function POST(request: NextRequest) {
       userSchema // Pass userSchema as a header
     );
 
+    // console.log("Bulk visualizations gateway response:", JSON.stringify(gatewayResponse[0]));
     // Return the gateway's response
     return NextResponse.json(gatewayResponse);
 

@@ -32,9 +32,3 @@ export const sessionOptions: SessionOptions = {
     // path: '/', // Usually defaults to /
   },
 };
-
-// Log to confirm sessionOptions are set up, especially during development
-console.log('Session options configured. Cookie name:', sessionOptions.cookieName);
-if (process.env.NODE_ENV !== 'production') {
-  console.log('SECRET_COOKIE_PASSWORD is set and has a length of:', secretCookiePassword.length);
-}
