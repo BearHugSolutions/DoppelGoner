@@ -16,7 +16,6 @@ use tokio::{
 use uuid::Uuid;
 
 use dedupe_lib::{
-    cluster_visualization,
     consolidate_clusters,
     db::{self, PgPool},
     entity_organizations,
@@ -47,8 +46,6 @@ use dedupe_lib::{
 
 // Define the concurrency limit for matching tasks
 const MAX_CONCURRENT_MATCHING_TASKS: usize = 10; // Default, can be overridden by BatchConfig
-
-// const EST_WORK_SAMPLE_SIZE: usize = 100; // This constant doesn't seem to be used
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -134,7 +131,7 @@ async fn run_pipeline(
         service_stats: None,
     };
 
-    info!("Pipeline started. Progress: [0/8] phases (0%)");
+    info!("Pipeline started. Progress: [0/4] phases (0%)");
 
     // Phase 1: Entity identification
     let phase1_start = Instant::now();
@@ -146,7 +143,7 @@ async fn run_pipeline(
         "Identified {} entities in {:.2?}. Phase 1 complete.",
         stats.total_entities, phase1_duration
     );
-    info!("Pipeline progress: [1/8] phases (12.5%)");
+    info!("Pipeline progress: [1/4] phases (25%)");
 
     // Phase 2: Entity Context Feature Extraction and Cache Pre-warming
     let entity_feature_cache: SharedFeatureCache = create_shared_cache();
@@ -179,7 +176,7 @@ async fn run_pipeline(
     );
     stats.context_feature_extraction_time = phase2_duration.as_secs_f64();
     info!("Entity Context Feature Extraction and Cache Pre-warming complete in {:.2?}. Phase 2 complete.", phase2_duration);
-    info!("Pipeline progress: [2/8] phases (25%)");
+    info!("Pipeline progress: [2/4] phases (50%)");
 
     // Initialize Entity MatchingOrchestrator
     let entity_matching_orchestrator_instance = MatchingOrchestrator::new(pool)
@@ -209,46 +206,24 @@ async fn run_pipeline(
         "Created {} entity groups in {:.2?}. Phase 3 complete.",
         stats.total_groups, phase3_duration
     );
-    info!("Pipeline progress: [3/8] phases (37.5%)");
+    info!("Pipeline progress: [3/4] phases (75%)");
 
-    // Phase 4: Cluster consolidation
+    // Phase 4: Cluster consolidation & Visualization Edge Calculation
     let phase4_start = Instant::now();
-    stats.total_clusters =
-        consolidate_clusters_helper(pool, entity_matching_orchestrator, stats.run_id.clone())
-            .await?;
+    let (clusters_created, viz_edges_created) =
+        consolidate_clusters_helper(pool, stats.run_id.clone()).await?;
+    stats.total_clusters = clusters_created;
+    stats.total_visualization_edges = viz_edges_created;
     let phase4_duration = phase4_start.elapsed();
     phase_times.insert("cluster_consolidation".to_string(), phase4_duration);
     stats.clustering_time = phase4_duration.as_secs_f64();
+    // Visualization edge calculation is now part of the clustering time and not a separate step
+    stats.visualization_edge_calculation_time = 0.0;
     info!(
-        "Formed {} clusters in {:.2?}. Phase 4 complete.",
-        stats.total_clusters, phase4_duration
+        "Formed {} clusters and {} visualization edges in {:.2?}. Phase 4 complete.",
+        stats.total_clusters, stats.total_visualization_edges, phase4_duration
     );
-    info!("Pipeline progress: [4/8] phases (50%)");
-
-    // Phase 5: Visualization edge calculation
-    let clusters_changed = stats.total_clusters > 0; // Or some other logic to determine if recalculation is needed
-    let existing_viz_edges =
-        cluster_visualization::visualization_edges_exist(pool, &stats.run_id).await?;
-    if clusters_changed || !existing_viz_edges {
-        let phase5_start = Instant::now();
-        cluster_visualization::ensure_visualization_tables_exist(pool).await?;
-        stats.total_visualization_edges =
-            cluster_visualization::calculate_visualization_edges(pool, &stats.run_id).await?;
-        let phase5_duration = phase5_start.elapsed();
-        phase_times.insert(
-            "visualization_edge_calculation".to_string(),
-            phase5_duration,
-        );
-        stats.visualization_edge_calculation_time = phase5_duration.as_secs_f64();
-        info!(
-            "Calculated {} entity viz edges in {:.2?}. Phase 5 complete.",
-            stats.total_visualization_edges, phase5_duration
-        );
-    } else {
-        info!("Skipping entity viz edge calculation as no changes or edges already exist. Phase 5 complete.");
-        stats.visualization_edge_calculation_time = 0.0; // Ensure it's set
-    }
-    info!("Pipeline progress: [5/8] phases (62.5%)");
+    info!("Pipeline progress: [4/4] phases (100%)");
 
     stats.total_processing_time = phase_times.values().map(|d| d.as_secs_f64()).sum();
     Ok(stats)
@@ -488,9 +463,8 @@ async fn run_entity_matching_pipeline(
 
 async fn consolidate_clusters_helper(
     pool: &PgPool,
-    _reinforcement_orchestrator: Arc<Mutex<MatchingOrchestrator>>, // Parameter kept for signature consistency if needed later
     run_id: String,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let conn = pool
         .get()
         .await
@@ -509,9 +483,16 @@ async fn consolidate_clusters_helper(
     );
     if unassigned_groups == 0 {
         info!("No groups require clustering. Skipping consolidation.");
-        return Ok(0); // No clusters formed if no groups to assign
+        return Ok((0, 0)); // No clusters formed if no groups to assign
     }
-    consolidate_clusters::process_clusters(pool, &run_id)
+
+    // This single call now handles clustering and creating visualization edge data.
+    let clusters_created = consolidate_clusters::process_clusters(pool, &run_id)
         .await
-        .context("Failed to process clusters")
+        .context("Failed to process clusters")?;
+
+    // After the process, we query the db to get the count of edges for the report.
+    let viz_edges_created = db::count_visualization_edges(pool, &run_id).await? as usize;
+
+    Ok((clusters_created, viz_edges_created))
 }

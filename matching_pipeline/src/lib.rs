@@ -1,5 +1,4 @@
 // src/lib.rs
-pub mod cluster_visualization;
 pub mod config;
 pub mod consolidate_clusters;
 pub mod db;

@@ -1,6 +1,7 @@
 // src/models.rs
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug; // Import the Debug trait
 
 use bytes::BytesMut;
 use chrono::NaiveDateTime;
@@ -8,6 +9,7 @@ use postgres_types::{FromSql, IsNull, ToSql, Type};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use uuid::Uuid;
+use xgraph::{graph::graph::NodeId, Graph};
 
 //------------------------------------------------------------------------------
 // IDENTIFIER TYPES
@@ -688,4 +690,58 @@ pub struct ContributingSharedServiceDetail {
     pub conf_service_in_target_group: f64,
     #[serde(rename = "W_z")]
     pub w_z: f64,
+}
+
+// This struct, inspired by cluster_visualization.rs, holds the necessary data
+// for calculating a consolidated edge weight between two entities.
+#[derive(Debug, Clone)]
+pub struct EntityGroupRecord {
+    pub(crate) id: String,
+    pub(crate) method_type: String,
+    pub(crate) confidence_score: Option<f64>,
+    pub(crate) pre_rl_confidence_score: Option<f64>,
+}
+
+// Struct to hold visualization edge data before it's inserted into the database.
+#[derive(Debug, Clone)]
+pub struct VisualizationEdgeData {
+    pub cluster_id: String,
+    pub entity_id_1: String,
+    pub entity_id_2: String,
+    pub edge_weight: f64,
+    pub details: serde_json::Value,
+    pub pipeline_run_id: String,
+}
+
+// A generic mapper to handle conversions between your application's IDs and xgraph's numeric NodeIds.
+#[derive(Debug)]
+pub struct NodeMapper<T: std::hash::Hash + Eq + Clone> {
+    id_to_idx: HashMap<T, NodeId>,
+    idx_to_id: HashMap<NodeId, T>,
+}
+
+// FIX: Add the `Debug` trait bound to `T` as required by `xgraph`.
+impl<T: std::hash::Hash + Eq + Clone + Debug> NodeMapper<T> {
+    pub fn new() -> Self {
+        NodeMapper {
+            id_to_idx: HashMap::new(),
+            idx_to_id: HashMap::new(),
+        }
+    }
+
+    pub fn get_or_add_node(&mut self, graph: &mut Graph<f64, T, ()>, id: T) -> NodeId {
+        *self.id_to_idx.entry(id.clone()).or_insert_with(|| {
+            let node_idx = graph.add_node(id.clone());
+            self.idx_to_id.insert(node_idx, id);
+            node_idx
+        })
+    }
+
+    pub fn get_id(&self, idx: NodeId) -> Option<&T> {
+        self.idx_to_id.get(&idx)
+    }
+
+    pub fn get_node_count(&self) -> usize {
+        self.idx_to_id.len()
+    }
 }
