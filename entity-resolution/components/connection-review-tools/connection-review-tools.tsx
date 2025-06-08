@@ -30,6 +30,8 @@ import {
   ChevronRight,
   DownloadCloud,
   ChevronsRight,
+  Maximize,
+  Minimize,
 } from "lucide-react";
 import type {
   VisualizationEntityEdge,
@@ -54,6 +56,7 @@ export default function ConnectionReviewTools() {
     currentConnectionData,
     currentVisualizationData,
     selectedClusterDetails,
+    isReviewToolsMaximized, // Get the new state from context
     actions,
     queries,
     reviewQueue,
@@ -402,7 +405,7 @@ export default function ConnectionReviewTools() {
 
   if (!selectedClusterId) {
     return (
-      <div className="flex justify-center items-center h-[100px] text-muted-foreground p-4 border rounded-md bg-card shadow">
+      <div className="flex justify-center items-center h-full text-muted-foreground p-4 border rounded-md bg-card shadow">
         Select a cluster to begin reviewing connections.
       </div>
     );
@@ -456,14 +459,14 @@ export default function ConnectionReviewTools() {
   ) {
     if (isLoadingConnectionPageData && isSelectedClusterLarge) {
       return (
-        <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
+        <div className="flex justify-center items-center h-full border rounded-md bg-card shadow">
           <Loader2 className="h-6 w-6 animate-spin text-primary mr-2" />{" "}
           Initializing connections...
         </div>
       );
     }
     return (
-      <div className="flex justify-center items-center h-[100px] text-muted-foreground p-4 border rounded-md bg-card shadow">
+      <div className="flex justify-center items-center h-full text-muted-foreground p-4 border rounded-md bg-card shadow">
         Select a connection from the graph to review its details.
         {isPagingActiveForSelectedCluster &&
           edgeSelectionInfo.totalEdges === 0 &&
@@ -478,7 +481,7 @@ export default function ConnectionReviewTools() {
 
   if (isLoadingUI && !currentConnectionData) {
     return (
-      <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
+      <div className="flex justify-center items-center h-full border rounded-md bg-card shadow">
         <Loader2 className="h-6 w-6 animate-spin text-primary" />
       </div>
     );
@@ -530,7 +533,7 @@ export default function ConnectionReviewTools() {
   if (!currentConnectionData && selectedEdgeId) {
     if (!isLoadingUI && !errorUI) {
       return (
-        <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
+        <div className="flex justify-center items-center h-full border rounded-md bg-card shadow">
           <Loader2 className="h-6 w-6 animate-spin text-primary mr-2" /> Loading
           connection data...
         </div>
@@ -539,8 +542,6 @@ export default function ConnectionReviewTools() {
     return null;
   }
 
-  // Simplified data handling: No more checks for `isEntityConnectionData` are needed here,
-  // as the context now provides a consistent `EntityConnectionDataResponse`.
   const data = currentConnectionData;
   const edgeDetails = data?.edge as VisualizationEntityEdge | undefined;
   const groupsForEdge = data?.entityGroups || [];
@@ -553,7 +554,7 @@ export default function ConnectionReviewTools() {
       (isLoadingConnectionPageData && isPagingActiveForSelectedCluster)
     ) {
       return (
-        <div className="flex justify-center items-center h-[100px] border rounded-md bg-card shadow">
+        <div className="flex justify-center items-center h-full border rounded-md bg-card shadow">
           <Loader2 className="h-6 w-6 animate-spin text-primary mr-2" /> Loading
           details...
         </div>
@@ -688,20 +689,39 @@ export default function ConnectionReviewTools() {
             </Badge>
           )}
         </div>
-        <CollapsibleTrigger asChild>
+        <div className="flex items-center">
           <Button
             variant="ghost"
             size="sm"
-            disabled={isAnyGeneralOperationPending || isContinuing}
+            onClick={() =>
+              actions.setIsReviewToolsMaximized(!isReviewToolsMaximized)
+            }
+            title={isReviewToolsMaximized ? "Restore" : "Maximize"}
           >
-            {isExpanded ? (
-              <ChevronUp className="h-4 w-4" />
+            {isReviewToolsMaximized ? (
+              <Minimize className="h-4 w-4" />
             ) : (
-              <ChevronDown className="h-4 w-4" />
+              <Maximize className="h-4 w-4" />
             )}
-            <span className="sr-only">Toggle review panel</span>
+            <span className="sr-only">
+              {isReviewToolsMaximized ? "Restore" : "Maximize"}
+            </span>
           </Button>
-        </CollapsibleTrigger>
+          <CollapsibleTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={isAnyGeneralOperationPending || isContinuing}
+            >
+              {isExpanded ? (
+                <ChevronUp className="h-4 w-4" />
+              ) : (
+                <ChevronDown className="h-4 w-4" />
+              )}
+              <span className="sr-only">Toggle review panel</span>
+            </Button>
+          </CollapsibleTrigger>
+        </div>
       </div>
 
       <CollapsibleContent className="flex-1 min-h-0">
