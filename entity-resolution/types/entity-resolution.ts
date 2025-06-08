@@ -41,6 +41,7 @@ export interface Organization {
   updatedAt: string | null; // NaiveDateTime from Rust becomes string
   sourceSystem: string | null;
   sourceId: string | null;
+  url?: string | null;
 }
 
 export interface Service {
@@ -51,6 +52,7 @@ export interface Service {
   updatedAt: string | null;
   sourceSystem: string | null;
   sourceId: string | null;
+  url?: string | null;
 }
 
 /**
@@ -87,6 +89,7 @@ export interface NodeServiceAttribute {
   createdAt: string;
   updatedAt: string;
   sourceSystem: string;
+  url?: string | null;
 }
 
 /**

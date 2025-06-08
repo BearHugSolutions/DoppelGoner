@@ -8,6 +8,7 @@ import {
   Briefcase,
   MapPin,
   AlertTriangle,
+  Link,
 } from "lucide-react";
 
 // Import the new detailed types along with the main response type
@@ -39,7 +40,7 @@ const PRIORITY_FIELDS: Record<string, string[]> = {
   ],
   phone: ["number", "type", "language", "description"],
   // Simplified service fields to match available data in NodeServiceAttribute
-  service: ["name", "sourceSystem", "updatedAt"], 
+  service: ["name", "sourceSystem", "updatedAt", "url"], 
   address: [
     "address1",
     "address2",
@@ -151,8 +152,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       }
       addressParts.push(streetPart);
     }
-
-    // FIXED: Use camelCase properties (city, stateProvince, postalCode)
+    
     let cityStateZipPart = "";
     if (addr.city) {
       cityStateZipPart += addr.city;
@@ -196,13 +196,21 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       if (displayValue === "N/A" && !prioritySubKeys.includes(subKey)) {
         return;
       }
+      
+      const isUrl = subKey === 'url' && typeof displayValue === 'string' && (displayValue.startsWith('http://') || displayValue.startsWith('https://'));
 
       const element = (
         <div key={subKey} className="mb-1">
           <span className="font-medium capitalize text-gray-700">
             {formattedSubKey}:
           </span>
-          <span className="text-gray-600 ml-1 break-all">{displayValue}</span>
+          {isUrl ? (
+            <a href={displayValue} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline ml-1 break-all">
+                {displayValue}
+            </a>
+          ) : (
+            <span className="text-gray-600 ml-1 break-all">{displayValue}</span>
+          )}
         </div>
       );
 
@@ -303,6 +311,22 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
                 Address:
               </span>
               <span className="text-slate-700 ml-1">{primaryAddressString}</span>
+            </div>
+          )}
+          {'url' in baseData && baseData.url && (
+            <div className="sm:col-span-2">
+                <span className="font-medium text-slate-600 flex items-center">
+                    <Link size={12} className="mr-1.5 text-slate-500" />
+                    URL:
+                </span>
+                <a 
+                    href={baseData.url} 
+                    target="_blank" 
+                    rel="noopener noreferrer"
+                    className="text-blue-600 hover:underline ml-1 break-all"
+                >
+                    {baseData.url}
+                </a>
             </div>
           )}
           {serviceNames.length > 0 && (
