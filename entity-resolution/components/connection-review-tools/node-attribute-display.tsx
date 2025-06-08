@@ -1,4 +1,4 @@
-// /components/connection-review-tools/node-attribute-display.tsx
+// /components/node-attribute-display.tsx
 import React, { JSX, useState } from "react";
 import {
   Loader2,
@@ -12,14 +12,14 @@ import {
 } from "lucide-react";
 
 // Import the new detailed types along with the main response type
-import type { 
-    NodeDetailResponse,
-    NodePhone,
-    NodeServiceAttribute,
-    NodeLocation,
-    NodeAddress,
-    Organization,
-    Service
+import type {
+  NodeDetailResponse,
+  NodePhone,
+  NodeServiceAttribute,
+  NodeLocation,
+  NodeAddress,
+  Organization,
+  Service,
 } from "@/types/entity-resolution"; // Assuming this path is correct
 
 // Assuming your Radix-based Collapsible components are here:
@@ -31,16 +31,10 @@ import {
 
 // UPDATED: Priority fields now use camelCase to match the new types
 const PRIORITY_FIELDS: Record<string, string[]> = {
-  location: [
-    "name",
-    "latitude",
-    "longitude",
-    "transportation",
-    "locationType",
-  ],
+  location: ["name", "latitude", "longitude", "transportation", "locationType"],
   phone: ["number", "type", "language", "description"],
   // Simplified service fields to match available data in NodeServiceAttribute
-  service: ["name", "sourceSystem", "updatedAt", "url"], 
+  service: ["name", "sourceSystem", "updatedAt", "url"],
   address: [
     "address1",
     "address2",
@@ -67,12 +61,14 @@ const LOW_PRIORITY_COMMON_FIELDS = [
 ];
 
 interface NodeAttributesDisplayProps {
+  node: Organization | Service;
   nodeDetails: NodeDetailResponse | null | "loading" | "error";
   isAttributesOpen: boolean;
   setIsAttributesOpen: (open: boolean) => void;
 }
 
 const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
+  node,
   nodeDetails,
   isAttributesOpen,
   setIsAttributesOpen,
@@ -84,7 +80,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       </div>
     );
   }
-  
+
   if (nodeDetails === "error") {
     return (
       <div className="text-xs text-destructive-foreground flex items-center bg-destructive/10 p-2 rounded-md">
@@ -120,18 +116,20 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
     }
     return String(value);
   };
-  
+
   // Helper to convert camelCase to Title Case (e.g., postalCode -> Postal Code)
   const camelCaseToTitleCase = (text: string) => {
     const result = text.replace(/([A-Z])/g, " $1");
     return result.charAt(0).toUpperCase() + result.slice(1);
   };
 
-
   let primaryPhoneNumber: string | null = null;
   if (attributes?.phones && attributes.phones.length > 0) {
-    const voicePhone = attributes.phones.find((p) => p.type === "voice" && p.number);
-    primaryPhoneNumber = voicePhone?.number || attributes.phones[0]?.number || null;
+    const voicePhone = attributes.phones.find(
+      (p) => p.type === "voice" && p.number
+    );
+    primaryPhoneNumber =
+      voicePhone?.number || attributes.phones[0]?.number || null;
   }
 
   let serviceNames: string[] = [];
@@ -144,7 +142,6 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
     const addr = attributes.addresses[0]; // Take the first address
     const addressParts: string[] = [];
 
-    // FIXED: Use camelCase properties (address1, address2)
     if (addr.address1) {
       let streetPart = addr.address1;
       if (addr.address2) {
@@ -152,7 +149,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       }
       addressParts.push(streetPart);
     }
-    
+
     let cityStateZipPart = "";
     if (addr.city) {
       cityStateZipPart += addr.city;
@@ -161,18 +158,23 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       cityStateZipPart += (cityStateZipPart ? ", " : "") + addr.stateProvince;
     }
     if (addr.postalCode) {
-      const prefix = (cityStateZipPart && addr.stateProvince) ? " " : (cityStateZipPart ? ", " : "");
+      const prefix =
+        cityStateZipPart && addr.stateProvince
+          ? " "
+          : cityStateZipPart
+          ? ", "
+          : "";
       cityStateZipPart += prefix + addr.postalCode;
     }
     if (cityStateZipPart) {
       addressParts.push(cityStateZipPart);
     }
-    
+
     if (addr.country) {
       addressParts.push(addr.country);
     }
 
-    primaryAddressString = addressParts.filter(Boolean).join(', ');
+    primaryAddressString = addressParts.filter(Boolean).join(", ");
   }
 
   const renderAttributeItem = (
@@ -181,7 +183,9 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
     itemIndex: number
   ) => {
     const itemKeys = Object.keys(item).filter(
-      (key) => item[key as keyof typeof item] !== null && item[key as keyof typeof item] !== ""
+      (key) =>
+        item[key as keyof typeof item] !== null &&
+        item[key as keyof typeof item] !== ""
     );
     const prioritySubKeys = PRIORITY_FIELDS[attributeKey] || [];
 
@@ -189,15 +193,18 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
     const secondaryContent: JSX.Element[] = [];
 
     itemKeys.forEach((subKey) => {
-      // FIXED: Use camelCaseToTitleCase for better display names
       const formattedSubKey = camelCaseToTitleCase(subKey);
       const displayValue = formatValue(item[subKey as keyof typeof item]);
 
       if (displayValue === "N/A" && !prioritySubKeys.includes(subKey)) {
         return;
       }
-      
-      const isUrl = subKey === 'url' && typeof displayValue === 'string' && (displayValue.startsWith('http://') || displayValue.startsWith('https://'));
+
+      const isUrl =
+        subKey === "url" &&
+        typeof displayValue === "string" &&
+        (displayValue.startsWith("http://") ||
+          displayValue.startsWith("https://"));
 
       const element = (
         <div key={subKey} className="mb-1">
@@ -205,8 +212,13 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
             {formattedSubKey}:
           </span>
           {isUrl ? (
-            <a href={displayValue} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline ml-1 break-all">
-                {displayValue}
+            <a
+              href={displayValue}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 hover:underline ml-1 break-all"
+            >
+              {displayValue}
             </a>
           ) : (
             <span className="text-gray-600 ml-1 break-all">{displayValue}</span>
@@ -214,7 +226,10 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
         </div>
       );
 
-      if (prioritySubKeys.includes(subKey) || !LOW_PRIORITY_COMMON_FIELDS.includes(subKey)) {
+      if (
+        prioritySubKeys.includes(subKey) ||
+        !LOW_PRIORITY_COMMON_FIELDS.includes(subKey)
+      ) {
         primaryContent.push(element);
       } else {
         secondaryContent.push(element);
@@ -223,7 +238,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
 
     return (
       <li
-        key={'id' in item ? item.id : `${attributeKey}-${itemIndex}`}
+        key={"id" in item ? item.id : `${attributeKey}-${itemIndex}`}
         className="py-2 px-3 mb-2 bg-slate-50 rounded-md shadow-sm border border-slate-200"
       >
         <div className="space-y-1">{primaryContent}</div>
@@ -237,7 +252,7 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
       </li>
     );
   };
-  
+
   const CollapsibleItem: React.FC<{
     title: string;
     children: React.ReactNode;
@@ -288,9 +303,27 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
               {baseData.name || "N/A"}
             </span>
           </div>
+
+          {/* CORRECTED: Display the URL from the main node object if it exists */}
+          {"url" in node && node.url && (
+            <div className="sm:col-span-2">
+              <span className="font-medium text-slate-600 flex items-center">
+                <Link size={12} className="mr-1.5 text-slate-500" />
+                URL:
+              </span>
+              <a
+                href={node.url as string}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:underline ml-1 break-all"
+              >
+                {node.url}
+              </a>
+            </div>
+          )}
+
           <div>
             <span className="font-medium text-slate-600">Source System:</span>
-            {/* FIXED: Use camelCase sourceSystem and sourceId */}
             <span className="text-slate-500 ml-1">
               {baseData.sourceSystem || "N/A"} ({baseData.sourceId || "N/A"})
             </span>
@@ -310,23 +343,9 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
                 <MapPin size={12} className="mr-1.5 text-slate-500" />
                 Address:
               </span>
-              <span className="text-slate-700 ml-1">{primaryAddressString}</span>
-            </div>
-          )}
-          {'url' in baseData && baseData.url && (
-            <div className="sm:col-span-2">
-                <span className="font-medium text-slate-600 flex items-center">
-                    <Link size={12} className="mr-1.5 text-slate-500" />
-                    URL:
-                </span>
-                <a 
-                    href={baseData.url} 
-                    target="_blank" 
-                    rel="noopener noreferrer"
-                    className="text-blue-600 hover:underline ml-1 break-all"
-                >
-                    {baseData.url}
-                </a>
+              <span className="text-slate-700 ml-1">
+                {primaryAddressString}
+              </span>
             </div>
           )}
           {serviceNames.length > 0 && (
@@ -366,10 +385,11 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
           <CollapsibleContent>
             <div className="space-y-3 mt-2 pt-3 border-t border-gray-200">
               {Object.entries(attributes).map(([attrKey, attrValues]) => {
-                // FIXED: Check correct keys ('phones', 'services', 'addresses')
                 if (attrKey === "phones" && primaryPhoneNumber) return null;
-                if (attrKey === "services" && serviceNames.length > 0) return null;
-                if (attrKey === "addresses" && primaryAddressString) return null;
+                if (attrKey === "services" && serviceNames.length > 0)
+                  return null;
+                if (attrKey === "addresses" && primaryAddressString)
+                  return null;
 
                 if (!Array.isArray(attrValues) || attrValues.length === 0) {
                   return null;

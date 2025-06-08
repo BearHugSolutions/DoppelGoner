@@ -908,6 +908,7 @@ export default function ConnectionReviewTools() {
               </CardHeader>
               <CardContent className="p-3 pt-0">
                 <NodeAttributesDisplay
+                  node={node1}
                   nodeDetails={node1Details}
                   setIsAttributesOpen={setIsAttributesOpen}
                   isAttributesOpen={isAttributesOpen}
@@ -920,6 +921,7 @@ export default function ConnectionReviewTools() {
               </CardHeader>
               <CardContent className="p-3 pt-0">
                 <NodeAttributesDisplay
+                  node={node2}
                   nodeDetails={node2Details}
                   setIsAttributesOpen={setIsAttributesOpen}
                   isAttributesOpen={isAttributesOpen}
