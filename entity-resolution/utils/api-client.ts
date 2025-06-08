@@ -3,7 +3,6 @@ import type {
   EntityConnectionDataResponse,
   EntityVisualizationDataResponse,
   GroupReviewApiResponse,
-  ClusterFinalizationStatusResponse,
   NodeDetailResponse,
   BulkNodeDetailsRequest,
   BulkConnectionsRequest,
@@ -216,31 +215,6 @@ export async function postServiceGroupFeedback(
   }
 }
 
-export async function triggerEntityClusterFinalization(
-  clusterId: string
-): Promise<ClusterFinalizationStatusResponse> {
-  const context = `triggerEntityClusterFinalization for cluster ${clusterId}`;
-  const url = `${API_BASE_URL}/clusters/${clusterId}/finalize-review?type=entity`;
-  console.log(`[API_CLIENT] Triggering finalization: POST ${url}`);
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    // The validateResponse function will log the successful response object
-    return await validateResponse<ClusterFinalizationStatusResponse>(
-      response,
-      context
-    );
-  } catch (error) {
-    // The handleApiError function will log the error
-    return handleApiError(
-      error,
-      context
-    );
-  }
-}
-
 // --- Service Specific Functions ---
 
 export async function getServiceClusters(
@@ -257,31 +231,6 @@ export async function getServiceClusters(
     );
   } catch (error) {
     return handleApiError(error, context);
-  }
-}
-
-export async function triggerServiceClusterFinalization(
-  clusterId: string
-): Promise<ClusterFinalizationStatusResponse> {
-  const context = `triggerServiceClusterFinalization for cluster ${clusterId}`;
-  const url = `${API_BASE_URL}/clusters/${clusterId}/finalize-review?type=service`;
-  console.log(`[API_CLIENT] Triggering finalization: POST ${url}`);
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    // The validateResponse function will log the successful response object
-    return await validateResponse<ClusterFinalizationStatusResponse>(
-      response,
-      context
-    );
-  } catch (error) {
-    // The handleApiError function will log the error
-    return handleApiError(
-      error,
-      context
-    );
   }
 }
 

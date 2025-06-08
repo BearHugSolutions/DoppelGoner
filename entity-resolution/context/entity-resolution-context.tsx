@@ -8,7 +8,6 @@ import {
   EntityConnectionDataResponse,
   EntityGroup,
   GroupReviewDecision,
-  ClusterFinalizationStatusResponse,
   QueuedReviewBatch,
   BaseLink,
   NodeDetailResponse,
@@ -22,10 +21,8 @@ import {
 } from "@/types/entity-resolution";
 import {
   postEntityGroupFeedback,
-  triggerEntityClusterFinalization,
   getServiceClusters,
   postServiceGroupFeedback,
-  triggerServiceClusterFinalization,
   getBulkNodeDetails,
   getBulkConnections,
   getBulkVisualizations,
@@ -111,6 +108,7 @@ export interface EntityResolutionContextType {
   lastReviewedEdgeId: string | null;
   refreshTrigger: number;
   isAutoAdvanceEnabled: boolean;
+  isReviewToolsMaximized: boolean; // New state for maximizing the review tools
 
   // State for clusters, visualization, and connection data
   clusters: ClustersState;
@@ -138,6 +136,7 @@ export interface EntityResolutionContextType {
     setSelectedEdgeId: (id: string | null) => void;
     setReviewerId: (id: string) => void;
     setLastReviewedEdgeId: (id: string | null) => void;
+    setIsReviewToolsMaximized: (isMaximized: boolean) => void; // New action
     triggerRefresh: (
       target?:
         | "all"
@@ -231,6 +230,8 @@ export function EntityResolutionProvider({
   );
   const [isAutoAdvanceEnabled, setIsAutoAdvanceEnabledState] =
     useState<boolean>(true);
+  const [isReviewToolsMaximized, setIsReviewToolsMaximized] =
+    useState<boolean>(false); // New state variable
 
   // State definitions are now simplified to use the unified types
   const [clusters, setClusters] = useState<ClustersState>(initialClustersState);
@@ -253,11 +254,11 @@ export function EntityResolutionProvider({
   >(null);
   const [largeClusterConnectionsPage, setLargeClusterConnectionsPage] =
     useState<number>(0);
-  const [isLoadingConnectionPageData, setIsLoadingConnectionPageData] =
-    useState<boolean>(false);
-  const [finalizingClusters, setFinalizingClusters] = useState<Set<string>>(
-    new Set()
-  );
+  const [isLoadingPage, setIsLoadingPage] = useState<boolean>(false);
+
+  // NEW: Use a ref to store the latest queue state to prevent stale closures in callbacks.
+  const queueStateRef = useRef({ reviewQueue, isProcessingQueue });
+  queueStateRef.current = { reviewQueue, isProcessingQueue };
 
   const getClusterById = useCallback(
     (clusterId: string): EntityCluster | undefined => {
@@ -284,7 +285,10 @@ export function EntityResolutionProvider({
         visualizationData[clusterId]?.error || null,
       getConnectionError: (edgeId: string) =>
         connectionData[edgeId]?.error || null,
-      getClusterProgress: (clusterIdToQuery: string): ClusterReviewProgress => {
+      getClusterProgress: (
+        clusterIdToQuery: string,
+        reviewCountAdjustment: number = 0
+      ): ClusterReviewProgress => {
         const vizState = visualizationData[clusterIdToQuery];
         const clusterDetails = getClusterById(clusterIdToQuery);
         const linksForProgress = vizState?.data?.links || [];
@@ -352,7 +356,8 @@ export function EntityResolutionProvider({
         const confirmedNonMatches = linksForProgress.filter(
           (link) => link.status === "CONFIRMED_NON_MATCH"
         ).length;
-        const reviewedEdges = confirmedMatches + confirmedNonMatches;
+        const reviewedEdges =
+          confirmedMatches + confirmedNonMatches + reviewCountAdjustment;
         const pendingEdges = totalEdges - reviewedEdges;
         const progressPercentage =
           totalEdges > 0
@@ -429,7 +434,7 @@ export function EntityResolutionProvider({
       setIsAutoAdvanceEnabledState(true);
       setActivelyPagingClusterId(null);
       setLargeClusterConnectionsPage(0);
-      setIsLoadingConnectionPageData(false);
+      setIsLoadingPage(false);
     },
     [resolutionMode]
   );
@@ -875,12 +880,12 @@ export function EntityResolutionProvider({
         console.warn(
           `loadConnectionDataForLinkPage: No visualization data or links for cluster ${clusterId}.`
         );
-        if (!isPrefetch) setIsLoadingConnectionPageData(false);
+        if (!isPrefetch) setIsLoadingPage(false);
         return;
       }
 
       if (!isPrefetch) {
-        setIsLoadingConnectionPageData(true);
+        setIsLoadingPage(true);
       }
 
       const startIndex = (pageToLoad - 1) * CONNECTION_PAGE_SIZE;
@@ -891,7 +896,7 @@ export function EntityResolutionProvider({
         console.log(
           `loadConnectionDataForLinkPage: No links for page ${pageToLoad} in cluster ${clusterId}.`
         );
-        if (!isPrefetch) setIsLoadingConnectionPageData(false);
+        if (!isPrefetch) setIsLoadingPage(false);
         return;
       }
 
@@ -923,7 +928,7 @@ export function EntityResolutionProvider({
       }
 
       if (!isPrefetch) {
-        setIsLoadingConnectionPageData(false);
+        setIsLoadingPage(false);
         const totalLinks = viz.links.length;
         if (endIndex < totalLinks) {
           // Check if there's a next page to prefetch
@@ -954,7 +959,7 @@ export function EntityResolutionProvider({
       );
       setActivelyPagingClusterId(clusterId);
       setLargeClusterConnectionsPage(1); // Start at page 1
-      setIsLoadingConnectionPageData(true);
+      setIsLoadingPage(true);
 
       let viz = visualizationData[clusterId]?.data;
       // Ensure full visualization data (nodes and all links) is loaded for large clusters before paging connections
@@ -998,7 +1003,7 @@ export function EntityResolutionProvider({
             }`,
             variant: "destructive",
           });
-          setIsLoadingConnectionPageData(false);
+          setIsLoadingPage(false);
           setActivelyPagingClusterId(null); // Reset paging state on error
           setLargeClusterConnectionsPage(0);
           return;
@@ -1073,7 +1078,6 @@ export function EntityResolutionProvider({
     ]
   );
 
-  // UPDATED: This function no longer calls the bulk endpoint for a single item.
   const loadSingleConnectionData = useCallback(
     async (edgeId: string): Promise<EntityConnectionDataResponse | null> => {
       const cached = connectionData[edgeId];
@@ -1268,7 +1272,7 @@ export function EntityResolutionProvider({
     setIsAutoAdvanceEnabledState(true);
     setActivelyPagingClusterId(null);
     setLargeClusterConnectionsPage(0);
-    setIsLoadingConnectionPageData(false);
+    setIsLoadingPage(false);
   }, []);
 
   const retryFailedBatch = useCallback((batchId: string) => {
@@ -1390,161 +1394,57 @@ export function EntityResolutionProvider({
   ]);
 
   const checkAndAdvanceIfComplete = useCallback(
-    async (clusterIdToCheck?: string) => {
+    async (clusterIdToCheck?: string, reviewCountAdjustment: number = 0) => {
       const targetClusterId = clusterIdToCheck || selectedClusterId;
-      if (!targetClusterId) {
-        console.log("No target cluster ID to check for completion.");
-        return;
-      }
+      console.log(
+        `%c[DEBUG] checkAndAdvanceIfComplete called for cluster: ${targetClusterId}`,
+        "color: cyan; font-weight: bold;"
+      );
 
-      // 1. Check if finalization is already in progress for this cluster.
-      if (finalizingClusters.has(targetClusterId)) {
-        console.log(
-          `Finalization for cluster ${targetClusterId} is already in progress. Skipping.`
-        );
+      if (!targetClusterId) {
+        console.log("[DEBUG] No target cluster ID. Aborting.");
         return;
       }
 
       const clusterDetail = queries.getClusterById(targetClusterId);
-      const progress = queries.getClusterProgress(targetClusterId);
-
-      console.log(
-        `Cluster ${targetClusterId}: Total=${progress.totalEdges}, Reviewed=${progress.reviewedEdges}, Pending=${progress.pendingEdges}, Complete=${progress.isComplete}, WasSplit=${clusterDetail?.wasSplit}`
+      const progress = queries.getClusterProgress(
+        targetClusterId,
+        reviewCountAdjustment
       );
 
+      console.log("[DEBUG] Cluster Progress State:", {
+        isComplete: progress.isComplete,
+        wasSplit: clusterDetail?.wasSplit,
+      });
+
+      // The primary logic is now greatly simplified.
+      // We only care about advancing the UI if a cluster is complete (or already split)
+      // and auto-advance is enabled.
+      // All finalization API calls and related state management are removed.
       if (
-        progress.isComplete &&
-        progress.totalEdges > 0 &&
-        !clusterDetail?.wasSplit
-      ) {
-        toast({
-          title: "Cluster Review Complete",
-          description: `Review of cluster ${targetClusterId.substring(
-            0,
-            8
-          )}... is complete. Finalizing...`,
-        });
-        const finalizer =
-          resolutionMode === "entity"
-            ? triggerEntityClusterFinalization
-            : triggerServiceClusterFinalization;
-        try {
-          // 2. Set the lock before making the API call.
-          setFinalizingClusters((prev) => new Set(prev).add(targetClusterId));
-
-          console.log(
-            `Finalizing cluster ${targetClusterId} for mode ${resolutionMode}.`
-          );
-          const finalizationResponse = await finalizer(targetClusterId);
-          toast({
-            title: "Cluster Finalization",
-            description: `${finalizationResponse.message}. Status: ${finalizationResponse.status}`,
-          });
-          console.log(
-            `Finalization response for ${targetClusterId}:`,
-            finalizationResponse
-          );
-
-          if (
-            finalizationResponse.status !== "ERROR" &&
-            finalizationResponse.status !== "CLUSTER_NOT_FOUND" &&
-            finalizationResponse.status !== "PENDING_FULL_REVIEW"
-          ) {
-            setClusters((prevClusters) => {
-              const newClusterData = prevClusters.data.map((c) => {
-                if (c.id === targetClusterId) {
-                  let updatedCluster = { ...c };
-                  if (
-                    finalizationResponse.status ===
-                      "COMPLETED_MARKED_AS_SPLIT" ||
-                    finalizationResponse.status === "COMPLETED_SPLIT_DETECTED"
-                  ) {
-                    updatedCluster.wasSplit = true;
-                  } else if (
-                    finalizationResponse.status ===
-                      "COMPLETED_NO_SPLIT_NEEDED" ||
-                    finalizationResponse.status ===
-                      "COMPLETED_NO_CONFIRMED_MATCHES"
-                  ) {
-                    updatedCluster.wasSplit = false;
-                  }
-                  return updatedCluster;
-                }
-                return c;
-              });
-              return { ...prevClusters, data: newClusterData };
-            });
-            if (targetClusterId === activelyPagingClusterId) {
-              setActivelyPagingClusterId(null);
-              setLargeClusterConnectionsPage(0);
-            }
-          }
-
-          if (targetClusterId === selectedClusterId) {
-            if (isAutoAdvanceEnabled) {
-              console.log(
-                `Auto-advance ON. Advancing after finalizing ${targetClusterId}.`
-              );
-              advanceToNextCluster();
-            } else {
-              console.log(
-                `Cluster ${targetClusterId} finalized, auto-advance OFF. Not advancing.`
-              );
-            }
-          }
-        } catch (finalizationError) {
-          toast({
-            title: "Finalization Error",
-            description: `Could not finalize cluster ${targetClusterId.substring(
-              0,
-              8
-            )}...: ${(finalizationError as Error).message}`,
-            variant: "destructive",
-          });
-          console.error(
-            `Error finalizing cluster ${targetClusterId}:`,
-            finalizationError
-          );
-        } finally {
-          // 3. Always release the lock after the operation is complete.
-          setFinalizingClusters((prev) => {
-            const newSet = new Set(prev);
-            newSet.delete(targetClusterId);
-            return newSet;
-          });
-        }
-      } else if (
         (progress.isComplete && progress.totalEdges >= 0) ||
         clusterDetail?.wasSplit
       ) {
         if (targetClusterId === selectedClusterId && isAutoAdvanceEnabled) {
           console.log(
-            `Cluster ${targetClusterId} is already split or is an empty/completed cluster. Auto-advance ON. Advancing.`
+            `Cluster ${targetClusterId} is complete or split. Auto-advance ON. Advancing.`
           );
           advanceToNextCluster();
-        } else if (
-          (progress.isComplete && progress.totalEdges >= 0) ||
-          clusterDetail?.wasSplit
-        ) {
+        } else {
           console.log(
-            `Cluster ${targetClusterId} is already split or empty/completed. Auto-advance OFF or not selected. Not advancing.`
+            `Cluster ${targetClusterId} is complete or split. Auto-advance OFF or cluster not selected. Not advancing.`
           );
         }
       }
     },
-    // Remember to add the new state to the dependency array
     [
       selectedClusterId,
       queries,
       advanceToNextCluster,
-      toast,
-      resolutionMode,
       isAutoAdvanceEnabled,
-      activelyPagingClusterId,
-      finalizingClusters,
     ]
   );
-
+  
   const currentVisualizationDataForSelection =
     useMemo((): EntityVisualizationDataResponse | null => {
       if (!selectedClusterId) return null;
@@ -1787,6 +1687,8 @@ export function EntityResolutionProvider({
 
   const submitEdgeReview = useCallback(
     async (edgeId: string, decision: GroupReviewDecision) => {
+      console.log("submitting edge review id: ", edgeId);
+      console.log("submitting edge review decision: ", decision);
       if (!currentUser?.id) {
         toast({
           title: "Auth Error",
@@ -1995,7 +1897,8 @@ export function EntityResolutionProvider({
 
           // Logic is now unified.
           targetConn.edge.status = batch.optimisticEdgeStatus;
-          targetConn.edge.confirmedStatus = batch.optimisticGroupStatus;
+          targetConn.edge.confirmedStatus =
+            batch.optimisticGroupStatus as string | null;
           targetConn.entityGroups.forEach((group) => {
             if (batch.operations.some((op) => op.groupId === group.id)) {
               group.confirmedStatus = batch.optimisticGroupStatus;
@@ -2013,8 +1916,14 @@ export function EntityResolutionProvider({
 
       setReviewQueue((prevQueue) => [...prevQueue, batch]);
       setLastReviewedEdgeId(edgeId);
-      if (isAutoAdvanceEnabled) selectNextUnreviewedEdge(edgeId);
-      else checkAndAdvanceIfComplete(selectedClusterId);
+
+      // If auto-advance is on, immediately select the next edge for a smooth UI.
+      if (isAutoAdvanceEnabled) {
+        selectNextUnreviewedEdge(edgeId);
+      }
+      // ALWAYS call checkAndAdvanceIfComplete, now with an adjustment of 1.
+      checkAndAdvanceIfComplete(selectedClusterId, 1);
+
     },
     [
       currentUser,
@@ -2227,19 +2136,22 @@ export function EntityResolutionProvider({
       setReviewQueue((prevQ) =>
         prevQ.filter((b) => b.batchId !== currentBatch.batchId)
       );
-      if (currentBatch.clusterId) {
-        checkAndAdvanceIfComplete(currentBatch.clusterId);
-      }
     }
     processingBatchIdRef.current = null;
     setIsProcessingQueue(false);
-  }, [
-    reviewQueue,
-    isProcessingQueue,
-    toast,
-    checkAndAdvanceIfComplete,
-    retryFailedBatch,
-  ]);
+  }, [reviewQueue, isProcessingQueue, toast, retryFailedBatch]);
+
+  const isLoadingConnectionPageData = useMemo(() => {
+    if (!isLoadingPage) {
+      return false;
+    }
+
+    if (selectedEdgeId) {
+      return !queries.isConnectionDataLoaded(selectedEdgeId);
+    }
+
+    return true;
+  }, [isLoadingPage, selectedEdgeId, queries]);
 
   const currentConnectionData =
     useMemo((): EntityConnectionDataResponse | null => {
@@ -2420,6 +2332,7 @@ export function EntityResolutionProvider({
       viewNextConnectionPage,
       getActivelyPagingClusterId: () => activelyPagingClusterId,
       getLargeClusterConnectionsPage: () => largeClusterConnectionsPage,
+      setIsReviewToolsMaximized, // Added the new action
     }),
     [
       setResolutionMode,
@@ -2523,6 +2436,7 @@ export function EntityResolutionProvider({
     lastReviewedEdgeId,
     refreshTrigger,
     isAutoAdvanceEnabled,
+    isReviewToolsMaximized, // Provide state to consumers
     clusters,
     visualizationData,
     connectionData,

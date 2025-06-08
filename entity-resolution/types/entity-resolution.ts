@@ -261,19 +261,6 @@ export interface GroupReviewApiResponse {
 
 export type GroupReviewDecision = "ACCEPTED" | "REJECTED" | string;
 
-export interface ClusterFinalizationStatusResponse {
-  status:
-    | "COMPLETED_NO_SPLIT_NEEDED"
-    | "COMPLETED_SPLIT_DETECTED"
-    | "PENDING_FULL_REVIEW"
-    | "CLUSTER_NOT_FOUND"
-    | "ERROR"
-    | string;
-  message: string;
-  originalClusterId: string;
-  newClusterIds?: string[];
-}
-
 // Generic response type to match Rust's `TypedClusterListResponse<T>`
 export interface PaginatedClustersResponse<T> {
   clusters: T[];
