@@ -93,45 +93,37 @@ export interface NodeServiceAttribute {
 }
 
 /**
- * Represents a location associated with a node, from the 'Node locations' log.
+ * REFACTORED: Represents a unified Location and its primary Address.
+ * This replaces the separate NodeLocation and NodeAddress interfaces.
  */
-export interface NodeLocation {
+export interface LocationAndAddress {
+  // Fields from the original NodeLocation
   id: string;
   organizationId: string;
-  name: string;
+  name: string | null;
   alternateName: string | null;
   description: string | null;
   shortDescription: string | null;
   transportation: string | null;
-  latitude: number;
-  longitude: number;
-  locationType: string;
-  lastModified: string;
-  created: string;
-  originalId: string;
-  originalTranslationsId: string;
+  latitude: number | null;
+  longitude: number | null;
+  locationType: string | null;
+  lastModified: string | null;
+  created: string | null;
+  originalId: string | null;
+  originalTranslationsId: string | null;
   contributorId: string | null;
-}
 
-/**
- * Represents a postal address associated with a location, from the 'Node addresses' log.
- */
-export interface NodeAddress {
-  id: string;
-  locationId: string;
+  // Fields from the original NodeAddress (all nullable due to LEFT JOIN)
   attention: string | null;
-  address1: string;
+  address1: string | null;
   address2: string | null;
-  city: string;
+  city: string | null;
   region: string | null;
-  stateProvince: string;
-  postalCode: string;
-  country: string;
-  addressType: string;
-  lastModified: string;
-  created: string;
-  originalId: string;
-  contributorId: string | null;
+  stateProvince: string | null;
+  postalCode: string | null;
+  country: string | null;
+  addressType: string | null;
 }
 
 export interface MatchValues {
@@ -169,7 +161,7 @@ export interface BaseCluster {
   averageCoherenceScore: number | null;
   createdAt?: string | null; // NaiveDateTime serializes to string
   updatedAt?: string | null;
-  wasReviewed?: boolean | null; // UPDATED: Renamed from wasSplit
+  wasReviewed?: boolean | null;
 }
 
 // This now perfectly matches the Rust `EntityClusterItem` and is used for both modes
@@ -230,7 +222,7 @@ export interface BaseLink {
   details?: Record<string, any> | null;
   createdAt?: string | null;
   clusterId: string;
-  wasReviewed?: boolean | null; // ADDED: New property for edge-level review status
+  wasReviewed?: boolean | null;
 }
 
 export interface VisualizationEntityEdge {
@@ -248,10 +240,9 @@ export interface VisualizationEntityEdge {
   status: string | null;
   displayWeight: number | null;
   color: string | null;
-  wasReviewed?: boolean | null; // ADDED: New property for edge-level review status
+  wasReviewed?: boolean | null;
 }
 
-// NEW: Type for the new edge review API payload
 export interface EdgeReviewApiPayload {
   decision: 'ACCEPTED' | 'REJECTED';
   reviewerId: string;
@@ -259,7 +250,6 @@ export interface EdgeReviewApiPayload {
   type: 'entity' | 'service';
 }
 
-// NEW: Type for the new edge review API response
 export interface EdgeReviewApiResponse {
   message: string;
   edgeId: string;
@@ -271,7 +261,6 @@ export interface EdgeReviewApiResponse {
 
 export type GroupReviewDecision = "ACCEPTED" | "REJECTED" | string;
 
-// Generic response type to match Rust's `TypedClusterListResponse<T>`
 export interface PaginatedClustersResponse<T> {
   clusters: T[];
   total: number;
@@ -368,29 +357,32 @@ export interface QueuedReviewBatch {
 }
 
 export interface ClusterReviewProgress {
-  totalEdges: number; // -1 if unknown (e.g. large cluster, viz not loaded)
+  totalEdges: number; 
   reviewedEdges: number;
-  progressPercentage: number; // -1 if unknown
+  progressPercentage: number; 
   isComplete: boolean;
-  pendingEdges: number; // Added
-  confirmedMatches: number; // Added
-  confirmedNonMatches: number; // Added
+  pendingEdges: number; 
+  confirmedMatches: number; 
+  confirmedNonMatches: number; 
 }
 
+/**
+ * REFACTORED: The main response for node details.
+ * The `attributes` field now uses a single `locations` array with the unified `LocationAndAddress` type.
+ * The `addresses` field has been removed.
+ */
 export interface NodeDetailResponse {
   id: string;
   nodeType: "entity" | "service";
-  baseData: Organization | Service; // This remains flexible for both node types
+  baseData: Organization | Service;
   attributes: {
-    // These properties are optional because they are not present in every node response
     phones?: NodePhone[];
     services?: NodeServiceAttribute[];
-    locations?: NodeLocation[];
-    addresses?:NodeAddress[];
+    locations?: LocationAndAddress[]; // UNIFIED FIELD
+    // The 'addresses' field is no longer present in the API response.
   };
 }
 
-// Defines the shape of the cluster state.
 export interface ClustersState {
   data: EntityCluster[];
   total: number;
@@ -400,7 +392,6 @@ export interface ClustersState {
   error: string | null;
 }
 
-// Defines the shape of the visualization data state
 export interface VisualizationState {
   data: EntityVisualizationDataResponse | null;
   loading: boolean;
@@ -408,7 +399,6 @@ export interface VisualizationState {
   lastUpdated: number | null;
 }
 
-// Defines the shape of the connection data state
 export interface ConnectionState {
   data: EntityConnectionDataResponse | null;
   loading: boolean;
@@ -427,7 +417,6 @@ export interface EdgeSelectionInfo {
   totalEdgesInEntireCluster: number;
 }
 
-// Defines the shape of the submission state for a single edge
 export interface EdgeSubmissionState {
   isSubmitting: boolean;
   error: string | null;

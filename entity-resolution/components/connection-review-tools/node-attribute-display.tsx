@@ -11,40 +11,40 @@ import {
   Link,
 } from "lucide-react";
 
-// Import the new detailed types along with the main response type
+// REFACTORED: Updated type imports for the unified location/address structure
 import type {
   NodeDetailResponse,
   NodePhone,
   NodeServiceAttribute,
-  NodeLocation,
-  NodeAddress,
+  LocationAndAddress, // ADD this
+  // REMOVE NodeLocation,
+  // REMOVE NodeAddress,
   Organization,
   Service,
-} from "@/types/entity-resolution"; // Assuming this path is correct
+} from "@/types/entity-resolution";
 
-// Assuming your Radix-based Collapsible components are here:
 import {
   Collapsible,
   CollapsibleTrigger,
   CollapsibleContent,
-} from "@/components/ui/collapsible"; // Adjust path if necessary
+} from "@/components/ui/collapsible";
 
-// UPDATED: Priority fields now use camelCase to match the new types
+// REFACTORED: Merged location and address priority fields and removed the 'address' key
 const PRIORITY_FIELDS: Record<string, string[]> = {
-  location: ["name", "latitude", "longitude", "transportation", "locationType"],
-  phone: ["number", "type", "language", "description"],
-  // Simplified service fields to match available data in NodeServiceAttribute
-  service: ["name", "sourceSystem", "updatedAt", "url"],
-  address: [
+  location: [
+    "name",
+    "transportation",
+    "locationType",
     "address1",
     "address2",
     "city",
     "stateProvince",
     "postalCode",
     "country",
-    "addressType",
     "attention",
   ],
+  phone: ["number", "type", "language", "description"],
+  service: ["name", "sourceSystem", "updatedAt", "url"],
 };
 
 const LOW_PRIORITY_COMMON_FIELDS = [
@@ -57,7 +57,12 @@ const LOW_PRIORITY_COMMON_FIELDS = [
   "created",
   "createdAt",
   "lastModified",
+  "last_modified",
+  "country",
   "updatedAt",
+  "locationType",
+  "latitude",
+  "longitude",
 ];
 
 interface NodeAttributesDisplayProps {
@@ -110,14 +115,12 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
         const date = new Date(value);
         return date.toLocaleDateString() + " " + date.toLocaleTimeString();
       } catch {
-        // Fallback for invalid date strings
         return value;
       }
     }
     return String(value);
   };
 
-  // Helper to convert camelCase to Title Case (e.g., postalCode -> Postal Code)
   const camelCaseToTitleCase = (text: string) => {
     const result = text.replace(/([A-Z])/g, " $1");
     return result.charAt(0).toUpperCase() + result.slice(1);
@@ -137,48 +140,50 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
     serviceNames = attributes.services.map((s) => s.name).filter(Boolean);
   }
 
+  // REFACTORED: Simplified primary address logic using the unified locations array.
   let primaryAddressString: string | null = null;
-  if (attributes?.addresses && attributes.addresses.length > 0) {
-    const addr = attributes.addresses[0]; // Take the first address
+  if (attributes?.locations && attributes.locations.length > 0) {
+    const loc = attributes.locations[0]; // The first location *is* the address
     const addressParts: string[] = [];
 
-    if (addr.address1) {
-      let streetPart = addr.address1;
-      if (addr.address2) {
-        streetPart += `, ${addr.address2}`;
+    if (loc.address1) {
+      let streetPart = loc.address1;
+      if (loc.address2) {
+        streetPart += `, ${loc.address2}`;
       }
       addressParts.push(streetPart);
     }
 
     let cityStateZipPart = "";
-    if (addr.city) {
-      cityStateZipPart += addr.city;
+    if (loc.city) {
+      cityStateZipPart += loc.city;
     }
-    if (addr.stateProvince) {
-      cityStateZipPart += (cityStateZipPart ? ", " : "") + addr.stateProvince;
+    if (loc.stateProvince) {
+      cityStateZipPart += (cityStateZipPart ? ", " : "") + loc.stateProvince;
     }
-    if (addr.postalCode) {
+    if (loc.postalCode) {
       const prefix =
-        cityStateZipPart && addr.stateProvince
+        cityStateZipPart && loc.stateProvince
           ? " "
           : cityStateZipPart
           ? ", "
           : "";
-      cityStateZipPart += prefix + addr.postalCode;
+      cityStateZipPart += prefix + loc.postalCode;
     }
     if (cityStateZipPart) {
       addressParts.push(cityStateZipPart);
     }
 
-    if (addr.country) {
-      addressParts.push(addr.country);
+    if (loc.country) {
+      addressParts.push(loc.country);
     }
 
     primaryAddressString = addressParts.filter(Boolean).join(", ");
   }
 
+  // REFACTORED: Updated the function signature to handle the new unified type.
   const renderAttributeItem = (
-    item: NodePhone | NodeServiceAttribute | NodeLocation | NodeAddress,
+    item: NodePhone | NodeServiceAttribute | LocationAndAddress,
     attributeKey: string,
     itemIndex: number
   ) => {
@@ -279,9 +284,17 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
 
   const displayedAttributesCount = attributes
     ? Object.entries(attributes).filter(([attrKey, attrValues]) => {
+        // Core info is now pulled from multiple sources, so we adjust filtering
         if (attrKey === "phones" && primaryPhoneNumber) return false;
         if (attrKey === "services" && serviceNames.length > 0) return false;
-        if (attrKey === "addresses" && primaryAddressString) return false;
+        // The primary address is now part of the first location
+        if (
+          attrKey === "locations" &&
+          primaryAddressString &&
+          attrValues?.length === 1
+        )
+          return false;
+        // The addresses key no longer exists
         return Array.isArray(attrValues) && attrValues.length > 0;
       }).length
     : 0;
@@ -304,7 +317,6 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
             </span>
           </div>
 
-          {/* CORRECTED: Display the URL from the main node object if it exists */}
           {"url" in node && node.url && (
             <div className="sm:col-span-2">
               <span className="font-medium text-slate-600 flex items-center">
@@ -388,7 +400,11 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
                 if (attrKey === "phones" && primaryPhoneNumber) return null;
                 if (attrKey === "services" && serviceNames.length > 0)
                   return null;
-                if (attrKey === "addresses" && primaryAddressString)
+                if (
+                  attrKey === "locations" &&
+                  primaryAddressString &&
+                  attrValues?.length === 1
+                )
                   return null;
 
                 if (!Array.isArray(attrValues) || attrValues.length === 0) {
