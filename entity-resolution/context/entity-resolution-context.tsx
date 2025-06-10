@@ -49,9 +49,9 @@ function uniqueBy<T>(items: T[], keySelector: (item: T) => string): T[] {
 }
 
 // Constants for bulk fetching and large cluster handling
-const MAX_BULK_FETCH_SIZE = 200;
+const MAX_BULK_FETCH_SIZE = 50; // MODIFIED: Reduced size for faster initial batches
 const LARGE_CLUSTER_THRESHOLD = 200;
-const CONNECTION_PAGE_SIZE = MAX_BULK_FETCH_SIZE;
+const CONNECTION_PAGE_SIZE = 200; // This is for manual paging on large clusters, can remain large
 
 // Defines the shape of the cluster state.
 interface ClustersState {
@@ -440,8 +440,10 @@ export function EntityResolutionProvider({
         return newState;
       });
 
-      for (let i = 0; i < trulyNeedsFetching.length; i += MAX_BULK_FETCH_SIZE) {
-        const chunk = trulyNeedsFetching.slice(i, i + MAX_BULK_FETCH_SIZE);
+      // NOTE: Using a larger fetch size for nodes is okay as it's less critical for immediate interaction
+      const NODE_FETCH_SIZE = 200;
+      for (let i = 0; i < trulyNeedsFetching.length; i += NODE_FETCH_SIZE) {
+        const chunk = trulyNeedsFetching.slice(i, i + NODE_FETCH_SIZE);
         try {
           const response = await getBulkNodeDetails({ items: chunk });
           setNodeDetails((prev) => {
@@ -469,6 +471,135 @@ export function EntityResolutionProvider({
     },
     [nodeDetails]
   );
+
+  // REFACTORED: This function now progressively fetches connections.
+  // It fetches the first small batch, updates the UI, then fetches the rest in the background.
+  const loadBulkConnections = useCallback(
+    async (items: BulkConnectionRequestItem[]) => {
+      if (items.length === 0) return;
+
+      const uniqueItems = uniqueBy(
+        items,
+        (item) => `${item.edgeId}-${item.itemType}`
+      );
+      const trulyNeedsFetching = uniqueItems.filter((item) => {
+        const existing = connectionData[item.edgeId];
+        return !existing || !existing.data || existing.error;
+      });
+
+      if (trulyNeedsFetching.length === 0) return;
+
+      setConnectionData(
+        produce((draft) => {
+          trulyNeedsFetching.forEach((item) => {
+            if (!draft[item.edgeId] || draft[item.edgeId]?.error) {
+              draft[item.edgeId] = {
+                data: null,
+                loading: true,
+                error: null,
+                lastUpdated: null,
+              };
+            } else if (draft[item.edgeId] && !draft[item.edgeId]?.loading) {
+              draft[item.edgeId]!.loading = true;
+              draft[item.edgeId]!.error = null;
+            }
+          });
+        })
+      );
+
+      const chunks: BulkConnectionRequestItem[][] = [];
+      for (let i = 0; i < trulyNeedsFetching.length; i += MAX_BULK_FETCH_SIZE) {
+        chunks.push(trulyNeedsFetching.slice(i, i + MAX_BULK_FETCH_SIZE));
+      }
+
+      if (chunks.length === 0) return;
+
+      // Immediately fetch and await the first chunk (high priority)
+      const firstChunk = chunks.shift();
+      if (firstChunk) {
+        try {
+          const response = await getBulkConnections({ items: firstChunk });
+          setConnectionData(
+            produce((draft) => {
+              response.forEach((connData) => {
+                const edgeId = connData.edge.id;
+                draft[edgeId] = {
+                  data: connData,
+                  loading: false,
+                  error: null,
+                  lastUpdated: Date.now(),
+                };
+              });
+              // Mark any requested items not in the response as errored
+              firstChunk.forEach((reqItem) => {
+                if (!response.some((r) => r.edge.id === reqItem.edgeId)) {
+                  draft[reqItem.edgeId] = {
+                    data: null,
+                    loading: false,
+                    error: "Not found in response.",
+                    lastUpdated: null,
+                  };
+                }
+              });
+            })
+          );
+        } catch (error) {
+          setConnectionData(
+            produce((draft) => {
+              firstChunk.forEach((item) => {
+                draft[item.edgeId] = {
+                  data: null,
+                  loading: false,
+                  error: (error as Error).message,
+                  lastUpdated: null,
+                };
+              });
+            })
+          );
+        }
+      }
+
+      // Fetch the rest of the chunks in the background
+      if (chunks.length > 0) {
+        chunks.forEach((chunk, index) => {
+          getBulkConnections({ items: chunk })
+            .then((response) => {
+              setConnectionData(
+                produce((draft) => {
+                  response.forEach((connData) => {
+                    const edgeId = connData.edge.id;
+                    draft[edgeId] = {
+                      data: connData,
+                      loading: false,
+                      error: null,
+                      lastUpdated: Date.now(),
+                    };
+                  });
+                   chunk.forEach((reqItem) => {
+                    if (!response.some((r) => r.edge.id === reqItem.edgeId)) {
+                      if (draft[reqItem.edgeId]?.loading) { // Only update if still loading
+                         draft[reqItem.edgeId] = { data: null, loading: false, error: "Not found in response.", lastUpdated: null };
+                      }
+                    }
+                  });
+                })
+              );
+            })
+            .catch((error) => {
+               setConnectionData(produce(draft => {
+                  chunk.forEach(item => {
+                    if (draft[item.edgeId]?.loading) {
+                      draft[item.edgeId] = { data: null, loading: false, error: (error as Error).message, lastUpdated: null };
+                    }
+                  });
+               }));
+            });
+        });
+      }
+    },
+    [connectionData]
+  );
+
 
   const loadVisualizationDataForClusters = useCallback(
     async (items: BulkVisualizationRequestItem[]) => {
@@ -503,8 +634,10 @@ export function EntityResolutionProvider({
 
       const allFetchedVisualizations: EntityVisualizationDataResponse[] = [];
 
-      for (let i = 0; i < uniqueItems.length; i += MAX_BULK_FETCH_SIZE) {
-        const chunk = uniqueItems.slice(i, i + MAX_BULK_FETCH_SIZE);
+      // A larger fetch size for visualizations is okay as they are lighter weight.
+      const VIZ_FETCH_SIZE = 200;
+      for (let i = 0; i < uniqueItems.length; i += VIZ_FETCH_SIZE) {
+        const chunk = uniqueItems.slice(i, i + VIZ_FETCH_SIZE);
         try {
           const response = await getBulkVisualizations({ items: chunk });
           allFetchedVisualizations.push(...response);
@@ -581,128 +714,69 @@ export function EntityResolutionProvider({
       if (allNodeIdentifiers.length > 0) {
         await loadBulkNodeDetails(allNodeIdentifiers);
       }
-      const connectionRequestItemsForNonLarge: BulkConnectionRequestItem[] = [];
+      
+      // REFACTORED: Prioritize connections from the first unreviewed cluster.
+      const priorityLinks: BulkConnectionRequestItem[] = [];
+      const backgroundLinks: BulkConnectionRequestItem[] = [];
+
+      let priorityClusterId: string | null = null;
+      // Find the first cluster in the view that has visualization data and is unreviewed.
+      for (const vizData of allFetchedVisualizations) {
+        const clusterDetail = getClusterById(vizData.clusterId);
+        if (clusterDetail && !clusterDetail.wasReviewed) {
+          priorityClusterId = vizData.clusterId;
+          break;
+        }
+      }
+
+      // If no unreviewed clusters are found, just use the first one as priority.
+      if (!priorityClusterId && allFetchedVisualizations.length > 0) {
+        priorityClusterId = allFetchedVisualizations[0].clusterId;
+      }
+
       allFetchedVisualizations.forEach((vizData) => {
         const clusterDetail = getClusterById(vizData.clusterId);
-        const connectionCount = clusterDetail
-          ? clusterDetail.groupCount
-          : undefined;
+        const connectionCount = clusterDetail?.groupCount;
+
         if (
           connectionCount !== undefined &&
           connectionCount !== null &&
           connectionCount <= LARGE_CLUSTER_THRESHOLD
         ) {
-          vizData.links.forEach((link) =>
-            connectionRequestItemsForNonLarge.push({
-              edgeId: link.id,
-              itemType: resolutionMode,
-            })
-          );
-        }
-      });
-      if (connectionRequestItemsForNonLarge.length > 0) {
-        await loadBulkConnections(connectionRequestItemsForNonLarge);
-      }
-    },
-    [resolutionMode, loadBulkNodeDetails, getClusterById]
-  );
+          const items = vizData.links.map((link) => ({
+            edgeId: link.id,
+            itemType: resolutionMode,
+          }));
 
-  const loadBulkConnections = useCallback(
-    async (items: BulkConnectionRequestItem[]) => {
-      if (items.length === 0) {
-        return;
-      }
-      const uniqueItems = uniqueBy(
-        items,
-        (item) => `${item.edgeId}-${item.itemType}`
-      );
-      const trulyNeedsFetching = uniqueItems.filter((item) => {
-        const existing = connectionData[item.edgeId];
-        return !existing || !existing.data || existing.error;
-      });
-
-      if (trulyNeedsFetching.length === 0) {
-        return;
-      }
-
-      setConnectionData((prev) => {
-        const newState = { ...prev };
-        trulyNeedsFetching.forEach((item) => {
-          if (!newState[item.edgeId] || newState[item.edgeId]?.error) {
-            newState[item.edgeId] = {
-              data: null,
-              loading: true,
-              error: null,
-              lastUpdated: null,
-            };
-          } else if (newState[item.edgeId] && !newState[item.edgeId]?.loading) {
-            newState[item.edgeId]!.loading = true;
-            newState[item.edgeId]!.error = null;
+          if (vizData.clusterId === priorityClusterId) {
+            priorityLinks.push(...items);
+          } else {
+            backgroundLinks.push(...items);
           }
-        });
-        return newState;
+        }
       });
 
-      for (let i = 0; i < trulyNeedsFetching.length; i += MAX_BULK_FETCH_SIZE) {
-        const chunk = trulyNeedsFetching.slice(i, i + MAX_BULK_FETCH_SIZE);
-        try {
-          const response = await getBulkConnections({ items: chunk });
-          setConnectionData((prev) => {
-            const newState = { ...prev };
-            response.forEach((connData) => {
-              const edgeId = connData.edge.id;
-              newState[edgeId] = {
-                data: connData,
-                loading: false,
-                error: null,
-                lastUpdated: Date.now(),
-              };
-            });
-            chunk.forEach((requestedItem) => {
-              const wasReturned = response.some(
-                (r) => r.edge.id === requestedItem.edgeId
-              );
-              if (!wasReturned) {
-                newState[requestedItem.edgeId] = {
-                  data: null,
-                  loading: false,
-                  error: "Not found in bulk response chunk",
-                  lastUpdated: null,
-                };
-              }
-            });
-            return newState;
-          });
-        } catch (error) {
-          setConnectionData((prev) => {
-            const newState = { ...prev };
-            chunk.forEach((item) => {
-              newState[item.edgeId] = {
-                data: null,
-                loading: false,
-                error: (error as Error).message,
-                lastUpdated: null,
-              };
-            });
-            return newState;
-          });
-        }
+      // Combine the lists with priority items first.
+      const allLinksToLoad = [...priorityLinks, ...backgroundLinks];
+
+      if (allLinksToLoad.length > 0) {
+        // The `await` is okay because the work inside loadBulkConnections is now progressive.
+        // It will return after the first small batch is complete.
+        await loadBulkConnections(allLinksToLoad);
       }
     },
-    [connectionData]
+    [resolutionMode, loadBulkNodeDetails, getClusterById, loadBulkConnections]
   );
 
   const loadVisualizationDataForClustersRef = useRef(
     loadVisualizationDataForClusters
   );
-  const loadBulkConnectionsRef = useRef(loadBulkConnections);
+  // REMOVED: loadBulkConnectionsRef is no longer needed as the function is self-contained.
   useEffect(() => {
     loadVisualizationDataForClustersRef.current =
       loadVisualizationDataForClusters;
   }, [loadVisualizationDataForClusters]);
-  useEffect(() => {
-    loadBulkConnectionsRef.current = loadBulkConnections;
-  }, [loadBulkConnections]);
+
 
   const loadClusters = useCallback(
     async (page: number, limit: number = 10) => {
@@ -745,6 +819,7 @@ export function EntityResolutionProvider({
         });
 
         if (vizRequestItemsNormal.length > 0) {
+          // This will now handle the prioritized loading of connections internally.
           await loadVisualizationDataForClustersRef.current(
             vizRequestItemsNormal
           );
@@ -799,23 +874,24 @@ export function EntityResolutionProvider({
         if (!isLarge) {
           const vizState = visualizationData[id];
           if ((!vizState?.data || vizState?.error) && !vizState?.loading) {
+            // Load viz, which will trigger prioritized connection loading
             await loadVisualizationDataForClustersRef.current([
               { clusterId: id, itemType: resolutionMode },
             ]);
-          } else if (vizState?.data?.nodes) {
-            const nodeIdsFromViz: NodeIdentifier[] = vizState.data.nodes.map(
-              (node) => ({ id: node.id, nodeType: resolutionMode })
-            );
-            if (nodeIdsFromViz.length > 0) {
-              const nodesTrulyNeedingFetch = nodeIdsFromViz.filter(
-                (n) => !nodeDetails[n.id] || nodeDetails[n.id] === "error"
-              );
-              if (nodesTrulyNeedingFetch.length > 0) {
-                await loadBulkNodeDetails(nodesTrulyNeedingFetch);
-              }
+          } else if (vizState?.data?.links) {
+            // If viz is already loaded, ensure all its connections are loaded or loading.
+            const unloadedConnectionItems = vizState.data.links
+              .map(link => ({ edgeId: link.id, itemType: resolutionMode }))
+              .filter(item => {
+                const connState = connectionData[item.edgeId];
+                return !connState || (!connState.data && !connState.loading);
+              });
+            if (unloadedConnectionItems.length > 0) {
+                loadBulkConnections(unloadedConnectionItems);
             }
           }
         } else {
+          // Logic for large clusters remains mostly the same, as it's a manual process.
           const vizState = visualizationData[id];
           if (vizState?.data?.nodes) {
             const nodeIdsFromViz: NodeIdentifier[] = vizState.data.nodes.map(
@@ -843,6 +919,8 @@ export function EntityResolutionProvider({
       loadBulkNodeDetails,
       nodeDetails,
       getClusterById,
+      connectionData,
+      loadBulkConnections,
     ]
   );
 
@@ -890,7 +968,8 @@ export function EntityResolutionProvider({
 
       if (connectionItemsToFetch.length > 0) {
         try {
-          await loadBulkConnectionsRef.current(connectionItemsToFetch);
+          // Use the progressive loader for paged data as well.
+          await loadBulkConnections(connectionItemsToFetch);
         } catch (error) {
           console.error(
             `Error loading connection data for page ${pageToLoad}, cluster ${clusterId}:`,
@@ -924,7 +1003,7 @@ export function EntityResolutionProvider({
         }
       }
     },
-    [visualizationData, resolutionMode, connectionData, toast]
+    [visualizationData, resolutionMode, connectionData, toast, loadBulkConnections]
   );
 
   const initializeLargeClusterConnectionPaging = useCallback(
@@ -1196,11 +1275,11 @@ export function EntityResolutionProvider({
           lastUpdated: null,
         },
       }));
-      await loadBulkConnectionsRef.current([
-        { edgeId, itemType: resolutionMode },
-      ]);
+      await loadBulkConnections(
+        [{ edgeId, itemType: resolutionMode }],
+      );
     },
-    [resolutionMode]
+    [resolutionMode, loadBulkConnections]
   );
 
   const setSelectedEdgeIdAction = useCallback(
@@ -1899,6 +1978,7 @@ export function EntityResolutionProvider({
       viewNextConnectionPage,
       activelyPagingClusterId,
       largeClusterConnectionsPage,
+      setClusterFilterStatus, // ADDED ACTION
     ]
   );
 
