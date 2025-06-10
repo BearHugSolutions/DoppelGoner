@@ -272,24 +272,24 @@ export function EntityResolutionProvider({
         connectionData[edgeId]?.error || null,
       // REFACTORED: Simplified progress calculation as per Task 3.6.1
       getClusterProgress: (clusterIdToQuery: string): ClusterReviewProgress => {
-        console.log("getClusterProgress Called");
+        // console.log("getClusterProgress Called");
         const vizState = visualizationData[clusterIdToQuery];
         const clusterDetails = getClusterById(clusterIdToQuery);
 
         // Case 1: Full visualization data is loaded. This is the primary source of truth.
         if (vizState?.data?.links) {
-          console.log("Case 1: Full visualization data is loaded");
+          // console.log("Case 1: Full visualization data is loaded");
           const totalEdges = vizState.data.links.length;
           const reviewedEdges = vizState.data.links.filter(
             (l) => l.wasReviewed
           ).length;
-          console.log("totalEdges", totalEdges);
-          console.log("reviewedEdges", reviewedEdges);
+          // console.log("totalEdges", totalEdges);
+          // console.log("reviewedEdges", reviewedEdges);
           const progressPercentage =
             totalEdges > 0
               ? Math.round((reviewedEdges / totalEdges) * 100)
               : 100;
-          console.log("progressPercentage", progressPercentage);
+          // console.log("progressPercentage", progressPercentage);
           return {
             totalEdges,
             reviewedEdges,
@@ -308,9 +308,9 @@ export function EntityResolutionProvider({
 
         // Case 2: No visualization data, but we have cluster details.
         if (clusterDetails) {
-          console.log(
-            "Case 2: No visualization data, but we have cluster details"
-          );
+          // console.log(
+          //   "Case 2: No visualization data, but we have cluster details"
+          // );
           // If the cluster is marked as reviewed from the backend, it's complete.
           if (clusterDetails.wasReviewed) {
             const total = clusterDetails.groupCount ?? 0;

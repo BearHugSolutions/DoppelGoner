@@ -20,6 +20,7 @@ import type {
   ClusterReviewProgress,
   ClusterFilterStatus,
 } from "@/types/entity-resolution";
+import ResolutionModeSwitcher from "./resolution-mode-switcher";
 
 const LARGE_CLUSTER_THRESHOLD = 200;
 
@@ -112,9 +113,9 @@ const ClusterListContent = () => {
     <Fragment>
       <div className="space-y-3 flex-grow overflow-auto pr-1 custom-scrollbar">
         {error && (
-            <div className="text-red-600 text-sm p-2 bg-red-50 rounded border">
+          <div className="text-red-600 text-sm p-2 bg-red-50 rounded border">
             Error: {error}
-            </div>
+          </div>
         )}
         {clustersData.length === 0 && !loading && (
           <div className="text-center text-muted-foreground py-10">
@@ -130,7 +131,9 @@ const ClusterListContent = () => {
             vizForCluster?.data?.links?.length !== undefined;
           const vizError = queries.getVisualizationError(cluster.id);
 
-          const progress: ClusterReviewProgress = clusterProgress[cluster.id] || {
+          const progress: ClusterReviewProgress = clusterProgress[
+            cluster.id
+          ] || {
             totalEdges: -1,
             reviewedEdges: 0,
             progressPercentage: -1,
@@ -233,14 +236,17 @@ const ClusterListContent = () => {
                   <div className="flex justify-between text-xs mb-0.5 text-muted-foreground">
                     <span>Review Progress</span>
                     <span className="font-medium text-card-foreground">
-                      {progress.totalEdges === -1 || progress.progressPercentage === -1
+                      {progress.totalEdges === -1 ||
+                      progress.progressPercentage === -1
                         ? `${progress.reviewedEdges} / ?`
                         : `${progress.reviewedEdges} / ${progress.totalEdges}`}
                     </span>
                   </div>
                   <Progress
                     value={
-                      progress.progressPercentage === -1 ? 0 : progress.progressPercentage
+                      progress.progressPercentage === -1
+                        ? 0
+                        : progress.progressPercentage
                     }
                     className={`h-1.5 ${
                       progress.progressPercentage === -1
@@ -304,7 +310,8 @@ const ClusterListContent = () => {
 };
 
 export default function ClusterSelector() {
-  const { resolutionMode, actions, clusterFilterStatus } = useEntityResolution();
+  const { resolutionMode, actions, clusterFilterStatus } =
+    useEntityResolution();
 
   // This effect triggers a reload of clusters whenever the filter status changes.
   useEffect(() => {
@@ -323,7 +330,7 @@ export default function ClusterSelector() {
         {resolutionMode === "entity" ? "Entity Clusters" : "Service Clusters"}{" "}
         for Review
       </h3>
-
+      <ResolutionModeSwitcher />
       <Tabs
         value={clusterFilterStatus}
         onValueChange={handleValueChange}
@@ -336,7 +343,10 @@ export default function ClusterSelector() {
 
         {/* The two TabsContent components will mount/unmount based on the selected tab.
             The list content itself is now a separate component to avoid code duplication. */}
-        <TabsContent value="unreviewed" className="flex-grow flex flex-col mt-2">
+        <TabsContent
+          value="unreviewed"
+          className="flex-grow flex flex-col mt-2"
+        >
           <ClusterListContent />
         </TabsContent>
         <TabsContent value="reviewed" className="flex-grow flex flex-col mt-2">
