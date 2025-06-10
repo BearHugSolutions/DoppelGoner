@@ -169,7 +169,7 @@ export interface BaseCluster {
   averageCoherenceScore: number | null;
   createdAt?: string | null; // NaiveDateTime serializes to string
   updatedAt?: string | null;
-  wasSplit?: boolean | null;
+  wasReviewed?: boolean | null; // UPDATED: Renamed from wasSplit
 }
 
 // This now perfectly matches the Rust `EntityClusterItem` and is used for both modes
@@ -230,6 +230,7 @@ export interface BaseLink {
   details?: Record<string, any> | null;
   createdAt?: string | null;
   clusterId: string;
+  wasReviewed?: boolean | null; // ADDED: New property for edge-level review status
 }
 
 export interface VisualizationEntityEdge {
@@ -247,20 +248,26 @@ export interface VisualizationEntityEdge {
   status: string | null;
   displayWeight: number | null;
   color: string | null;
+  wasReviewed?: boolean | null; // ADDED: New property for edge-level review status
 }
 
-export interface GroupReviewApiPayloadBase {
-  decision: GroupReviewDecision;
+// NEW: Type for the new edge review API payload
+export interface EdgeReviewApiPayload {
+  decision: 'ACCEPTED' | 'REJECTED';
   reviewerId: string;
   notes?: string;
+  type: 'entity' | 'service';
 }
 
-export interface GroupReviewApiResponse {
+// NEW: Type for the new edge review API response
+export interface EdgeReviewApiResponse {
   message: string;
-  updatedGroupId?: string;
-  newStatus?: string;
-  updatedEdgesInUserSchema?: number | null;
+  edgeId: string;
+  newStatus: string;
+  clusterId: string;
+  clusterFinalized: boolean;
 }
+
 
 export type GroupReviewDecision = "ACCEPTED" | "REJECTED" | string;
 
@@ -379,6 +386,49 @@ export interface NodeDetailResponse {
     phones?: NodePhone[];
     services?: NodeServiceAttribute[];
     locations?: NodeLocation[];
-    addresses?: NodeAddress[];
+    addresses?:NodeAddress[];
   };
+}
+
+// Defines the shape of the cluster state.
+export interface ClustersState {
+  data: EntityCluster[];
+  total: number;
+  page: number;
+  limit: number;
+  loading: boolean;
+  error: string | null;
+}
+
+// Defines the shape of the visualization data state
+export interface VisualizationState {
+  data: EntityVisualizationDataResponse | null;
+  loading: boolean;
+  error: string | null;
+  lastUpdated: number | null;
+}
+
+// Defines the shape of the connection data state
+export interface ConnectionState {
+  data: EntityConnectionDataResponse | null;
+  loading: boolean;
+  error: string | null;
+  lastUpdated: number | null;
+}
+
+export interface EdgeSelectionInfo {
+  currentEdgeId: string | null;
+  nextUnreviewedEdgeId: string | null;
+  hasUnreviewedEdges: boolean;
+  currentEdgeIndex: number;
+  totalEdges: number;
+  totalUnreviewedEdgesInCluster: number;
+  currentUnreviewedEdgeIndexInCluster: number;
+  totalEdgesInEntireCluster: number;
+}
+
+// Defines the shape of the submission state for a single edge
+export interface EdgeSubmissionState {
+  isSubmitting: boolean;
+  error: string | null;
 }

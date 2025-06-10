@@ -87,8 +87,18 @@ export default function GraphVisualizer() {
       return;
     }
 
-    setNodes(data.nodes || []);
-    setLinks(data.links || []);
+    // BUG FIX: Create deep copies of nodes and links.
+    // D3's force simulation mutates the objects passed to it by adding
+    // properties like 'x', 'y', 'vx', 'vy', and 'index'. If the objects
+    // from the context are immutable (e.g., from Immer), this will throw
+    // a "Cannot assign to read only property" error.
+    // By creating a new array of new, shallow-copied objects, we ensure
+    // that the data used by D3 is mutable.
+    const mutableNodes = (data.nodes || []).map((n) => ({ ...n }));
+    const mutableLinks = (data.links || []).map((l) => ({ ...l }));
+
+    setNodes(mutableNodes);
+    setLinks(mutableLinks);
 
     const allGroups = data.groups || [];
 
@@ -598,7 +608,8 @@ export default function GraphVisualizer() {
           (group) =>
             (group.entityId1 === linkSourceId &&
               group.entityId2 === linkTargetId) ||
-            (group.entityId1 === linkTargetId && group.entityId2 === linkSourceId)
+            (group.entityId1 === linkTargetId &&
+              group.entityId2 === linkSourceId)
         );
 
         let statusHtml = "";
@@ -869,9 +880,6 @@ export default function GraphVisualizer() {
     return (
       <div className="flex justify-center items-center h-full text-muted-foreground">
         No visualization data to display for this {resolutionMode} cluster.
-        {selectedClusterId &&
-          queries.getClusterById(selectedClusterId)?.wasSplit &&
-          " (Cluster was split)"}
       </div>
     );
   }

@@ -2,7 +2,8 @@
 import type {
   EntityConnectionDataResponse,
   EntityVisualizationDataResponse,
-  GroupReviewApiResponse,
+  EdgeReviewApiPayload, // IMPORT NEW
+  EdgeReviewApiResponse, // IMPORT NEW
   NodeDetailResponse,
   BulkNodeDetailsRequest,
   BulkConnectionsRequest,
@@ -167,53 +168,30 @@ export async function getServiceVisualizationData(
   }
 }
 
-export async function postEntityGroupFeedback(
-  groupId: string,
-  payload: any
-): Promise<GroupReviewApiResponse> {
-  const context = `postEntityGroupFeedback for group ${groupId}`;
-  const url = `${API_BASE_URL}/entity-groups/${groupId}/review`;
+// NEW: Unified function to post a review for an edge
+export async function postEdgeReview(
+  edgeId: string,
+  payload: EdgeReviewApiPayload
+): Promise<EdgeReviewApiResponse> {
+  const context = `postEdgeReview for edge ${edgeId}`;
+  const url = `${API_BASE_URL}/edge-visualizations/${edgeId}/review`;
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    return await validateResponse<GroupReviewApiResponse>(
-      response,
-      context
-    );
+    console.log("[API_CLIENT] Response for postEdgeReview:", response);
+    return await validateResponse<EdgeReviewApiResponse>(response, context);
   } catch (error) {
-    return handleApiError(
-      error,
-      context
-    );
+    return handleApiError(error, context);
   }
 }
 
-export async function postServiceGroupFeedback(
-  groupId: string,
-  payload: any
-): Promise<GroupReviewApiResponse> {
-  const context = `postServiceGroupFeedback for group ${groupId}`;
-  const url = `${API_BASE_URL}/service-groups/${groupId}/review`;
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    return await validateResponse<GroupReviewApiResponse>(
-      response,
-      context
-    );
-  } catch (error) {
-    return handleApiError(
-      error,
-      context
-    );
-  }
-}
+
+// DELETED: postEntityGroupFeedback
+// DELETED: postServiceGroupFeedback
+
 
 // --- Service Specific Functions ---
 

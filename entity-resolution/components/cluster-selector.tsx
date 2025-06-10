@@ -275,12 +275,6 @@ export default function ClusterSelector() {
                         Review Complete
                       </div>
                     )}
-                    {cluster.wasSplit && (
-                      <div className="flex items-center mt-1.5 text-orange-600 text-xs font-medium">
-                        <Info className="h-3.5 w-3.5 mr-1" />
-                        Cluster Processed (Split)
-                      </div>
-                    )}
                   </CardContent>
                 </Card>
               );
