@@ -12,6 +12,7 @@ import type {
   BulkVisualizationsResponse,
   PaginatedClustersResponse,
   EntityCluster,
+  ClusterFilterStatus,
 } from "@/types/entity-resolution";
 
 const API_BASE_URL = "/api";
@@ -80,9 +81,10 @@ async function validateResponse<T>(
 
 export async function getOrganizationClusters(
   page: number = 1,
-  limit: number = 10
+  limit: number = 10,
+  reviewStatus: ClusterFilterStatus = "unreviewed"
 ): Promise<PaginatedClustersResponse<EntityCluster>> {
-  const url = `${API_BASE_URL}/clusters?type=entity&page=${page}&limit=${limit}`;
+  const url = `${API_BASE_URL}/clusters?type=entity&page=${page}&limit=${limit}&review_status=${reviewStatus}`;
   const context = `getEntityClusters (url: ${url})`;
   try {
     const response = await fetch(url);
@@ -197,10 +199,11 @@ export async function postEdgeReview(
 
 export async function getServiceClusters(
   page: number = 1,
-  limit: number = 10
+  limit: number = 10,
+  reviewStatus: ClusterFilterStatus = "unreviewed"
 ): Promise<PaginatedClustersResponse<EntityCluster>> {
-  const context = `getServiceClusters (page: ${page}, limit: ${limit})`;
-  const url = `${API_BASE_URL}/clusters?type=service&page=${page}&limit=${limit}`;
+  const context = `getServiceClusters (page: ${page}, limit: ${limit}, reviewStatus: ${reviewStatus})`;
+  const url = `${API_BASE_URL}/clusters?type=service&page=${page}&limit=${limit}&review_status=${reviewStatus}`;
   try {
     const response = await fetch(url);
     return await validateResponse<PaginatedClustersResponse<EntityCluster>>(

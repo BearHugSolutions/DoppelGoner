@@ -1,6 +1,7 @@
 // types/entity-resolution.ts
 
 export type ResolutionMode = "entity" | "service";
+export type ClusterFilterStatus = "all" | "reviewed" | "unreviewed";
 
 // --- Structs for Bulk Node Details ---
 export interface NodeIdentifier {
@@ -357,13 +358,13 @@ export interface QueuedReviewBatch {
 }
 
 export interface ClusterReviewProgress {
-  totalEdges: number; 
+  totalEdges: number;
   reviewedEdges: number;
-  progressPercentage: number; 
+  progressPercentage: number;
   isComplete: boolean;
-  pendingEdges: number; 
-  confirmedMatches: number; 
-  confirmedNonMatches: number; 
+  pendingEdges: number;
+  confirmedMatches: number;
+  confirmedNonMatches: number;
 }
 
 /**
@@ -415,9 +416,4 @@ export interface EdgeSelectionInfo {
   totalUnreviewedEdgesInCluster: number;
   currentUnreviewedEdgeIndexInCluster: number;
   totalEdgesInEntireCluster: number;
-}
-
-export interface EdgeSubmissionState {
-  isSubmitting: boolean;
-  error: string | null;
 }

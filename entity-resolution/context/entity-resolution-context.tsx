@@ -14,6 +14,7 @@ import {
   BulkVisualizationRequestItem,
   ClusterReviewProgress,
   EdgeReviewApiPayload,
+  ClusterFilterStatus, // IMPORT NEW TYPE
 } from "@/types/entity-resolution";
 import {
   getServiceClusters,
@@ -98,6 +99,7 @@ export interface EntityResolutionContextType {
   refreshTrigger: number;
   isAutoAdvanceEnabled: boolean;
   isReviewToolsMaximized: boolean;
+  clusterFilterStatus: ClusterFilterStatus; // ADDED
 
   // State for clusters, visualization, and connection data
   clusters: ClustersState;
@@ -123,6 +125,7 @@ export interface EntityResolutionContextType {
     setReviewerId: (id: string) => void;
     setLastReviewedEdgeId: (id: string | null) => void;
     setIsReviewToolsMaximized: (isMaximized: boolean) => void;
+    setClusterFilterStatus: (status: ClusterFilterStatus) => void; // ADDED
     triggerRefresh: (
       target?:
         | "all"
@@ -217,6 +220,8 @@ export function EntityResolutionProvider({
     useState<boolean>(true);
   const [isReviewToolsMaximized, setIsReviewToolsMaximized] =
     useState<boolean>(false);
+  const [clusterFilterStatus, setClusterFilterStatus] =
+    useState<ClusterFilterStatus>("unreviewed"); // ADDED STATE
 
   const [clusters, setClusters] = useState<ClustersState>(initialClustersState);
   const [visualizationData, setVisualizationData] = useState<
@@ -714,7 +719,7 @@ export function EntityResolutionProvider({
           : getServiceClusters;
 
       try {
-        const response = await fetcher(page, limit);
+        const response = await fetcher(page, limit, clusterFilterStatus); // MODIFIED
         setClusters({
           data: response.clusters,
           total: response.total,
@@ -754,7 +759,7 @@ export function EntityResolutionProvider({
         }));
       }
     },
-    [resolutionMode]
+    [resolutionMode, clusterFilterStatus] // ADDED DEPENDENCY
   );
 
   const handleSetSelectedClusterId = useCallback(
@@ -1812,6 +1817,7 @@ export function EntityResolutionProvider({
     }
   }, [
     resolutionMode,
+    clusterFilterStatus, // ADDED DEPENDENCY
     clusters.data.length,
     clusters.loading,
     loadClusters,
@@ -1851,6 +1857,7 @@ export function EntityResolutionProvider({
       setSelectedEdgeId: setSelectedEdgeIdAction,
       setReviewerId,
       setLastReviewedEdgeId,
+      setClusterFilterStatus, // ADDED
       triggerRefresh,
       loadClusters,
       loadBulkNodeDetails,
@@ -1892,7 +1899,6 @@ export function EntityResolutionProvider({
       viewNextConnectionPage,
       activelyPagingClusterId,
       largeClusterConnectionsPage,
-      setIsReviewToolsMaximized, // Added missing dependency
     ]
   );
 
@@ -1960,6 +1966,7 @@ export function EntityResolutionProvider({
     refreshTrigger,
     isAutoAdvanceEnabled,
     isReviewToolsMaximized,
+    clusterFilterStatus, // ADDED
     clusters,
     visualizationData,
     connectionData,
