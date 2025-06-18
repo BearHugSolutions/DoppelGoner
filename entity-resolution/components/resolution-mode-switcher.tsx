@@ -3,7 +3,6 @@
 
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import { Button } from "@/components/ui/button";
-import { Network, ServerCog } from "lucide-react"; // Using ServerCog for services
 
 export type ResolutionMode = "entity" | "service";
 
@@ -15,24 +14,26 @@ export default function ResolutionModeSwitcher() {
   };
 
   return (
-    <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+    <div className="flex flex-col sm:flex-row gap-2">
       <Button
         variant={resolutionMode === "entity" ? "default" : "outline"}
         onClick={() => handleModeChange("entity")}
-        className="flex items-center justify-center sm:justify-start w-full sm:w-auto"
+        className="flex items-center justify-center flex-1"
         size="sm"
       >
-        {/* <Network className="h-3.5 w-3.5 sm:h-4 sm:w-4 mr-1.5 sm:mr-2 flex-shrink-0" /> */}
-        <span className="text-xs sm:text-sm truncate">Entity Resolution</span>
+        <span className="text-xs sm:text-sm truncate text-center flex">
+          Organization
+        </span>
       </Button>
       <Button
         variant={resolutionMode === "service" ? "default" : "outline"}
         onClick={() => handleModeChange("service")}
-        className="flex items-center justify-center sm:justify-start w-full sm:w-auto"
+        className="flex items-center justify-center flex-1"
         size="sm"
       >
-        {/* <ServerCog className="h-3.5 w-3.5 sm:h-4 sm:w-4 mr-1.5 sm:mr-2 flex-shrink-0" /> */}
-        <span className="text-xs sm:text-sm truncate">Service Resolution</span>
+        <span className="text-xs sm:text-sm truncate text-center flex">
+          Service
+        </span>
       </Button>
     </div>
   );

@@ -26,7 +26,13 @@ const LARGE_CLUSTER_THRESHOLD = 200;
 
 // To avoid duplicating the list rendering logic, it's extracted into its own component.
 // This component will be rendered inside each Tab's content.
-const ClusterListContent = () => {
+const ClusterListContent = ({
+  page, // Receive page as prop
+  loading, // Receive loading as prop
+}: {
+  page: number;
+  loading: boolean;
+}) => {
   const {
     resolutionMode,
     selectedClusterId,
@@ -37,13 +43,12 @@ const ClusterListContent = () => {
     visualizationData,
   } = useEntityResolution();
 
-  const { data: clustersData, loading, error, page, total, limit } = clusters;
-  const [pageInput, setPageInput] = useState(page.toString());
-  const totalPages = Math.ceil(total / limit);
+  const { data: clustersData, error } = clusters; // Only use data and error from clusters here
 
   useEffect(() => {
-    setPageInput(page.toString());
-  }, [page]);
+    // This useEffect is no longer needed here as pageInput state is managed higher up
+    // setPageInput(page.toString());
+  }, [page]); // Keep dependency for completeness if it were used, but it's not anymore
 
   const handleClusterSelection = useCallback(
     async (clusterId: string) => {
@@ -62,34 +67,6 @@ const ClusterListContent = () => {
     },
     [selectedClusterId, actions, queries, resolutionMode]
   );
-
-  const handlePageChange = useCallback(
-    (newPage: number) => {
-      if (newPage >= 1 && newPage <= totalPages) {
-        actions.loadClusters(newPage, limit);
-      }
-    },
-    [actions, totalPages, limit]
-  );
-
-  const handlePageInputSubmit = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      const newPage = parseInt(pageInput, 10);
-      if (!isNaN(newPage) && newPage >= 1 && newPage <= totalPages) {
-        handlePageChange(newPage);
-      } else {
-        setPageInput(page.toString());
-      }
-      e.currentTarget.blur();
-    }
-  };
-
-  const handleInputBlur = () => {
-    const newPage = parseInt(pageInput, 10);
-    if (isNaN(newPage) || newPage < 1 || newPage > totalPages) {
-      setPageInput(page.toString());
-    }
-  };
 
   const getCoherenceColor = (score: number | null) => {
     if (score === null) return "bg-gray-300";
@@ -110,8 +87,10 @@ const ClusterListContent = () => {
   }
 
   return (
-    <Fragment>
-      <div className="space-y-3 flex-grow overflow-auto pr-1 custom-scrollbar">
+    <div className="flex flex-col h-full">
+      {/* Parent container for flex column behavior*/}
+      <div className="space-y-3 flex-grow overflow-y-auto pr-1 custom-scrollbar">
+        {/* Scrollable content area*/}
         {error && (
           <div className="text-red-600 text-sm p-2 bg-red-50 rounded border">
             Error: {error}
@@ -267,51 +246,22 @@ const ClusterListContent = () => {
           );
         })}
       </div>
-
-      {total > limit && (
-        <div className="flex justify-between items-center pt-3 border-t mt-auto">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => handlePageChange(page - 1)}
-            disabled={page === 1 || loading}
-          >
-            <ChevronLeft className="h-4 w-4 mr-1" />
-            Prev
-          </Button>
-          <div className="text-xs text-muted-foreground flex items-center gap-2">
-            Page
-            <Input
-              type="number"
-              value={pageInput}
-              onChange={(e) => setPageInput(e.target.value)}
-              onKeyDown={handlePageInputSubmit}
-              onBlur={handleInputBlur}
-              className="h-8 w-16 text-center"
-              min="1"
-              max={totalPages}
-              disabled={loading}
-            />
-            of {totalPages}
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => handlePageChange(page + 1)}
-            disabled={page >= totalPages || loading}
-          >
-            Next
-            <ChevronRight className="h-4 w-4 ml-1" />
-          </Button>
-        </div>
-      )}
-    </Fragment>
+    </div>
   );
 };
 
 export default function ClusterSelector() {
-  const { resolutionMode, actions, clusterFilterStatus } =
+  const { resolutionMode, actions, clusterFilterStatus, clusters } =
     useEntityResolution();
+
+  const { page, total, limit, loading } = clusters;
+  const [pageInput, setPageInput] = useState(page.toString());
+  const totalPages = Math.ceil(total / limit);
+
+  // Update pageInput when the actual page changes (e.g., after loading new clusters)
+  useEffect(() => {
+    setPageInput(page.toString());
+  }, [page]);
 
   // This effect triggers a reload of clusters whenever the filter status changes.
   useEffect(() => {
@@ -324,6 +274,34 @@ export default function ClusterSelector() {
     actions.setClusterFilterStatus(value as ClusterFilterStatus);
   };
 
+  const handlePageChange = useCallback(
+    (newPage: number) => {
+      if (newPage >= 1 && newPage <= totalPages) {
+        actions.loadClusters(newPage, limit);
+      }
+    },
+    [actions, totalPages, limit]
+  );
+
+  const handlePageInputSubmit = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      const newPage = parseInt(pageInput, 10);
+      if (!isNaN(newPage) && newPage >= 1 && newPage <= totalPages) {
+        handlePageChange(newPage);
+      } else {
+        setPageInput(page.toString()); // Revert to current page if invalid input
+      }
+      e.currentTarget.blur();
+    }
+  };
+
+  const handleInputBlur = () => {
+    const newPage = parseInt(pageInput, 10);
+    if (isNaN(newPage) || newPage < 1 || newPage > totalPages) {
+      setPageInput(page.toString()); // Revert to current page if invalid input on blur
+    }
+  };
+
   return (
     <div className="space-y-4 h-full flex flex-col bg-card p-3 rounded-lg shadow">
       <h3 className="text-lg font-semibold text-card-foreground border-b pb-2">
@@ -331,28 +309,69 @@ export default function ClusterSelector() {
         for Review
       </h3>
       <ResolutionModeSwitcher />
-      <Tabs
-        value={clusterFilterStatus}
-        onValueChange={handleValueChange}
-        className="flex flex-col flex-grow"
-      >
-        <TabsList className="grid w-full grid-cols-2">
-          <TabsTrigger value="unreviewed">Unreviewed</TabsTrigger>
-          <TabsTrigger value="reviewed">Reviewed</TabsTrigger>
-        </TabsList>
-
-        {/* The two TabsContent components will mount/unmount based on the selected tab.
-            The list content itself is now a separate component to avoid code duplication. */}
-        <TabsContent
-          value="unreviewed"
-          className="flex-grow flex flex-col mt-2"
+      {/* This is the key change: apply flex-grow only to this div */}
+      <div className="flex flex-col flex-grow min-h-0">
+        <Tabs
+          value={clusterFilterStatus}
+          onValueChange={handleValueChange}
+          className="flex flex-col flex-grow min-h-0"
         >
-          <ClusterListContent />
-        </TabsContent>
-        <TabsContent value="reviewed" className="flex-grow flex flex-col mt-2">
-          <ClusterListContent />
-        </TabsContent>
-      </Tabs>
+          <TabsList className="grid w-full grid-cols-2 flex-shrink-0">
+            <TabsTrigger value="unreviewed">Unreviewed</TabsTrigger>
+            <TabsTrigger value="reviewed">Reviewed</TabsTrigger>
+          </TabsList>
+          {/* The two TabsContent components will mount/unmount based on the selected tab.
+              The list content itself is now a separate component to avoid code duplication. */}
+          <TabsContent
+            value="unreviewed"
+            className="flex-grow flex flex-col mt-2 min-h-0"
+          >
+            <ClusterListContent page={page} loading={loading} />
+          </TabsContent>
+          <TabsContent value="reviewed" className="flex-grow flex flex-col mt-2 min-h-0">
+            <ClusterListContent page={page} loading={loading} />
+          </TabsContent>
+        </Tabs>
+        {totalPages > 1 && (
+          <div className="flex justify-between items-center pt-3 border-t flex-shrink-0 min-h-0">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handlePageChange(page - 1)}
+              disabled={page === 1 || loading}
+              className="text-xs"
+            >
+              <ChevronLeft className="h-2 w-2 mr-0.5" />
+              Prev
+            </Button>
+            <div className="text-xs text-muted-foreground flex items-center gap-2">
+              Page
+              <Input
+                type="number"
+                value={pageInput}
+                onChange={(e) => setPageInput(e.target.value)}
+                onKeyDown={handlePageInputSubmit}
+                onBlur={handleInputBlur}
+                className="h-8 w-10 text-center"
+                min="1"
+                max={totalPages}
+                disabled={loading}
+              />
+              of {totalPages}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handlePageChange(page + 1)}
+              disabled={page >= totalPages || loading}
+              className="text-xs"
+            >
+              Next
+              <ChevronRight className="h-2 w-2 ml-0.5" />
+            </Button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
