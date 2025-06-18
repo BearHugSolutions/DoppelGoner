@@ -14,7 +14,7 @@ import {
   BulkVisualizationRequestItem,
   ClusterReviewProgress,
   EdgeReviewApiPayload,
-  ClusterFilterStatus, // IMPORT NEW TYPE
+  ClusterFilterStatus,
 } from "@/types/entity-resolution";
 import {
   getServiceClusters,
@@ -24,7 +24,7 @@ import {
   getOrganizationClusters,
   getOrganizationConnectionData,
   getServiceConnectionData,
-  postEdgeReview, // Import the new atomic API function
+  postEdgeReview,
 } from "@/utils/api-client";
 import {
   createContext,
@@ -794,6 +794,23 @@ export function EntityResolutionProvider({
 
       try {
         const response = await fetcher(page, limit, clusterFilterStatus); // MODIFIED
+
+        // If no clusters are returned, and it's not the first page, we might have over-paged.
+        // Or, if it's the first page and no clusters, it means there are genuinely no clusters.
+        if (response.clusters.length === 0 && response.page > 1) {
+          console.warn(
+            `No clusters on page ${response.page}. Attempting to load page 1.`
+          );
+          // Recursively call loadClusters to reset to page 1
+          setClusters((prev) => ({
+            ...prev,
+            loading: false, // Stop loading state for the failed page
+            error: null, // Clear any previous error
+          }));
+          loadClusters(1, limit);
+          return;
+        }
+
         setClusters({
           data: response.clusters,
           total: response.total,
@@ -802,6 +819,11 @@ export function EntityResolutionProvider({
           loading: false,
           error: null,
         });
+
+        // If no clusters are fetched, clear selected cluster
+        if (response.clusters.length === 0) {
+          setSelectedClusterIdState(null);
+        }
 
         const vizRequestItemsNormal: BulkVisualizationRequestItem[] = [];
         response.clusters.forEach((c) => {
@@ -832,6 +854,8 @@ export function EntityResolutionProvider({
           data: [],
           total: 0,
         }));
+        // If an error occurs, clear selected cluster to prevent issues
+        setSelectedClusterIdState(null);
       }
     },
     [resolutionMode, clusterFilterStatus] // ADDED DEPENDENCY
@@ -1388,6 +1412,8 @@ export function EntityResolutionProvider({
         });
         console.log("All clusters reviewed.");
         setIsAutoAdvanceEnabledState(false);
+        // Set selected cluster to null if all are reviewed and no more pages
+        setSelectedClusterIdState(null);
       }
     }
   }, [
@@ -1891,8 +1917,29 @@ export function EntityResolutionProvider({
   ]);
 
   useEffect(() => {
-    if (clusters.data.length === 0 && !clusters.loading && !clusters.error) {
+    // Only load clusters if there are no clusters loaded OR if there was an error in previous load
+    // AND if the total is not 0 (meaning we haven't already confirmed no clusters exist for the filter).
+    // This prevents infinite fetches if the backend truly returns 0 total clusters for a filter.
+    if (
+      (clusters.data.length === 0 || clusters.error) &&
+      !clusters.loading &&
+      (clusters.total > 0 || clusterFilterStatus === "unreviewed")
+    ) {
+      console.log(
+        `[useEffect] Initial cluster load/reload triggered for filter: ${clusterFilterStatus}`
+      );
       loadClusters(1, clusters.limit);
+    } else if (
+      clusters.total === 0 &&
+      !clusters.loading &&
+      selectedClusterId !== null // If total is 0, ensure selectedClusterId is null
+    ) {
+      // If total is 0 and we're not loading, and a cluster is still selected, deselect it.
+      // This handles cases where all clusters might have been reviewed and moved to another tab.
+      console.log(
+        `[useEffect] Clusters total is 0 for filter ${clusterFilterStatus}. Deselecting current cluster.`
+      );
+      setSelectedClusterIdState(null);
     }
   }, [
     resolutionMode,
@@ -1902,9 +1949,16 @@ export function EntityResolutionProvider({
     loadClusters,
     clusters.limit,
     clusters.error,
+    clusters.total, // Added clusters.total to dependency array
+    selectedClusterId, // Added selectedClusterId to dependency array
   ]);
 
   useEffect(() => {
+    // This effect handles auto-selecting a cluster when clusters load or filter changes.
+    // It should only run if:
+    // 1. No cluster is currently selected.
+    // 2. Clusters data is available and not empty.
+    // 3. Clusters are not currently loading.
     if (!selectedClusterId && clusters.data.length > 0 && !clusters.loading) {
       const firstNonReviewedCluster = clusters.data.find((c) => !c.wasReviewed);
       if (firstNonReviewedCluster) {
@@ -1914,18 +1968,29 @@ export function EntityResolutionProvider({
         );
         handleSetSelectedClusterId(firstNonReviewedCluster.id);
       } else if (clusters.data.length > 0) {
+        // If all clusters on the current page are reviewed, select the first one for viewing.
+        // This is important for the "reviewed" tab, where all clusters are expected to be reviewed.
         const firstCluster = clusters.data[0];
         console.log(
           "All clusters on current page are reviewed. Auto-selecting first for viewing:",
           firstCluster.id
         );
         handleSetSelectedClusterId(firstCluster.id);
+      } else if (clusters.total === 0) {
+        // Explicitly clear selected cluster if there are no clusters at all
+        setSelectedClusterIdState(null);
       }
+    } else if (selectedClusterId && clusters.data.length === 0 && !clusters.loading) {
+        // If a cluster is selected, but the cluster list is now empty (e.g., due to filter change resulting in no data)
+        // then deselect the current cluster.
+        console.log("Current selected cluster no longer exists in an empty cluster list. Deselecting.");
+        setSelectedClusterIdState(null);
     }
   }, [
     selectedClusterId,
     clusters.data,
     clusters.loading,
+    clusters.total, // Add clusters.total to dependencies
     handleSetSelectedClusterId,
   ]);
 

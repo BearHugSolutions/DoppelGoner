@@ -467,47 +467,48 @@ export default function ConnectionReviewTools() {
                         methods.length > 0
                       ) {
                         return (
+                          console.log("‼️ Methods:", methods),
                           <div className="space-y-1">
                             {methods.map(
                               (
                                 method: {
-                                  method_type: string;
-                                  pre_rl_confidence: number;
-                                  rl_confidence: number;
-                                  combined_confidence: number;
+                                  methodType: string; // Changed from method_type
+                                  preRlConfidence: number; // Changed from pre_rl_confidence
+                                  rlConfidence: number; // Changed from rl_confidence
+                                  combinedConfidence: number; // Changed from combined_confidence
                                 },
                                 index: React.Key
                               ) => (
                                 <div
                                   key={
-                                    method.method_type
-                                      ? `${method.method_type}-${index}`
+                                    method.methodType // Changed from method_type
+                                      ? `${method.methodType}-${index}` // Changed from method_type
                                       : index
                                   }
                                   className="grid grid-cols-[1fr_auto_auto_auto] gap-2 items-center text-xs"
                                 >
                                   <div className="truncate">
-                                    {method.method_type?.replace(/_/g, " ") ??
+                                    {method.methodType?.replace(/_/g, " ") ?? // Changed from method_type
                                       "Unknown Method"}
                                   </div>
                                   <div className="text-right">
                                     <span className="text-xs text-muted-foreground">
                                       Pre-RL:{" "}
                                     </span>
-                                    {method.pre_rl_confidence?.toFixed(2) ??
+                                    {method.preRlConfidence?.toFixed(2) ?? // Changed from pre_rl_confidence
                                       "N/A"}
                                   </div>
                                   <div className="text-right">
                                     <span className="text-xs text-muted-foreground">
                                       RL:{" "}
                                     </span>
-                                    {method.rl_confidence?.toFixed(2) ?? "N/A"}
+                                    {method.rlConfidence?.toFixed(2) ?? "N/A"} {/* Changed from rl_confidence */}
                                   </div>
                                   <div className="text-right font-medium">
                                     <span className="text-xs text-muted-foreground">
                                       Combined:{" "}
                                     </span>
-                                    {method.combined_confidence?.toFixed(2) ??
+                                    {method.combinedConfidence?.toFixed(2) ?? // Changed from combined_confidence
                                       "N/A"}
                                   </div>
                                 </div>

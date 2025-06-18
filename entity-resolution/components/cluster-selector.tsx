@@ -317,7 +317,7 @@ export default function ClusterSelector() {
   useEffect(() => {
     // When a new tab is selected, fetch the clusters for that tab, resetting to page 1.
     actions.loadClusters(1);
-  }, [clusterFilterStatus, actions.loadClusters]); // MODIFIED: Depend on the specific function
+  }, [clusterFilterStatus, actions.loadClusters]);
 
   const handleValueChange = (value: string) => {
     // This updates the filter status in the global context.
