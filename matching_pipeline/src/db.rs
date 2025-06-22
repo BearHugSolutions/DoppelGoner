@@ -558,6 +558,7 @@ pub async fn insert_service_match_decision_details_batch(
     info!("Successfully batch inserted {} service match decision details", details.len());
     Ok(all_ids)
 }
+
 /// Upserts an entity group. If it exists, it's updated. If not, it's inserted.
 /// Returns the ID of the entity group and a boolean indicating if a new group was inserted.
 pub async fn upsert_entity_group(

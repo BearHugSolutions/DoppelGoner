@@ -1,0 +1,93 @@
+# Cargo.toml
+[package]
+name = "service_matching"
+version = "0.1.0"
+edition = "2021"
+authors = ["David Botos"]
+description = "A deduplication system for HSDS"
+
+[dependencies]
+# Error handling
+anyhow = "1.0.98"
+
+# Logging
+log = "0.4.27"
+env_logger = "0.11.3"
+
+# Date and time
+chrono = { version = "0.4.40", features = ["serde"] }
+
+# UUID generation
+uuid = { version = "1.16.0", features = ["v4", "serde"] }
+
+# Random number generation
+rand = { version = "0.8", features = ["std", "std_rng"] }
+
+# Async runtime
+tokio = { version = "1.44.2", features = ["full"] }
+
+# PostgreSQL
+tokio-postgres = { version = "0.7.13", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+bb8 = "0.8.6"
+bb8-postgres = "0.8.1"
+deadpool-postgres = "0.10.5"
+postgres-types = { version = "0.2.9", features = ["derive", "with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+
+# Async utilities
+futures = "0.3.30"
+bytes = "1.10.1"
+
+# URL handling
+url = "2.5.4"
+
+# Serialization/Deserialization
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+# Machine Learning
+smartcore = { version = "0.3.2", features = ["serde"] }  # Replaces lightgbm
+ndarray = "0.15.6"   # Array manipulation
+linfa = "0.6.1"      # Potential utility functions
+candle-core = { version = "0.9.1", features = ["accelerate"] }
+candle-nn = { version = "0.9.1", features = ["accelerate"] }
+once_cell = "1.19.0"
+
+# NEW: Arroy for Approximate Nearest Neighbor (ANN) search
+arroy = "0.6.1"
+heed = "0.22.0"
+tempfile = "3.10.1" # For creating temporary directories for heed/arroy
+
+# Reconciling storage types
+pgvector = { version = "0.4", features = ["postgres"] }
+
+# Graph algorithms
+petgraph = "=0.8.2"
+
+# For string similarity calculations
+strsim = "0.10.0"
+
+# For regular expressions in name normalization
+regex = "1.7.0"
+
+lru = "0.9"  # For feature caching
+num_cpus = "1.15"  # For detecting available CPU cores
+sysinfo = "0.30"  # For memory monitoring
+indicatif = "0.17"
+
+# Hashing calculations
+sha2 = "0.10"
+md5 = "0.7.0"
+hex = "0.4"
+
+# Define binary targets
+[[bin]]
+name = "dedupe"
+path = "src/main.rs"
+
+[[bin]]
+name = "run_clustering"
+path = "src/bin/run_clustering.rs"
+
+[lib]
+name = "dedupe_lib"
+path = "src/lib.rs"

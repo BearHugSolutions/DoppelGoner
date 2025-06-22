@@ -30,9 +30,20 @@ const MAX_CONCURRENT_ENTITY_PROCESSING_TASKS: usize = 50; // Max concurrent task
 struct EntityPhoneLink {
     entity_id: String,
     phone_id: String,
+    pathway: String, // Track which pathway this link came from
+}
+
+// Struct to hold pathway statistics
+#[derive(Debug, Default)]
+struct PathwayStats {
+    organization_direct: usize,
+    service_linked: usize,
+    location_linked: usize,
+    service_at_location: usize,
 }
 
 async fn fetch_existing_phone_features(pool: &PgPool) -> Result<HashSet<(String, String, String)>> {
+    info!("Fetching existing phone entity_feature records...");
     let conn = pool
         .get()
         .await
@@ -53,10 +64,88 @@ async fn fetch_existing_phone_features(pool: &PgPool) -> Result<HashSet<(String,
         existing_features.insert((entity_id, table_name, table_id));
     }
     info!(
-        "Fetched {} existing 'phone' entity_feature records.",
+        "✅ Found {} existing 'phone' entity_feature records to exclude.",
         existing_features.len()
     );
     Ok(existing_features)
+}
+
+async fn get_pathway_counts(pool: &PgPool) -> Result<PathwayStats> {
+    info!("Getting pathway counts for phones...");
+    let conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for pathway counts")?;
+
+    let mut stats = PathwayStats::default();
+
+    // Count direct organization phones
+    let rows = conn
+        .query(
+            "SELECT COUNT(*) as count FROM public.phone p 
+             JOIN public.entity e ON p.organization_id = e.organization_id 
+             WHERE p.organization_id IS NOT NULL",
+            &[],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        stats.organization_direct = row.get::<_, i64>("count") as usize;
+    }
+
+    // Count service-linked phones
+    let rows = conn
+        .query(
+            "SELECT COUNT(*) as count FROM public.phone p 
+             JOIN public.service s ON p.service_id = s.id 
+             JOIN public.entity e ON s.organization_id = e.organization_id 
+             WHERE p.service_id IS NOT NULL",
+            &[],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        stats.service_linked = row.get::<_, i64>("count") as usize;
+    }
+
+    // Count location-linked phones
+    let rows = conn
+        .query(
+            "SELECT COUNT(*) as count FROM public.phone p 
+             JOIN public.location l ON p.location_id = l.id 
+             JOIN public.entity e ON l.organization_id = e.organization_id 
+             WHERE p.location_id IS NOT NULL",
+            &[],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        stats.location_linked = row.get::<_, i64>("count") as usize;
+    }
+
+    // Count service-at-location phones
+    let rows = conn
+        .query(
+            "SELECT COUNT(*) as count FROM public.phone p 
+             JOIN public.service_at_location sal ON p.service_at_location_id = sal.id 
+             JOIN public.service s ON sal.service_id = s.id 
+             JOIN public.entity e ON s.organization_id = e.organization_id 
+             WHERE p.service_at_location_id IS NOT NULL",
+            &[],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        stats.service_at_location = row.get::<_, i64>("count") as usize;
+    }
+
+    info!("📊 Pathway Statistics:");
+    info!("  Direct Organization: {} phones", stats.organization_direct);
+    info!("  Service-linked: {} phones", stats.service_linked);
+    info!("  Location-linked: {} phones", stats.location_linked);
+    info!("  Service-at-location: {} phones", stats.service_at_location);
+    info!(
+        "  Total: {} phones across all pathways",
+        stats.organization_direct + stats.service_linked + stats.location_linked + stats.service_at_location
+    );
+
+    Ok(stats)
 }
 
 async fn fetch_entity_phone_links_batch(
@@ -69,30 +158,80 @@ async fn fetch_entity_phone_links_batch(
         .await
         .context("Failed to get DB connection for entity-phone links")?;
 
-    // Query to link entities to phones via:
-    // phone -> service_at_location -> service -> organization (implicit via entity.organization_id) -> entity
+    // Enhanced query that handles all four foreign key pathways using UNION
     let query_str = "
-        SELECT DISTINCT e.id AS entity_id, p.id AS phone_id
+        -- Pathway 1: Direct organization phones
+        SELECT DISTINCT 
+            e.id AS entity_id, 
+            p.id AS phone_id, 
+            'organization_direct' AS pathway
+        FROM public.phone p
+        JOIN public.entity e ON p.organization_id = e.organization_id
+        WHERE p.organization_id IS NOT NULL
+        
+        UNION
+        
+        -- Pathway 2: Service-linked phones
+        SELECT DISTINCT 
+            e.id AS entity_id, 
+            p.id AS phone_id, 
+            'service_linked' AS pathway
+        FROM public.phone p
+        JOIN public.service s ON p.service_id = s.id
+        JOIN public.entity e ON s.organization_id = e.organization_id
+        WHERE p.service_id IS NOT NULL
+        
+        UNION
+        
+        -- Pathway 3: Location-linked phones
+        SELECT DISTINCT 
+            e.id AS entity_id, 
+            p.id AS phone_id, 
+            'location_linked' AS pathway
+        FROM public.phone p
+        JOIN public.location l ON p.location_id = l.id
+        JOIN public.entity e ON l.organization_id = e.organization_id
+        WHERE p.location_id IS NOT NULL
+        
+        UNION
+        
+        -- Pathway 4: Service-at-Location phones (original behavior)
+        SELECT DISTINCT 
+            e.id AS entity_id, 
+            p.id AS phone_id, 
+            'service_at_location' AS pathway
         FROM public.phone p
         JOIN public.service_at_location sal ON p.service_at_location_id = sal.id
         JOIN public.service s ON sal.service_id = s.id
         JOIN public.entity e ON s.organization_id = e.organization_id
-        WHERE p.service_at_location_id IS NOT NULL -- Ensure the primary link for this path exists
+        WHERE p.service_at_location_id IS NOT NULL
+        
         ORDER BY entity_id, phone_id
         OFFSET $1 LIMIT $2";
 
     let rows = conn
         .query(query_str, &[&(offset as i64), &(limit as i64)])
         .await
-        .context("Failed to query entity-phone links via service_at_location")?;
+        .context("Failed to query entity-phone links via all pathways")?;
 
     let mut links = Vec::new();
+    let mut pathway_counts = std::collections::HashMap::new();
+    
     for row in rows {
+        let pathway: String = row.get("pathway");
+        *pathway_counts.entry(pathway.clone()).or_insert(0) += 1;
+        
         links.push(EntityPhoneLink {
             entity_id: row.get("entity_id"),
             phone_id: row.get("phone_id"),
+            pathway,
         });
     }
+
+    if !pathway_counts.is_empty() {
+        debug!("Batch pathway breakdown: {:?}", pathway_counts);
+    }
+
     Ok(links)
 }
 
@@ -139,6 +278,9 @@ async fn insert_new_features_batch(
         ));
     }
     
+    // Add ON CONFLICT clause to handle any duplicates gracefully
+    query.push_str(" ON CONFLICT (entity_id, table_name, table_id) DO NOTHING");
+    
     match transaction.execute(query.as_str(), &[]).await {
         Ok(count) => {
             transaction
@@ -147,11 +289,11 @@ async fn insert_new_features_batch(
                 .context("Failed to commit transaction")?;
             let num_inserted = count as usize;
             inserted_counter.fetch_add(num_inserted, Ordering::Relaxed);
-            debug!("Successfully inserted {} phone features.", num_inserted);
+            debug!("✅ Successfully inserted {} phone features.", num_inserted);
         }
         Err(e) => {
             let _ = transaction.rollback().await; 
-            warn!("Error inserting batch of phone features: {}. Batch details: {} features.", e, features_to_insert.len());
+            warn!("❌ Error inserting batch of phone features: {}. Batch details: {} features.", e, features_to_insert.len());
             if !features_to_insert.is_empty() {
                 warn!("First feature in failed batch: entity_id: {}, phone_id: {}", features_to_insert[0].entity_id.0, features_to_insert[0].table_id);
             }
@@ -164,7 +306,7 @@ async fn insert_new_features_batch(
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    info!("Starting one-time phone (via service_at_location) entity feature creation binary.");
+    info!("🚀 Starting enhanced phone entity feature creation binary (all pathways).");
     let start_time = Instant::now();
 
     let env_paths = [".env", ".env.local", "../.env", "../../.env"];
@@ -175,7 +317,7 @@ async fn main() -> Result<()> {
             if let Err(e) = db::load_env_from_file(path_str) {
                 warn!("Failed to load environment from {}: {}", path_str, e);
             } else {
-                info!("Loaded environment variables from {}", path_str);
+                info!("✅ Loaded environment variables from {}", path_str);
                 loaded_env = true;
                 break;
             }
@@ -190,16 +332,17 @@ async fn main() -> Result<()> {
     let pool = db::connect()
         .await
         .context("Failed to connect to database")?;
-    info!("Successfully connected to the database.");
+    info!("✅ Successfully connected to the database.");
+
+    // Get pathway statistics first
+    let _pathway_stats = get_pathway_counts(&pool)
+        .await
+        .context("Failed to get pathway statistics")?;
 
     let existing_features = Arc::new(
         fetch_existing_phone_features(&pool)
             .await
             .context("Failed to fetch existing phone features")?,
-    );
-    info!(
-        "Found {} existing 'phone' features to exclude.",
-        existing_features.len()
     );
 
     let total_processed_links = Arc::new(AtomicUsize::new(0));
@@ -210,9 +353,11 @@ async fn main() -> Result<()> {
     let processing_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_ENTITY_PROCESSING_TASKS));
 
     let mut offset = 0;
+    let mut total_pathway_counts = std::collections::HashMap::new();
+
     loop {
         info!(
-            "Fetching entity-phone links batch: offset {}, limit {}",
+            "🔄 Fetching entity-phone links batch: offset {}, limit {}",
             offset, BATCH_SIZE
         );
         let links_batch = fetch_entity_phone_links_batch(&pool, offset, BATCH_SIZE)
@@ -223,12 +368,19 @@ async fn main() -> Result<()> {
             ))?;
 
         if links_batch.is_empty() {
-            info!("No more entity-phone links to process.");
+            info!("✅ No more entity-phone links to process.");
             break;
         }
+        
         let current_batch_size = links_batch.len();
+        
+        // Count pathways in this batch
+        for link in &links_batch {
+            *total_pathway_counts.entry(link.pathway.clone()).or_insert(0) += 1;
+        }
+        
         info!(
-            "Processing {} phone links from offset {}.",
+            "📝 Processing {} phone links from offset {} across all pathways.",
             current_batch_size, offset
         );
 
@@ -248,7 +400,7 @@ async fn main() -> Result<()> {
                     total_processed_links_clone.fetch_add(1, Ordering::Relaxed);
                     let feature_key = (
                         link.entity_id.clone(),
-                        "phone".to_string(), // Table name is 'phone'
+                        "phone".to_string(),
                         link.phone_id.clone(),
                     );
 
@@ -271,10 +423,11 @@ async fn main() -> Result<()> {
         for task_result in join_all(tasks).await {
             match task_result {
                 Ok(chunk_features) => all_new_features_for_main_batch.extend(chunk_features),
-                Err(e) => warn!("Entity phone link processing task panicked: {}", e),
+                Err(e) => warn!("⚠️ Entity phone link processing task panicked: {}", e),
             }
         }
 
+        // Deduplicate within this batch
         let mut unique_features_to_insert_for_main_batch = Vec::new();
         let mut seen_in_this_main_batch = HashSet::new();
         for feature in all_new_features_for_main_batch {
@@ -286,7 +439,7 @@ async fn main() -> Result<()> {
 
         if !unique_features_to_insert_for_main_batch.is_empty() {
             info!(
-                "Found {} unique new phone features to insert from this batch of links (total links in batch: {}, after internal deduplication).",
+                "💾 Found {} unique new phone features to insert from this batch (total links: {}).",
                 unique_features_to_insert_for_main_batch.len(),
                 current_batch_size
             );
@@ -308,30 +461,33 @@ async fn main() -> Result<()> {
                     )
                     .await
                     {
-                        // Error already logged in insert_new_features_batch
+                        warn!("❌ Insert task failed: {}", e);
                     }
                 }));
             }
             join_all(insert_tasks).await; 
         } else {
-            info!("No new unique phone features to insert from this batch of links (total links in batch: {}).", current_batch_size);
+            info!("ℹ️ No new unique phone features to insert from this batch (total links: {}).", current_batch_size);
         }
         
         offset += current_batch_size;
         if current_batch_size < BATCH_SIZE {
-            info!("Processed last batch of phone links.");
+            info!("🏁 Processed last batch of phone links.");
             break; 
         }
     }
 
     let elapsed = start_time.elapsed();
-    info!(
-        "Phone entity feature creation completed in {:.2?}.",
-        elapsed
-    );
-    info!("Total entity-phone links processed: {}", total_processed_links.load(Ordering::Relaxed));
-    info!("Total new phone features identified (pre-batch deduplication): {}", new_features_identified_count.load(Ordering::Relaxed));
-    info!("Total new phone features inserted: {}", total_inserted_count.load(Ordering::Relaxed));
+    info!("🎉 Enhanced phone entity feature creation completed in {:.2?}.", elapsed);
+    info!("📊 FINAL STATISTICS:");
+    info!("  Total entity-phone links processed: {}", total_processed_links.load(Ordering::Relaxed));
+    info!("  Total new phone features identified: {}", new_features_identified_count.load(Ordering::Relaxed));
+    info!("  Total new phone features inserted: {}", total_inserted_count.load(Ordering::Relaxed));
+    
+    info!("📈 PATHWAY BREAKDOWN:");
+    for (pathway, count) in total_pathway_counts {
+        info!("  {}: {} links", pathway, count);
+    }
 
     Ok(())
 }
