@@ -305,6 +305,8 @@ export default function ConnectionReviewTools() {
   const edgeStatus = selectedEdgeId ? queries.getEdgeStatus(selectedEdgeId) : null;
   const nodeLabel = resolutionMode === 'entity' ? 'Entity' : 'Service';
 
+  console.log("🙏 currentConnectionData", currentConnectionData);
+
   return (
     <Collapsible
       open={isExpanded}
@@ -561,7 +563,6 @@ export default function ConnectionReviewTools() {
                   )}
                 </CardContent>
               </Card>
-
               {currentConnectionData?.entityGroups?.length && currentConnectionData.entityGroups.length > 0 && (
                 <Card>
                   <CardHeader className="p-3">

@@ -352,7 +352,7 @@ export default function ClusterSelector() {
                 onChange={(e) => setPageInput(e.target.value)}
                 onKeyDown={handlePageInputSubmit}
                 onBlur={handleInputBlur}
-                className="h-8 w-10 text-center"
+                className="h-8 w-12 text-center"
                 min="1"
                 max={totalPages}
                 disabled={loading}

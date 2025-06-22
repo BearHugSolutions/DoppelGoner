@@ -7,6 +7,7 @@ import { getIronSession, SessionOptions } from 'iron-session';
 // You'll need to ensure this file exists and exports sessionOptions correctly.
 // Example: export const sessionOptions: SessionOptions = { cookieName: 'myapp_session', password: 'complex_password_at_least_32_characters_long', cookieOptions: { secure: process.env.NODE_ENV === 'production' } };
 import { sessionOptions } from '@/lib/session';
+import { UserSessionData } from '@/app/api/auth/login/route';
 
 const SALT_ROUNDS = 10; // Cost factor for bcrypt
 
@@ -23,17 +24,6 @@ export interface DbUser {
   created_at: Date;
   updated_at: Date;
   last_login_at?: Date | null;
-}
-
-/**
- * Interface for user data stored in the session.
- * Ensure this matches the structure you save upon login.
- */
-interface UserSessionData {
-  id: string;
-  username: string;
-  userSchema: string; // This is the schema name we need
-  // Add other relevant session fields, e.g., isLoggedIn: boolean;
 }
 
 /**
