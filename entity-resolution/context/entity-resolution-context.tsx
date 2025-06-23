@@ -200,7 +200,7 @@ export function EntityResolutionProvider({
 }: {
   children: ReactNode;
 }) {
-  const { currentUser } = useAuth();
+  const { user } = useAuth();
   const { toast } = useToast();
 
   const [resolutionMode, setResolutionModeState] =
@@ -1868,7 +1868,7 @@ export function EntityResolutionProvider({
 
   const submitEdgeReview = useCallback(
     async (edgeId: string, decision: GroupReviewDecision, notes?: string) => {
-      if (!currentUser?.id) {
+      if (!user?.id) {
         toast({
           title: "Auth Error",
           description: "Login required.",
@@ -1913,7 +1913,7 @@ export function EntityResolutionProvider({
       try {
         const payload: EdgeReviewApiPayload = {
           decision: decision as "ACCEPTED" | "REJECTED",
-          reviewerId: currentUser.id,
+          reviewerId: user.id,
           notes,
           type: resolutionMode,
         };
@@ -1970,7 +1970,7 @@ export function EntityResolutionProvider({
       }
     },
     [
-      currentUser,
+      user,
       selectedClusterId,
       visualizationData,
       resolutionMode,
@@ -2344,8 +2344,8 @@ export function EntityResolutionProvider({
   }, [selectedEdgeId, connectionData, actions]);
 
   useEffect(() => {
-    if (currentUser?.id) setReviewerId(currentUser.id);
-  }, [currentUser]);
+    if (user?.id) setReviewerId(user.id);
+  }, [user]);
 
   const clusterProgress = useMemo(() => {
     const reconstructed: Record<string, ClusterReviewProgress> = {};

@@ -1,184 +1,213 @@
 // context/auth-context.tsx
 "use client";
 
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { useToast } from '@/hooks/use-toast'; // Assuming you have this toast hook
+import { useRouter } from 'next/navigation'; // Assuming you are using Next.js 13+ app router
+
+// Define user and team types for clarity in the context
+interface TeamContext {
+  teamSchema: string;
+  userPrefix: string;
+}
 
 interface User {
   id: string;
   username: string;
-  email?: string | null;
-  teamId: string;          // New: team ID
-  teamName: string;        // New: team name
-  teamSchema: string;      // New: team schema name (e.g., "alpha")
-  userPrefix: string;      // New: user prefix within team (e.g., "john")
-}
-
-// Team context type that matches the gateway client
-export interface TeamContext {
+  email?: string;
+  teamId: string;
+  teamName: string;
   teamSchema: string;
   userPrefix: string;
 }
 
 interface AuthContextType {
-  currentUser: User | null;
+  user: User | null;
   isLoading: boolean;
-  login: (usernameInput: string, passwordInput: string) => Promise<boolean>; // Changed return type to Promise<boolean>
-  register: (usernameInput: string, passwordInput: string, emailInput: string, teamName: string, datasets?: string[]) => Promise<boolean>; // Changed return type to Promise<boolean>
-  logout: () => void;
   error: string | null;
+  login: (username: string, password: string) => Promise<boolean>;
+  register: (username: string, password: string, email: string, teamName: string, datasets?: string[]) => Promise<boolean>;
+  logout: () => void;
   clearError: () => void;
-  // Helper function to get team context for API calls
-  getTeamContext: () => TeamContext | null;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [user, setUser] = useState<User | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { toast } = useToast();
+  const router = useRouter();
 
+  // Effect to load user from local storage on initial app load
   useEffect(() => {
     try {
-      const storedUser = localStorage.getItem('currentUser');
+      const storedUser = localStorage.getItem('user');
       if (storedUser) {
-        const parsedUser = JSON.parse(storedUser);
-        // Validate the stored user structure for the new team-based system
-        if (parsedUser &&
-            parsedUser.username &&
-            parsedUser.id &&
-            parsedUser.teamSchema &&
-            parsedUser.userPrefix &&
-            parsedUser.teamName) {
-          setCurrentUser(parsedUser);
-        } else {
-          console.warn("Stored user data is incompatible with team-based system, clearing...");
-          localStorage.removeItem('currentUser'); // Clear invalid stored user
-        }
+        setUser(JSON.parse(storedUser));
       }
     } catch (e) {
-      console.error("Failed to parse user from localStorage", e);
-      localStorage.removeItem('currentUser');
+      console.error("Failed to parse user from local storage:", e);
+      localStorage.removeItem('user'); // Clear corrupted storage
     }
-    setIsLoading(false);
   }, []);
 
-  const clearError = () => setError(null);
-
-  // Helper function to extract team context for API calls
-  const getTeamContext = (): TeamContext | null => {
-    if (!currentUser) return null;
-    return {
-      teamSchema: currentUser.teamSchema,
-      userPrefix: currentUser.userPrefix
-    };
-  };
-
-  const login = async (usernameInput: string, passwordInput: string): Promise<boolean> => {
-    setIsLoading(true);
+  /**
+   * Clears any authentication-related errors.
+   */
+  const clearError = useCallback(() => {
     setError(null);
+  }, []);
+
+  /**
+   * Handles user login by calling the Next.js local API route.
+   * @param username The user's username.
+   * @param password The user's password.
+   * @returns A boolean indicating login success or failure.
+   */
+  const login = useCallback(async (username: string, password: string): Promise<boolean> => {
+    setIsLoading(true);
+    clearError();
     try {
+      // Call your Next.js API route for login
       const response = await fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: usernameInput, password: passwordInput }),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username, password }),
       });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'Login failed');
-      }
 
-      // Validate the user object from API matches the new User interface
-      if (data.user &&
-          data.user.id &&
-          data.user.username &&
-          data.user.teamSchema &&
-          data.user.userPrefix &&
-          data.user.teamName) {
-        setCurrentUser(data.user);
-        localStorage.setItem('currentUser', JSON.stringify(data.user));
-        return true; // Login successful
+      const data = await response.json();
+
+      if (response.ok) {
+        setUser(data.user);
+        localStorage.setItem('user', JSON.stringify(data.user)); // Persist user data
+        toast({
+          title: "Login Successful",
+          description: "Welcome back!",
+        });
+        router.push('/dashboard'); // Redirect to dashboard or a relevant page after successful login
+        return true;
       } else {
-        console.error("Login response user data:", data.user);
-        throw new Error('Login response did not include valid team-based user data.');
+        // Set error message from the API response
+        setError(data.error || 'Login failed.');
+        toast({
+          title: "Login Error",
+          description: data.error || 'Login failed. Please check your credentials.',
+          variant: "destructive",
+        });
+        return false;
       }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'An unknown error occurred during login.';
-      setError(message);
-      console.error("Login error:", err);
-      return false; // Login failed
+    } catch (err: any) {
+      console.error('Login network or unexpected error:', err);
+      // Handle network errors or other unexpected issues
+      setError(err.message || 'An unexpected error occurred during login.');
+      toast({
+        title: "Login Error",
+        description: err.message || 'Network error occurred. Please try again.',
+        variant: "destructive",
+      });
+      return false;
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [clearError, toast, router]);
 
-  const register = async (usernameInput: string, passwordInput: string, emailInput: string, teamName: string, datasets?: string[]): Promise<boolean> => {
+  /**
+   * Handles user registration by calling the Next.js local API route.
+   * THIS IS THE CRITICAL FIX: Ensures the call goes to your Next.js proxy.
+   * @param username The desired username.
+   * @param password The desired password.
+   * @param email The user's email address.
+   * @param teamName The name of the team to join or create.
+   * @param datasets Optional array of dataset names for new teams.
+   * @returns A boolean indicating registration success or failure.
+   */
+  const register = useCallback(async (username: string, password: string, email: string, teamName: string, datasets?: string[]): Promise<boolean> => {
     setIsLoading(true);
-    setError(null);
+    clearError();
     try {
-      console.log("Request body:", {
-        username: usernameInput,
-        password: passwordInput,
-        email: emailInput,
-        teamName: teamName,
-        datasets: datasets
-      });
+      // >>> CRITICAL CHANGE <<<
+      // Call the local Next.js API route, which then proxies to your Gateway
       const response = await fetch('/api/auth/register', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: usernameInput,
-          password: passwordInput,
-          email: emailInput,
-          teamName: teamName,
-          datasets: datasets
-        }),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username, password, email, teamName, datasets }),
       });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'Registration failed');
-      }
 
-      // Instead of alert(), you might want to integrate with a global toast system here
-      // For now, we'll just return true and let auth-forms handle the success toast.
-      // alert(data.message || "Registration successful! Please log in.");
-      return true; // Registration successful
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'An unknown error occurred during registration.';
-      setError(message);
-      console.error("Registration error:", err);
-      return false; // Registration failed
+      const data = await response.json();
+
+      if (response.ok) {
+        toast({
+          title: "Registration Successful",
+          description: "Your account has been created. You can now log in.",
+        });
+        // You might want to automatically redirect to the login tab in AuthForms here
+        return true;
+      } else {
+        // Set error message from the API response
+        setError(data.error || 'Registration failed.');
+        toast({
+          title: "Registration Error",
+          description: data.error || 'Registration failed. Please check the details and try again.',
+          variant: "destructive",
+        });
+        return false;
+      }
+    } catch (err: any) {
+      console.error('Registration network or unexpected error:', err);
+      // Handle network errors or other unexpected issues
+      setError(err.message || 'An unexpected error occurred during registration.');
+      toast({
+        title: "Registration Error",
+        description: err.message || 'Network error occurred. Please try again.',
+        variant: "destructive",
+      });
+      return false;
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [clearError, toast]);
 
-  const logout = () => {
-    setCurrentUser(null);
-    localStorage.removeItem('currentUser');
-    setIsLoading(false);
-  };
+  /**
+   * Logs out the current user, clears local storage, and redirects to login.
+   */
+  const logout = useCallback(() => {
+    setUser(null);
+    localStorage.removeItem('user');
+    toast({
+      title: "Logged out",
+      description: "You have been successfully logged out.",
+    });
+    router.push('/login'); // Redirect to login page after logout
+  }, [toast, router]);
+
+  // Memoize the context value to prevent unnecessary re-renders
+  const value = React.useMemo(() => ({
+    user,
+    isLoading,
+    error,
+    login,
+    register,
+    logout,
+    clearError,
+  }), [user, isLoading, error, login, register, logout, clearError]);
 
   return (
-    <AuthContext.Provider value={{
-      currentUser,
-      isLoading,
-      login,
-      register,
-      logout,
-      error,
-      clearError,
-      getTeamContext
-    }}>
+    <AuthContext.Provider value={value}>
       {children}
     </AuthContext.Provider>
   );
-}
+};
 
-export function useAuth() {
+export const useAuth = () => {
   const context = useContext(AuthContext);
   if (context === undefined) {
     throw new Error('useAuth must be used within an AuthProvider');
   }
   return context;
-}
+};
