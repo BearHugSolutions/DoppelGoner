@@ -48,17 +48,6 @@ export function AuthForms() {
   const [loadingTeams, setLoadingTeams] = useState(false);
   const [loadingDatasets, setLoadingDatasets] = useState(false);
 
-  // Load teams and datasets when registration tab is selected
-  // IMPORTANT FIX: This useEffect now forces a reload of teams and datasets
-  // every time the 'register' tab is activated, ensuring fresh data.
-  useEffect(() => {
-    if (!isLoginTab) { // If it's the register tab
-      loadTeams(); // Always try to load teams
-      loadDatasets(); // Always try to load datasets
-    }
-    // Dependency array changed to only listen to isLoginTab
-  }, [isLoginTab]); 
-
   /**
    * Fetches the list of available teams from the backend.
    * Uses the Next.js API route instead of calling gateway directly.
@@ -126,6 +115,22 @@ export function AuthForms() {
     }
   };
 
+  // NEW: Load teams and datasets when the component mounts.
+  // This ensures the data is fresh every time the page is visited.
+  useEffect(() => {
+    loadTeams();
+    loadDatasets();
+  }, []); // Empty dependency array ensures this runs only once on mount
+
+  // Load teams and datasets specifically when switching to the registration tab.
+  // This is kept to ensure data is loaded/refreshed if the user switches back and forth.
+  useEffect(() => {
+    if (!isLoginTab) { // If it's the register tab
+      loadTeams();
+      loadDatasets();
+    }
+  }, [isLoginTab]); 
+
   /**
    * Handles the form submission for both login and registration.
    */
@@ -135,12 +140,10 @@ export function AuthForms() {
 
     if (isLoginTab) {
       const success = await login(username, password);
-      // Toast messages are now handled directly within the login function in auth-context.
-      // This conditional block is simplified.
       if (!success && error) {
-        // If login failed and there's an error, it's already toasted.
+        // Error already handled by toast in auth-context.
       } else if (success) {
-        // If login succeeded, it's already toasted and redirected.
+        // Success handled by toast and redirection in auth-context.
       }
     } else {
       let teamName = '';
@@ -165,7 +168,7 @@ export function AuthForms() {
 
       const success = await register(username, password, email, teamName, datasetsToRegister);
       if (!success && error) {
-        // If registration failed and there's an error, it's already toasted.
+        // Error already handled by toast in auth-context.
       } else if (success) {
         toast({
           title: "Registration Successful",
