@@ -56,7 +56,8 @@ export function AuthForms() {
     setLoadingTeams(true);
     try {
       // Use relative URL to call the Next.js API route
-      const response = await fetch('/api/teams');
+      // Added 'cache: no-store' to ensure the request bypasses browser cache
+      const response = await fetch('/api/teams', { cache: 'no-store' });
       if (response.ok) {
         const teamsData = await response.json();
         setTeams(teamsData);
@@ -88,7 +89,8 @@ export function AuthForms() {
     setLoadingDatasets(true);
     try {
       // Use relative URL to call the Next.js API route
-      const response = await fetch('/api/datasets');
+      // Added 'cache: no-store' to ensure the request bypasses browser cache
+      const response = await fetch('/api/datasets', { cache: 'no-store' });
       if (response.ok) {
         const data = await response.json();
         // Assuming the backend response structure has a 'datasets' key
@@ -115,7 +117,7 @@ export function AuthForms() {
     }
   };
 
-  // NEW: Load teams and datasets when the component mounts.
+  // Load teams and datasets when the component mounts.
   // This ensures the data is fresh every time the page is visited.
   useEffect(() => {
     loadTeams();
