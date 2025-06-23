@@ -29,7 +29,7 @@ interface Dataset {
 
 // Define the API_BASE_URL using environment variables.
 // It's crucial for correct API routing, especially in production environments.
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3000';
+const API_BASE_URL = process.env.GATEWAY_BASE_URL;
 
 export function AuthForms() {
   // Destructure toast from useToast hook
