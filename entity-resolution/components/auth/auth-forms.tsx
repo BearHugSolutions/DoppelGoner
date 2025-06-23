@@ -10,7 +10,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
-// Import the useToast hook
 import { useToast } from '@/hooks/use-toast';
 
 interface Team {
@@ -27,14 +26,9 @@ interface Dataset {
   isActive: boolean;
 }
 
-// Define the API_BASE_URL using environment variables.
-// It's crucial for correct API routing, especially in production environments.
-const API_BASE_URL = process.env.GATEWAY_BASE_URL;
-
 export function AuthForms() {
-  // Destructure toast from useToast hook
   const { login, register, isLoading, error, clearError } = useAuth();
-  const { toast } = useToast(); // Initialize useToast hook
+  const { toast } = useToast();
 
   // Form state
   const [username, setUsername] = useState('');
@@ -50,9 +44,9 @@ export function AuthForms() {
 
   // Data loading state
   const [teams, setTeams] = useState<Team[]>([]);
-  const [datasets, setDatasets] = useState<Dataset[]>([]); // State to hold fetched datasets
+  const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [loadingTeams, setLoadingTeams] = useState(false);
-  const [loadingDatasets, setLoadingDatasets] = useState(false); // New loading state for datasets
+  const [loadingDatasets, setLoadingDatasets] = useState(false);
 
   // Load teams and datasets when registration tab is selected
   useEffect(() => {
@@ -61,24 +55,25 @@ export function AuthForms() {
         loadTeams();
       }
       if (datasets.length === 0) {
-        loadDatasets(); // Load datasets when switching to register tab
+        loadDatasets();
       }
     }
-  }, [isLoginTab, teams.length, datasets.length]); // Add datasets.length to dependency array
+  }, [isLoginTab, teams.length, datasets.length]);
 
   /**
    * Fetches the list of available teams from the backend.
+   * Uses the Next.js API route instead of calling gateway directly.
    */
   const loadTeams = async () => {
     setLoadingTeams(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/v1/api/teams`);
+      // Use relative URL to call the Next.js API route
+      const response = await fetch('/api/teams');
       if (response.ok) {
         const teamsData = await response.json();
         setTeams(teamsData);
       } else {
         console.error('Failed to load teams:', response.statusText);
-        // Display error using toast
         toast({
           title: "Error loading teams",
           description: response.statusText,
@@ -87,7 +82,6 @@ export function AuthForms() {
       }
     } catch (error) {
       console.error('Failed to load teams:', error);
-      // Display error using toast
       toast({
         title: "Error loading teams",
         description: (error as Error).message || "An unexpected error occurred.",
@@ -100,22 +94,20 @@ export function AuthForms() {
 
   /**
    * Fetches the list of available datasets from the backend.
-   * This function does not use getTeamContext, as per the provided
-   * backend route for /api/datasets, which doesn't require team context.
+   * Uses the Next.js API route instead of calling gateway directly.
    */
   const loadDatasets = async () => {
     setLoadingDatasets(true);
     try {
-      // Constructs the URL using API_BASE_URL as instructed.
-      const response = await fetch(`${API_BASE_URL}/v1/api/datasets`);
+      // Use relative URL to call the Next.js API route
+      const response = await fetch('/api/datasets');
       if (response.ok) {
         const data = await response.json();
         // Assuming the backend response structure has a 'datasets' key
         setDatasets(data.datasets || []);
       } else {
         console.error('Failed to load datasets:', response.statusText);
-        setDatasets([]); // Clear datasets on error
-        // Display error using toast
+        setDatasets([]);
         toast({
           title: "Error loading datasets",
           description: response.statusText,
@@ -124,8 +116,7 @@ export function AuthForms() {
       }
     } catch (error) {
       console.error('Failed to load datasets:', error);
-      setDatasets([]); // Clear datasets on error
-      // Display error using toast
+      setDatasets([]);
       toast({
         title: "Error loading datasets",
         description: (error as Error).message || "An unexpected error occurred.",
@@ -141,13 +132,11 @@ export function AuthForms() {
    */
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
-    clearError(); // Still clear internal error state if useAuth uses it.
+    clearError();
 
     if (isLoginTab) {
       const success = await login(username, password);
-      // If login failed, useAuth might already toast the error.
-      // If not, you could add a toast here.
-      if (!success && error) { // 'error' comes from useAuth
+      if (!success && error) {
         toast({
           title: "Login Error",
           description: error,
@@ -172,7 +161,6 @@ export function AuthForms() {
       }
 
       if (!teamName) {
-        // Display error using toast instead of console.error or setError
         toast({
           title: "Registration Error",
           description: "Please select or create a team.",
@@ -182,7 +170,7 @@ export function AuthForms() {
       }
 
       const success = await register(username, password, email, teamName, datasetsToRegister);
-      if (!success && error) { // 'error' comes from useAuth
+      if (!success && error) {
         toast({
           title: "Registration Error",
           description: error,
@@ -210,7 +198,7 @@ export function AuthForms() {
     setSelectedTeam('');
     setNewTeamName('');
     setSelectedDatasets([]);
-    clearError(); // Clear internal error state
+    clearError();
   };
 
   /**
@@ -264,8 +252,6 @@ export function AuthForms() {
                     placeholder="Your password"
                   />
                 </div>
-                {/* The global toast will handle errors, so this local error display might be redundant */}
-                {/* {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>} */}
                 <Button type="submit" disabled={isLoading} className="w-full">
                   {isLoading ? 'Processing...' : 'Login'}
                 </Button>
@@ -400,9 +386,6 @@ export function AuthForms() {
                     </TabsContent>
                   </Tabs>
                 </div>
-
-                {/* The global toast will handle errors, so this local error display might be redundant */}
-                {/* {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>} */}
 
                 <Button type="submit" disabled={isLoading} className="w-full">
                   {isLoading ? 'Processing...' : 'Register'}
