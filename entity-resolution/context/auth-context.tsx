@@ -96,7 +96,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             description: "Welcome back!",
           });
           // CRITICAL CHANGE: Redirect to the root page (app/page.tsx)
-          router.push('/'); 
+          // Use window.location.href for a full page refresh to ensure session cookie is picked up
+          window.location.href = '/'; 
           return true;
         } else {
           setError('Login successful, but no user data received.');
@@ -128,7 +129,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       setIsLoading(false);
     }
-  }, [clearError, toast, router]);
+  }, [clearError, toast]); // Removed router from dependencies as it's no longer used for push
 
   /**
    * Handles user registration by calling the Next.js local API route.
@@ -192,7 +193,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       title: "Logged out",
       description: "You have been successfully logged out.",
     });
-    router.push('/login'); // Redirect to login page after logout
+    // This can still use router.push as it's redirecting to the login page
+    router.push('/login'); 
   }, [toast, router]);
 
   // Memoize the context value to prevent unnecessary re-renders
