@@ -363,7 +363,6 @@ export function AuthForms() {
                           className="mt-1"
                           placeholder="e.g., WA211, IL211, etc."
                         />
-                        <p className="text-xs text-gray-500 mt-1">Team name should be lowercase with hyphens or underscores.</p>
                       </div>
 
                       <div>
