@@ -72,7 +72,7 @@ export function AuthForms() {
   const loadTeams = async () => {
     setLoadingTeams(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/teams`);
+      const response = await fetch(`${API_BASE_URL}/v1/api/teams`);
       if (response.ok) {
         const teamsData = await response.json();
         setTeams(teamsData);
@@ -107,7 +107,7 @@ export function AuthForms() {
     setLoadingDatasets(true);
     try {
       // Constructs the URL using API_BASE_URL as instructed.
-      const response = await fetch(`${API_BASE_URL}/api/datasets`);
+      const response = await fetch(`${API_BASE_URL}/v1/api/datasets`);
       if (response.ok) {
         const data = await response.json();
         // Assuming the backend response structure has a 'datasets' key
