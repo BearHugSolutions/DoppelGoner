@@ -80,16 +80,37 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
 
       const data = await response.json();
+      // Added console log to inspect the data received from the login API
+      console.log("Login API response data:", data); 
 
       if (response.ok) {
-        setUser(data.user);
-        localStorage.setItem('user', JSON.stringify(data.user)); // Persist user data
-        toast({
-          title: "Login Successful",
-          description: "Welcome back!",
-        });
-        router.push('/dashboard'); // Redirect to dashboard or a relevant page after successful login
-        return true;
+        // Ensure data.user exists before setting state and local storage
+        if (data.user) { 
+          setUser(data.user);
+          try {
+            localStorage.setItem('user', JSON.stringify(data.user)); // Persist user data
+            // Confirmed user data saved to local storage
+            console.log("User data saved to local storage:", data.user); 
+          } catch (localStorageError) {
+            console.error("Error saving user to local storage:", localStorageError);
+            // Optionally, handle this error more gracefully, e.g., by informing the user
+          }
+          toast({
+            title: "Login Successful",
+            description: "Welcome back!",
+          });
+          router.push('/dashboard'); // Redirect to dashboard or a relevant page after successful login
+          return true;
+        } else {
+          // Case where login is "ok" but user data is missing (unexpected but handled)
+          setError('Login successful, but no user data received.');
+          toast({
+            title: "Login Error",
+            description: "No user data received after successful login.",
+            variant: "destructive",
+          });
+          return false;
+        }
       } else {
         // Set error message from the API response
         setError(data.error || 'Login failed.');

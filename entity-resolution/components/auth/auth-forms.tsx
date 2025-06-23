@@ -49,16 +49,15 @@ export function AuthForms() {
   const [loadingDatasets, setLoadingDatasets] = useState(false);
 
   // Load teams and datasets when registration tab is selected
+  // IMPORTANT FIX: This useEffect now forces a reload of teams and datasets
+  // every time the 'register' tab is activated, ensuring fresh data.
   useEffect(() => {
-    if (!isLoginTab) {
-      if (teams.length === 0) {
-        loadTeams();
-      }
-      if (datasets.length === 0) {
-        loadDatasets();
-      }
+    if (!isLoginTab) { // If it's the register tab
+      loadTeams(); // Always try to load teams
+      loadDatasets(); // Always try to load datasets
     }
-  }, [isLoginTab, teams.length, datasets.length]);
+    // Dependency array changed to only listen to isLoginTab
+  }, [isLoginTab]); 
 
   /**
    * Fetches the list of available teams from the backend.
@@ -136,17 +135,12 @@ export function AuthForms() {
 
     if (isLoginTab) {
       const success = await login(username, password);
+      // Toast messages are now handled directly within the login function in auth-context.
+      // This conditional block is simplified.
       if (!success && error) {
-        toast({
-          title: "Login Error",
-          description: error,
-          variant: "destructive",
-        });
+        // If login failed and there's an error, it's already toasted.
       } else if (success) {
-        toast({
-          title: "Login Successful",
-          description: "Welcome back!",
-        });
+        // If login succeeded, it's already toasted and redirected.
       }
     } else {
       let teamName = '';
@@ -171,16 +165,14 @@ export function AuthForms() {
 
       const success = await register(username, password, email, teamName, datasetsToRegister);
       if (!success && error) {
-        toast({
-          title: "Registration Error",
-          description: error,
-          variant: "destructive",
-        });
+        // If registration failed and there's an error, it's already toasted.
       } else if (success) {
         toast({
           title: "Registration Successful",
           description: "Please log in with your new credentials.",
         });
+        // Optionally, switch to login tab automatically after successful registration
+        handleTabChange('login');
       }
     }
   };
