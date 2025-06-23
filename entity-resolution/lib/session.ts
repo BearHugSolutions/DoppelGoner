@@ -1,6 +1,18 @@
 // @/lib/session.ts
 import type { SessionOptions } from 'iron-session';
 
+// Session data structure for team-based system
+export interface UserSessionData {
+  userId: string;
+  sessionId: string;
+  username: string;
+  teamId: string;        // Team ID
+  teamName: string;      // Human-readable team name
+  teamSchema: string;    // Team's database schema name (e.g., "alpha")
+  userPrefix: string;    // User's prefix within team schema (e.g., "john")
+  isLoggedIn: true;
+}
+
 // Ensure SECRET_COOKIE_PASSWORD is set and is a string
 const secretCookiePassword = process.env.SECRET_COOKIE_PASSWORD;
 if (!secretCookiePassword || typeof secretCookiePassword !== 'string') {
@@ -22,13 +34,14 @@ if (secretCookiePassword.length < 32) {
 }
 
 export const sessionOptions: SessionOptions = {
-  cookieName: process.env.SESSION_COOKIE_NAME || 'your-app-session-name', // Replace 'your-app-session-name' or use an env var
-  password: secretCookiePassword, // Use the validated password
+  cookieName: process.env.SESSION_COOKIE_NAME || 'entity-resolution-session',
+  password: secretCookiePassword,
   cookieOptions: {
-    secure: process.env.NODE_ENV === 'production', // Important: Set to true in production
-    httpOnly: true, // Recommended for security
-    sameSite: 'lax', // Recommended for security
-    maxAge: undefined, // Session cookie by default, or set a duration in seconds (e.g., 24 * 60 * 60 for 1 day)
-    // path: '/', // Usually defaults to /
+    secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+    httpOnly: true, // Prevent XSS attacks
+    sameSite: 'lax', // CSRF protection
+    maxAge: 7 * 24 * 60 * 60, // 7 days (recommended for team-based systems)
+    // Note: Longer sessions are acceptable for team-based systems since users
+    // are typically organization members with ongoing access
   },
 };

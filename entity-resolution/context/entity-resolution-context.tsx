@@ -244,6 +244,9 @@ export function EntityResolutionProvider({
   const [largeClusterConnectionsPage, setLargeClusterConnectionsPage] =
     useState<number>(0);
   const [isLoadingPage, setIsLoadingPage] = useState<boolean>(false);
+  const [pendingNodeFetches, setPendingNodeFetches] = useState<Set<string>>(
+    new Set()
+  );
 
   const getClusterById = useCallback(
     (clusterId: string): EntityCluster | undefined => {
@@ -390,12 +393,100 @@ export function EntityResolutionProvider({
     ]
   );
 
+  const optimizedQueries = useMemo(
+    () => ({
+      isVisualizationDataLoaded: (clusterId: string) =>
+        !!visualizationData[clusterId]?.data &&
+        !visualizationData[clusterId]?.loading &&
+        !visualizationData[clusterId]?.error,
+
+      isVisualizationDataLoading: (clusterId: string) =>
+        !!visualizationData[clusterId]?.loading,
+
+      isConnectionDataLoaded: (edgeId: string) =>
+        !!connectionData[edgeId]?.data &&
+        !connectionData[edgeId]?.loading &&
+        !connectionData[edgeId]?.error,
+
+      isConnectionDataLoading: (edgeId: string) =>
+        !!connectionData[edgeId]?.loading,
+
+      getVisualizationError: (clusterId: string) =>
+        visualizationData[clusterId]?.error || null,
+
+      getConnectionError: (edgeId: string) =>
+        connectionData[edgeId]?.error || null,
+
+      getClusterProgress: queries.getClusterProgress,
+
+      canAdvanceToNextCluster: () => {
+        if (!selectedClusterId) return false;
+        const progress = queries.getClusterProgress(selectedClusterId);
+        return progress?.isComplete || false;
+      },
+
+      isEdgeReviewed: (edgeId: string) => {
+        const currentViz = selectedClusterId
+          ? visualizationData[selectedClusterId]?.data
+          : null;
+        if (!currentViz?.links) return false;
+        const edge = currentViz.links.find((l) => l.id === edgeId);
+        return edge ? edge.wasReviewed === true : false;
+      },
+
+      getEdgeStatus: (edgeId: string) => {
+        const currentViz = selectedClusterId
+          ? visualizationData[selectedClusterId]?.data
+          : null;
+        if (!currentViz?.links) return null;
+        const edge = currentViz.links.find((l) => l.id === edgeId);
+        return edge?.status ?? null;
+      },
+
+      getEdgeSubmissionStatus: (edgeId: string) => {
+        return (
+          edgeSubmissionStatus[edgeId] || { isSubmitting: false, error: null }
+        );
+      },
+
+      getClusterById,
+
+      getNodeDetail: (nodeId: string) => nodeDetails[nodeId] || null,
+
+      // NEW: Debug query for pending node fetches
+      getPendingNodeFetches: () => Array.from(pendingNodeFetches),
+
+      // NEW: Utility queries for better debugging
+      getNodeLoadingState: (nodeId: string) => ({
+        details: nodeDetails[nodeId],
+        isPending: pendingNodeFetches.has(nodeId),
+        needsLoading:
+          !nodeDetails[nodeId] &&
+          nodeDetails[nodeId] !== "loading" &&
+          nodeDetails[nodeId] !== "error" &&
+          !pendingNodeFetches.has(nodeId),
+      }),
+    }),
+    [
+      // More specific dependencies to prevent unnecessary recalculations
+      visualizationData,
+      connectionData,
+      selectedClusterId,
+      edgeSubmissionStatus,
+      getClusterById,
+      nodeDetails,
+      pendingNodeFetches,
+      queries.getClusterProgress,
+    ]
+  );
+
   const clearAllData = useCallback(() => {
     console.log("Clearing all data.");
     setClusters(initialClustersState);
     setVisualizationData({});
     setConnectionData({});
     setNodeDetails({});
+    setPendingNodeFetches(new Set());
     setSelectedClusterIdState(null);
     setSelectedEdgeIdState(null);
     setLastReviewedEdgeId(null);
@@ -420,18 +511,64 @@ export function EntityResolutionProvider({
 
   const loadBulkNodeDetails = useCallback(
     async (nodesToFetch: NodeIdentifier[]) => {
+      // Debug logging to track calls
+      const caller =
+        new Error().stack?.split("\n")[2]?.match(/at (\w+)/)?.[1] || "unknown";
+      console.log(`🔍 loadBulkNodeDetails called by: ${caller}`);
+      console.log(
+        `🔍 Requested: ${nodesToFetch.length} nodes, First 3 IDs:`,
+        nodesToFetch.slice(0, 3).map((n) => n.id)
+      );
+
+      if (nodesToFetch.length === 0) {
+        console.log("🚫 No nodes to fetch, early return");
+        return;
+      }
+
+      // Step 1: Remove duplicates from input
       const uniqueNodesToFetch = uniqueBy(
         nodesToFetch,
         (node) => `${node.id}-${node.nodeType}`
       );
-      const trulyNeedsFetching = uniqueNodesToFetch.filter(
-        (node) => !nodeDetails[node.id] || nodeDetails[node.id] === "error"
-      );
+
+      // Step 2: ENHANCED filtering - check nodeDetails AND pendingNodeFetches
+      const trulyNeedsFetching = uniqueNodesToFetch.filter((node) => {
+        const currentState = nodeDetails[node.id];
+        const isPending = pendingNodeFetches.has(node.id);
+
+        // Skip if:
+        // - Already has data (any truthy value except "error")
+        // - Currently loading
+        // - Currently being fetched by another call
+        const shouldSkip =
+          (currentState && currentState !== "error") || isPending;
+
+        if (shouldSkip) {
+          console.log(
+            `🚫 Skipping node ${node.id}: state=${currentState}, pending=${isPending}`
+          );
+        }
+
+        return !shouldSkip;
+      });
 
       if (trulyNeedsFetching.length === 0) {
+        console.log("🚫 All nodes already loaded/loading, early return");
         return;
       }
 
+      console.log(`📦 Actually fetching: ${trulyNeedsFetching.length} nodes`);
+
+      // Step 3: IMMEDIATELY mark as pending (before any async operations)
+      const nodeIdsToLoad = trulyNeedsFetching.map((n) => n.id);
+      setPendingNodeFetches((prev) => {
+        const newSet = new Set(prev);
+        nodeIdsToLoad.forEach((id) => newSet.add(id));
+        console.log(`📝 Added to pending:`, nodeIdsToLoad);
+        return newSet;
+      });
+
+      // Step 4: IMMEDIATELY mark as loading in nodeDetails
       setNodeDetails((prev) => {
         const newState = { ...prev };
         trulyNeedsFetching.forEach((node) => {
@@ -440,36 +577,60 @@ export function EntityResolutionProvider({
         return newState;
       });
 
-      // NOTE: Using a larger fetch size for nodes is okay as it's less critical for immediate interaction
-      const NODE_FETCH_SIZE = 200;
-      for (let i = 0; i < trulyNeedsFetching.length; i += NODE_FETCH_SIZE) {
-        const chunk = trulyNeedsFetching.slice(i, i + NODE_FETCH_SIZE);
-        try {
-          const response = await getBulkNodeDetails({ items: chunk });
-          setNodeDetails((prev) => {
-            const newState = { ...prev };
-            response.forEach((detail) => {
-              newState[detail.id] = detail;
+      // Step 5: Cleanup function to remove from pending state
+      const cleanupPendingState = () => {
+        setPendingNodeFetches((prev) => {
+          const newSet = new Set(prev);
+          nodeIdsToLoad.forEach((id) => newSet.delete(id));
+          console.log(`🧹 Removed from pending:`, nodeIdsToLoad);
+          return newSet;
+        });
+      };
+
+      try {
+        // Step 6: Batch fetch with proper error handling
+        const NODE_FETCH_SIZE = 200;
+        for (let i = 0; i < trulyNeedsFetching.length; i += NODE_FETCH_SIZE) {
+          const chunk = trulyNeedsFetching.slice(i, i + NODE_FETCH_SIZE);
+
+          try {
+            const response = await getBulkNodeDetails({ items: chunk });
+
+            // Update successful fetches
+            setNodeDetails((prev) => {
+              const newState = { ...prev };
+              response.forEach((detail) => {
+                newState[detail.id] = detail;
+              });
+
+              // Mark any missing nodes as error
+              chunk.forEach((requestedNode) => {
+                if (!response.find((r) => r.id === requestedNode.id)) {
+                  newState[requestedNode.id] = "error";
+                }
+              });
+
+              return newState;
             });
-            chunk.forEach((requestedNode) => {
-              if (!response.find((r) => r.id === requestedNode.id)) {
-                newState[requestedNode.id] = "error";
-              }
+          } catch (error) {
+            console.error(`❌ Error fetching node chunk:`, error);
+
+            // Mark chunk as error
+            setNodeDetails((prev) => {
+              const newState = { ...prev };
+              chunk.forEach((node) => {
+                newState[node.id] = "error";
+              });
+              return newState;
             });
-            return newState;
-          });
-        } catch (error) {
-          setNodeDetails((prev) => {
-            const newState = { ...prev };
-            chunk.forEach((node) => {
-              newState[node.id] = "error";
-            });
-            return newState;
-          });
+          }
         }
+      } finally {
+        // Always cleanup pending state, even on error
+        cleanupPendingState();
       }
     },
-    [nodeDetails]
+    [nodeDetails, pendingNodeFetches] // Include pendingNodeFetches in dependencies
   );
 
   // REFACTORED: This function now progressively fetches connections.
@@ -575,10 +736,16 @@ export function EntityResolutionProvider({
                       lastUpdated: Date.now(),
                     };
                   });
-                   chunk.forEach((reqItem) => {
+                  chunk.forEach((reqItem) => {
                     if (!response.some((r) => r.edge.id === reqItem.edgeId)) {
-                      if (draft[reqItem.edgeId]?.loading) { // Only update if still loading
-                         draft[reqItem.edgeId] = { data: null, loading: false, error: "Not found in response.", lastUpdated: null };
+                      if (draft[reqItem.edgeId]?.loading) {
+                        // Only update if still loading
+                        draft[reqItem.edgeId] = {
+                          data: null,
+                          loading: false,
+                          error: "Not found in response.",
+                          lastUpdated: null,
+                        };
                       }
                     }
                   });
@@ -586,20 +753,26 @@ export function EntityResolutionProvider({
               );
             })
             .catch((error) => {
-               setConnectionData(produce(draft => {
-                  chunk.forEach(item => {
+              setConnectionData(
+                produce((draft) => {
+                  chunk.forEach((item) => {
                     if (draft[item.edgeId]?.loading) {
-                      draft[item.edgeId] = { data: null, loading: false, error: (error as Error).message, lastUpdated: null };
+                      draft[item.edgeId] = {
+                        data: null,
+                        loading: false,
+                        error: (error as Error).message,
+                        lastUpdated: null,
+                      };
                     }
                   });
-               }));
+                })
+              );
             });
         });
       }
     },
     [connectionData]
   );
-
 
   const loadVisualizationDataForClusters = useCallback(
     async (items: BulkVisualizationRequestItem[]) => {
@@ -714,7 +887,7 @@ export function EntityResolutionProvider({
       if (allNodeIdentifiers.length > 0) {
         await loadBulkNodeDetails(allNodeIdentifiers);
       }
-      
+
       // REFACTORED: Prioritize connections from the first unreviewed cluster.
       const priorityLinks: BulkConnectionRequestItem[] = [];
       const backgroundLinks: BulkConnectionRequestItem[] = [];
@@ -776,7 +949,6 @@ export function EntityResolutionProvider({
     loadVisualizationDataForClustersRef.current =
       loadVisualizationDataForClusters;
   }, [loadVisualizationDataForClusters]);
-
 
   const loadClusters = useCallback(
     async (page: number, limit: number = 10) => {
@@ -898,37 +1070,35 @@ export function EntityResolutionProvider({
         if (!isLarge) {
           const vizState = visualizationData[id];
           if ((!vizState?.data || vizState?.error) && !vizState?.loading) {
-            // Load viz, which will trigger prioritized connection loading
+            // Load viz data - this will handle node loading internally
             await loadVisualizationDataForClustersRef.current([
               { clusterId: id, itemType: resolutionMode },
             ]);
-          } else if (vizState?.data?.links) {
-            // If viz is already loaded, ensure all its connections are loaded or loading.
+          }
+          // REMOVED: Redundant node loading block that was causing duplicate calls
+          // The loadVisualizationDataForClusters function already handles node loading
+          // so we don't need to duplicate it here
+          else if (vizState?.data?.links) {
+            // Only handle connection loading if viz data already exists
             const unloadedConnectionItems = vizState.data.links
-              .map(link => ({ edgeId: link.id, itemType: resolutionMode }))
-              .filter(item => {
+              .map((link) => ({ edgeId: link.id, itemType: resolutionMode }))
+              .filter((item) => {
                 const connState = connectionData[item.edgeId];
                 return !connState || (!connState.data && !connState.loading);
               });
             if (unloadedConnectionItems.length > 0) {
-                loadBulkConnections(unloadedConnectionItems);
+              loadBulkConnections(unloadedConnectionItems);
             }
           }
         } else {
-          // Logic for large clusters remains mostly the same, as it's a manual process.
+          // For large clusters, only load nodes if viz data already exists
           const vizState = visualizationData[id];
           if (vizState?.data?.nodes) {
             const nodeIdsFromViz: NodeIdentifier[] = vizState.data.nodes.map(
               (node) => ({ id: node.id, nodeType: resolutionMode })
             );
-            if (nodeIdsFromViz.length > 0) {
-              const nodesTrulyNeedingFetch = nodeIdsFromViz.filter(
-                (n) => !nodeDetails[n.id] || nodeDetails[n.id] === "error"
-              );
-              if (nodesTrulyNeedingFetch.length > 0) {
-                await loadBulkNodeDetails(nodesTrulyNeedingFetch);
-              }
-            }
+            // Use the enhanced loadBulkNodeDetails which has proper deduplication
+            await loadBulkNodeDetails(nodeIdsFromViz);
           }
         }
       }
@@ -940,8 +1110,7 @@ export function EntityResolutionProvider({
       queries,
       visualizationData,
       resolutionMode,
-      loadBulkNodeDetails,
-      nodeDetails,
+      loadBulkNodeDetails, // Updated dependency
       getClusterById,
       connectionData,
       loadBulkConnections,
@@ -1027,7 +1196,13 @@ export function EntityResolutionProvider({
         }
       }
     },
-    [visualizationData, resolutionMode, connectionData, toast, loadBulkConnections]
+    [
+      visualizationData,
+      resolutionMode,
+      connectionData,
+      toast,
+      loadBulkConnections,
+    ]
   );
 
   const initializeLargeClusterConnectionPaging = useCallback(
@@ -1162,6 +1337,8 @@ export function EntityResolutionProvider({
         Date.now() - cached.lastUpdated < 300000
       ) {
         console.log(`Using cached connection data for edge ${edgeId}`);
+
+        // Ensure related nodes are loaded (but don't duplicate if already loading)
         const nodesToLoad: NodeIdentifier[] = [];
         const connItem = cached.data;
         if (connItem.entity1)
@@ -1176,11 +1353,8 @@ export function EntityResolutionProvider({
           });
 
         if (nodesToLoad.length > 0) {
-          const nodesTrulyNeedingFetch = nodesToLoad.filter(
-            (n) => !nodeDetails[n.id] || nodeDetails[n.id] === "error"
-          );
-          if (nodesTrulyNeedingFetch.length > 0)
-            await loadBulkNodeDetails(nodesTrulyNeedingFetch);
+          // Use enhanced loadBulkNodeDetails which handles deduplication
+          await loadBulkNodeDetails(nodesToLoad);
         }
         return cached.data;
       }
@@ -1201,7 +1375,6 @@ export function EntityResolutionProvider({
           resolutionMode === "entity"
             ? getOrganizationConnectionData
             : getServiceConnectionData;
-
         const response = await fetcher(edgeId);
 
         setConnectionData((prev) => ({
@@ -1228,11 +1401,8 @@ export function EntityResolutionProvider({
             });
 
           if (nodesToLoad.length > 0) {
-            const nodesTrulyNeedingFetch = nodesToLoad.filter(
-              (n) => !nodeDetails[n.id] || nodeDetails[n.id] === "error"
-            );
-            if (nodesTrulyNeedingFetch.length > 0)
-              await loadBulkNodeDetails(nodesTrulyNeedingFetch);
+            // Use enhanced loadBulkNodeDetails which handles deduplication
+            await loadBulkNodeDetails(nodesToLoad);
           }
         }
         return response;
@@ -1253,7 +1423,7 @@ export function EntityResolutionProvider({
         return null;
       }
     },
-    [connectionData, resolutionMode, loadBulkNodeDetails, nodeDetails]
+    [connectionData, resolutionMode, loadBulkNodeDetails] // Updated dependency
   );
 
   const invalidateVisualizationData = useCallback(
@@ -1299,9 +1469,7 @@ export function EntityResolutionProvider({
           lastUpdated: null,
         },
       }));
-      await loadBulkConnections(
-        [{ edgeId, itemType: resolutionMode }],
-      );
+      await loadBulkConnections([{ edgeId, itemType: resolutionMode }]);
     },
     [resolutionMode, loadBulkConnections]
   );
@@ -1826,11 +1994,20 @@ export function EntityResolutionProvider({
     return true;
   }, [isLoadingPage, selectedEdgeId, queries]);
 
+  const selectedEdgeConnectionState = selectedEdgeId
+    ? connectionData[selectedEdgeId]
+    : null;
+
   const currentConnectionData =
     useMemo((): EntityConnectionDataResponse | null => {
-      if (!selectedEdgeId) return null;
-      return connectionData[selectedEdgeId]?.data || null;
-    }, [selectedEdgeId, connectionData]);
+      if (!selectedEdgeId || !selectedEdgeConnectionState) return null;
+      return selectedEdgeConnectionState.data || null;
+    }, [
+      selectedEdgeId,
+      selectedEdgeConnectionState?.data,
+      selectedEdgeConnectionState?.loading,
+      selectedEdgeConnectionState?.error,
+    ]);
 
   const selectedClusterDetails = useMemo((): EntityCluster | null => {
     if (!selectedClusterId) return null;
@@ -1980,11 +2157,17 @@ export function EntityResolutionProvider({
         // Explicitly clear selected cluster if there are no clusters at all
         setSelectedClusterIdState(null);
       }
-    } else if (selectedClusterId && clusters.data.length === 0 && !clusters.loading) {
-        // If a cluster is selected, but the cluster list is now empty (e.g., due to filter change resulting in no data)
-        // then deselect the current cluster.
-        console.log("Current selected cluster no longer exists in an empty cluster list. Deselecting.");
-        setSelectedClusterIdState(null);
+    } else if (
+      selectedClusterId &&
+      clusters.data.length === 0 &&
+      !clusters.loading
+    ) {
+      // If a cluster is selected, but the cluster list is now empty (e.g., due to filter change resulting in no data)
+      // then deselect the current cluster.
+      console.log(
+        "Current selected cluster no longer exists in an empty cluster list. Deselecting."
+      );
+      setSelectedClusterIdState(null);
     }
   }, [
     selectedClusterId,
@@ -2047,6 +2230,68 @@ export function EntityResolutionProvider({
     ]
   );
 
+  const optimizedActions = useMemo(
+    () => ({
+      // Core state setters
+      setResolutionMode,
+      setSelectedClusterId: handleSetSelectedClusterId,
+      setSelectedEdgeId: setSelectedEdgeIdAction,
+      setReviewerId,
+      setLastReviewedEdgeId,
+      setClusterFilterStatus,
+      setIsReviewToolsMaximized,
+      setIsAutoAdvanceEnabled: setIsAutoAdvanceEnabledState,
+
+      // Data loading actions
+      triggerRefresh,
+      loadClusters,
+      loadBulkNodeDetails,
+      loadSingleConnectionData,
+      invalidateVisualizationData,
+      invalidateConnectionData,
+      clearAllData,
+
+      // Navigation actions
+      selectNextUnreviewedEdge,
+      selectNextUnreviewedInCluster,
+      selectPreviousUnreviewedInCluster,
+      advanceToNextCluster,
+      checkAndAdvanceIfComplete,
+
+      // Review actions
+      submitEdgeReview,
+
+      // Large cluster paging actions
+      initializeLargeClusterConnectionPaging,
+      viewNextConnectionPage,
+      getActivelyPagingClusterId: () => activelyPagingClusterId,
+      getLargeClusterConnectionsPage: () => largeClusterConnectionsPage,
+    }),
+    [
+      setResolutionMode,
+      handleSetSelectedClusterId,
+      setSelectedEdgeIdAction,
+      triggerRefresh,
+      loadClusters,
+      loadBulkNodeDetails,
+      loadSingleConnectionData,
+      invalidateVisualizationData,
+      invalidateConnectionData,
+      clearAllData,
+      selectNextUnreviewedEdge,
+      selectNextUnreviewedInCluster,
+      selectPreviousUnreviewedInCluster,
+      advanceToNextCluster,
+      checkAndAdvanceIfComplete,
+      submitEdgeReview,
+      initializeLargeClusterConnectionPaging,
+      viewNextConnectionPage,
+      activelyPagingClusterId,
+      largeClusterConnectionsPage,
+      setClusterFilterStatus,
+    ]
+  );
+
   useEffect(() => {
     if (
       selectedClusterId &&
@@ -2102,6 +2347,38 @@ export function EntityResolutionProvider({
     if (currentUser?.id) setReviewerId(currentUser.id);
   }, [currentUser]);
 
+  const clusterProgress = useMemo(() => {
+    const reconstructed: Record<string, ClusterReviewProgress> = {};
+
+    // Process all clusters in the current data set
+    clusters.data.forEach((cluster) => {
+      reconstructed[cluster.id] = queries.getClusterProgress(cluster.id);
+    });
+
+    // Ensure selected cluster is included even if not in current page
+    if (selectedClusterId && !reconstructed[selectedClusterId]) {
+      const hasVisualizationData =
+        visualizationData[selectedClusterId]?.data?.links;
+      const hasClusterDetails = getClusterById(selectedClusterId);
+
+      if (hasVisualizationData || hasClusterDetails) {
+        reconstructed[selectedClusterId] =
+          queries.getClusterProgress(selectedClusterId);
+      }
+    }
+
+    return reconstructed;
+  }, [
+    clusters.data,
+    selectedClusterId,
+    // More specific dependencies instead of entire objects
+    selectedClusterId
+      ? visualizationData[selectedClusterId]?.data?.links
+      : undefined,
+    queries.getClusterProgress, // Only depend on the specific query function
+    getClusterById,
+  ]);
+
   const contextValue: EntityResolutionContextType = {
     resolutionMode,
     selectedClusterId,
@@ -2111,7 +2388,7 @@ export function EntityResolutionProvider({
     refreshTrigger,
     isAutoAdvanceEnabled,
     isReviewToolsMaximized,
-    clusterFilterStatus, // ADDED
+    clusterFilterStatus,
     clusters,
     visualizationData,
     connectionData,
@@ -2119,34 +2396,13 @@ export function EntityResolutionProvider({
     activelyPagingClusterId,
     largeClusterConnectionsPage,
     isLoadingConnectionPageData,
-    clusterProgress: useMemo(() => {
-      const reconstructed: Record<string, ClusterReviewProgress> = {};
-      clusters.data.forEach((c) => {
-        reconstructed[c.id] = queries.getClusterProgress(c.id);
-      });
-      if (
-        selectedClusterId &&
-        !reconstructed[selectedClusterId] &&
-        (visualizationData[selectedClusterId]?.data?.links ||
-          getClusterById(selectedClusterId))
-      ) {
-        reconstructed[selectedClusterId] =
-          queries.getClusterProgress(selectedClusterId);
-      }
-      return reconstructed;
-    }, [
-      clusters.data,
-      selectedClusterId,
-      visualizationData,
-      queries,
-      getClusterById,
-    ]),
+    clusterProgress,
     edgeSelectionInfo,
     currentVisualizationData: currentVisualizationDataForSelection,
     currentConnectionData,
     selectedClusterDetails,
-    actions,
-    queries,
+    actions: optimizedActions,
+    queries: optimizedQueries,
   };
 
   return (

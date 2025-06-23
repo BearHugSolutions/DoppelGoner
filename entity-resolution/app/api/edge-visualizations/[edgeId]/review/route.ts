@@ -1,20 +1,17 @@
 // app/api/edge-visualizations/[edgeId]/review/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { getUserSchemaFromSession } from '@/utils/auth-db';
 import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client';
+import { requireTeamContext } from '@/utils/team-context';
 import type { EdgeReviewApiPayload } from '@/types/entity-resolution';
 
 export async function POST(
   request: NextRequest,
   { params }: { params: { edgeId: string } }
 ) {
-  const userSchema = await getUserSchemaFromSession(request);
-  if (!userSchema) {
-    return NextResponse.json(
-      { error: 'Unauthorized: User session not found or invalid.' },
-      { status: 401 }
-    );
-  }
+  const response = NextResponse.next();
+  const authResult = await requireTeamContext(request, response);
+  if (authResult instanceof NextResponse) return authResult;
+  const { teamContext, user } = authResult;
 
   const { edgeId } = await params;
   if (!edgeId) {
@@ -56,19 +53,16 @@ export async function POST(
   console.log("[API_CLIENT] Payload:", payload);
 
   try {
-    // Proxy the request to the new Rust gateway endpoint
     const gatewayResponse = await fetchFromGateway(
-      // The path now uses the new, unified endpoint structure
       `/edge-visualizations/${edgeId}/review`,
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        // The entire payload received by this route is forwarded
         body: JSON.stringify(payload),
       },
-      userSchema // Pass the user's schema for the gateway to use
+      teamContext // Pass team context
     );
 
     return NextResponse.json(gatewayResponse);

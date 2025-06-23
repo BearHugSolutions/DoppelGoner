@@ -1,40 +1,35 @@
 // app/api/connections/[edgeId]/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { getUserSchemaFromSession } from "@/utils/auth-db"; // Still needed
-import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client'; // Import new utility
+import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client';
+import { requireTeamContext } from '@/utils/team-context';
 
 export async function GET(
   request: NextRequest,
   { params }: { params: { edgeId: string } }
 ) {
-  const userSchema = await getUserSchemaFromSession(request);
-  if (!userSchema) {
-    return NextResponse.json(
-      { error: "Unauthorized: User session not found or invalid." },
-      { status: 401 }
-    );
-  }
+  const response = NextResponse.next();
+  const authResult = await requireTeamContext(request, response);
+  if (authResult instanceof NextResponse) return authResult;
+  const { teamContext, user } = authResult;
 
   const { searchParams } = new URL(request.url);
-  const type = searchParams.get("type") || "entity"; // Default to 'entity'
-  const { edgeId } = await params; // Correctly get edgeId from params
+  const type = searchParams.get("type") || "entity";
+  const { edgeId } = await params;
 
   if (!edgeId) {
     return NextResponse.json({ error: "Edge ID is required." }, { status: 400 });
   }
 
   try {
-    // Call the Rust gateway
     const gatewayResponse = await fetchFromGateway(
       `/connections/${edgeId}`,
       {
         method: 'GET',
         params: { type },
       },
-      userSchema // Pass userSchema as a header
+      teamContext // Pass team context
     );
 
-    // The gateway response is assumed to match the structure previously returned
     return NextResponse.json(gatewayResponse);
 
   } catch (error: any) {

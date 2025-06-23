@@ -1,19 +1,16 @@
 // app/api/service-groups/[groupId]/review/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { getUserSchemaFromSession } from '@/utils/auth-db'; // Still needed
-import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client'; // Import new utility
+import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client';
+import { requireTeamContext } from '@/utils/team-context';
 
 export async function POST(
   request: NextRequest,
   { params }: { params: { groupId: string } }
 ) {
-  const userSchema = await getUserSchemaFromSession(request);
-  if (!userSchema) {
-    return NextResponse.json(
-      { error: 'Unauthorized: User session not found or invalid.' },
-      { status: 401 }
-    );
-  }
+  const response = NextResponse.next();
+  const authResult = await requireTeamContext(request, response);
+  if (authResult instanceof NextResponse) return authResult;
+  const { teamContext, user } = authResult;
 
   const { groupId } = await params;
   if (!groupId) {
@@ -38,20 +35,18 @@ export async function POST(
   }
 
   try {
-    // Call the Rust gateway
     const gatewayResponse = await fetchFromGateway(
-      `/service-groups/${groupId}/review`, // Target the service-group specific endpoint on the gateway
+      `/service-groups/${groupId}/review`,
       {
         method: 'POST',
-        headers: { // Explicitly set Content-Type to application/json
+        headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ decision, reviewerId, notes }), // Pass the original body
+        body: JSON.stringify({ decision, reviewerId, notes }),
       },
-      userSchema // Pass userSchema as a header
+      teamContext // Pass team context
     );
 
-    // The gateway response is assumed to match the structure previously returned
     return NextResponse.json(gatewayResponse);
 
   } catch (error: any) {
@@ -59,3 +54,4 @@ export async function POST(
     return handleGatewayError(error, 'Failed to submit service group review');
   }
 }
+

@@ -1,17 +1,23 @@
 // app/api/nodeData/[nodeId]/route.ts
 import { NextResponse, NextRequest } from "next/server";
-// import { getUserSchemaFromSession } from '@/utils/auth-db'; // Not needed for this route based on main.rs
-import { fetchFromGateway, handleGatewayError } from "@/utils/gateway-client"; // Import new utility
-import { NodeDetailResponse } from "@/types/entity-resolution"; // Keep this for type safety
+import { fetchFromGateway, handleGatewayError } from "@/utils/gateway-client";
+import { requireTeamContext } from '@/utils/team-context';
+import { NodeDetailResponse } from "@/types/entity-resolution";
 
 export async function GET(
-  request: NextRequest, // Use NextRequest for easier access to URL
+  request: NextRequest,
   { params }: { params: { nodeId: string } }
 ) {
   console.log("--- Entering Next.js API route: /api/nodeData/[nodeId] ---");
-  const { nodeId } = await params; // Get nodeId directly from params
+  
+  const response = NextResponse.next();
+  const authResult = await requireTeamContext(request, response);
+  if (authResult instanceof NextResponse) return authResult;
+  const { teamContext, user } = authResult;
+
+  const { nodeId } = await params;
   const { searchParams } = new URL(request.url);
-  const type = searchParams.get("type"); // 'entity' or 'service'
+  const type = searchParams.get("type");
 
   console.log(`Received nodeId: ${nodeId}, type: ${type}`);
 
@@ -24,15 +30,13 @@ export async function GET(
   }
 
   try {
-    // This route does not require userSchema based on your main.rs setup,
-    // so we pass null for userSchema.
     const gatewayResponse = await fetchFromGateway<NodeDetailResponse>(
       `/nodeData/${nodeId}`,
       {
         method: "GET",
-        params: { type }, // Pass 'type' as a query parameter
+        params: { type },
       },
-      null // No userSchema needed for this specific backend route
+      teamContext // Pass team context for consistency
     );
 
     console.log(`Successfully fetched data for node: ${nodeId}`);

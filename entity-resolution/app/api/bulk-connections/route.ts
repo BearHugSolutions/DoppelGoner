@@ -1,22 +1,17 @@
 // app/api/bulk-connections/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { getUserSchemaFromSession } from "@/utils/auth-db";
 import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client';
+import { requireTeamContext } from '@/utils/team-context';
 import type { BulkConnectionsRequest, BulkConnectionsResponse } from "@/types/entity-resolution";
 
 export async function POST(request: NextRequest) {
-  // Authenticate the user and get their schema
-  const userSchema = await getUserSchemaFromSession(request);
-  if (!userSchema) {
-    return NextResponse.json(
-      { error: "Unauthorized: User session not found or invalid." },
-      { status: 401 }
-    );
-  }
+  const response = NextResponse.next();
+  const authResult = await requireTeamContext(request, response);
+  if (authResult instanceof NextResponse) return authResult;
+  const { teamContext, user } = authResult;
 
   let payload: BulkConnectionsRequest;
   try {
-    // Parse the request body to get the array of items to fetch
     payload = await request.json();
   } catch (error) {
     return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
@@ -38,25 +33,21 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    // Call the Rust gateway's bulk connections endpoint
-    // The gateway expects a POST request with the payload in the body
     const gatewayResponse = await fetchFromGateway<BulkConnectionsResponse>(
-      `/bulk-connections`, // Path to the Rust backend endpoint
+      `/bulk-connections`,
       {
         method: 'POST',
-        body: JSON.stringify(payload), // Send the received payload directly to the gateway
+        body: JSON.stringify(payload),
         headers: {
           'Content-Type': 'application/json',
         },
       },
-      userSchema // Pass userSchema as a header
+      teamContext // Pass team context
     );
     
-    // Return the gateway's response
     return NextResponse.json(gatewayResponse);
 
   } catch (error: any) {
-    // Log the error and return a standardized error response
     console.error(`Error fetching bulk connection data from gateway:`, error);
     return handleGatewayError(error, `Failed to fetch bulk connection data`);
   }
