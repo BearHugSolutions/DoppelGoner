@@ -80,29 +80,25 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
 
       const data = await response.json();
-      // Added console log to inspect the data received from the login API
       console.log("Login API response data:", data); 
 
       if (response.ok) {
-        // Ensure data.user exists before setting state and local storage
         if (data.user) { 
           setUser(data.user);
           try {
             localStorage.setItem('user', JSON.stringify(data.user)); // Persist user data
-            // Confirmed user data saved to local storage
             console.log("User data saved to local storage:", data.user); 
           } catch (localStorageError) {
             console.error("Error saving user to local storage:", localStorageError);
-            // Optionally, handle this error more gracefully, e.g., by informing the user
           }
           toast({
             title: "Login Successful",
             description: "Welcome back!",
           });
-          router.push('/dashboard'); // Redirect to dashboard or a relevant page after successful login
+          // CRITICAL CHANGE: Redirect to the root page (app/page.tsx)
+          router.push('/'); 
           return true;
         } else {
-          // Case where login is "ok" but user data is missing (unexpected but handled)
           setError('Login successful, but no user data received.');
           toast({
             title: "Login Error",
@@ -112,7 +108,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           return false;
         }
       } else {
-        // Set error message from the API response
         setError(data.error || 'Login failed.');
         toast({
           title: "Login Error",
@@ -123,7 +118,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch (err: any) {
       console.error('Login network or unexpected error:', err);
-      // Handle network errors or other unexpected issues
       setError(err.message || 'An unexpected error occurred during login.');
       toast({
         title: "Login Error",
@@ -138,7 +132,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   /**
    * Handles user registration by calling the Next.js local API route.
-   * THIS IS THE CRITICAL FIX: Ensures the call goes to your Next.js proxy.
    * @param username The desired username.
    * @param password The desired password.
    * @param email The user's email address.
@@ -150,8 +143,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setIsLoading(true);
     clearError();
     try {
-      // >>> CRITICAL CHANGE <<<
-      // Call the local Next.js API route, which then proxies to your Gateway
       const response = await fetch('/api/auth/register', {
         method: 'POST',
         headers: {
@@ -167,10 +158,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           title: "Registration Successful",
           description: "Your account has been created. You can now log in.",
         });
-        // You might want to automatically redirect to the login tab in AuthForms here
         return true;
       } else {
-        // Set error message from the API response
         setError(data.error || 'Registration failed.');
         toast({
           title: "Registration Error",
@@ -181,7 +170,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch (err: any) {
       console.error('Registration network or unexpected error:', err);
-      // Handle network errors or other unexpected issues
       setError(err.message || 'An unexpected error occurred during registration.');
       toast({
         title: "Registration Error",
