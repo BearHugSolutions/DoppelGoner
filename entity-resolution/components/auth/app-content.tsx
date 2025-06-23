@@ -8,7 +8,7 @@ import { Users, User } from "lucide-react";
 
 // Create a client component to conditionally render children or AuthForms
 export default function AppContent({ children }: { children: React.ReactNode }) {
-  const { currentUser, isLoading, logout } = useAuth();
+  const { user, isLoading, logout } = useAuth();
 
   if (isLoading) {
     return (
@@ -18,7 +18,7 @@ export default function AppContent({ children }: { children: React.ReactNode }) 
     );
   }
 
-  if (!currentUser) {
+  if (!user) {
     return <AuthForms />;
   }
 
@@ -28,20 +28,20 @@ export default function AppContent({ children }: { children: React.ReactNode }) 
         <div className="flex items-center space-x-4">
           <div className="flex items-center space-x-2">
             <User className="h-5 w-5" />
-            <span className="font-medium">{currentUser.username}</span>
+            <span className="font-medium">{user.username}</span>
           </div>
           
           <div className="flex items-center space-x-2">
             <Users className="h-4 w-4 text-gray-300" />
             <Badge variant="secondary" className="bg-gray-600 text-white">
-              Team: {currentUser.teamName}
+              Team: {user.teamName}
             </Badge>
           </div>
           
           {/* Optional: Show team schema for debugging/admin purposes */}
           {process.env.NODE_ENV === 'development' && (
             <Badge variant="outline" className="border-gray-500 text-gray-300 text-xs">
-              Schema: {currentUser.teamSchema}
+              Schema: {user.teamSchema}
             </Badge>
           )}
         </div>
