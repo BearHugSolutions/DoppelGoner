@@ -31,6 +31,7 @@ import {
   ChevronsRight,
   Maximize,
   Minimize,
+  Link,
 } from "lucide-react";
 import type {
   VisualizationEntityEdge,
@@ -52,6 +53,7 @@ export default function ConnectionReviewTools() {
     currentVisualizationData,
     selectedClusterDetails,
     isReviewToolsMaximized,
+    disconnectDependentServicesEnabled, // NEW: Use the setting
     actions,
     queries,
     edgeSelectionInfo,
@@ -318,6 +320,14 @@ export default function ConnectionReviewTools() {
           <h3 className="text-lg font-medium">{nodeLabel} Connection Review</h3>
           {isSubmitting && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
           
+          {/* NEW: Show dependent services indicator when enabled */}
+          {disconnectDependentServicesEnabled && resolutionMode === 'entity' && (
+            <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
+              <Link className="h-3 w-3 mr-1" />
+              Auto-disconnect Services
+            </Badge>
+          )}
+          
           {/* REMOVED: All queue-related badges ('Processing', 'Queued', 'Failed') */}
           
           {/* UPDATED: Badge logic based on new flags */}
@@ -364,9 +374,24 @@ export default function ConnectionReviewTools() {
         <div className="h-full overflow-y-auto space-y-3 pr-2 custom-scrollbar">
           {showReviewButtons ? (
             <div className="space-y-3 p-1">
-              <p className="text-sm text-muted-foreground">
-                Do these records represent the same real-world {resolutionMode}?
-              </p>
+              <div className="flex flex-col space-y-2">
+                <p className="text-sm text-muted-foreground">
+                  Do these records represent the same real-world {resolutionMode}?
+                </p>
+                
+                {/* NEW: Show dependent services warning for entity reviews */}
+                {disconnectDependentServicesEnabled && resolutionMode === 'entity' && (
+                  <div className="bg-blue-50 border border-blue-200 rounded-md p-2">
+                    <div className="flex items-start space-x-2">
+                      <Info className="h-4 w-4 text-blue-600 mt-0.5 flex-shrink-0" />
+                      <p className="text-xs text-blue-800">
+                        If you mark these entities as <strong>Not a Match</strong>, any service matches between them will also be automatically disconnected.
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+              
               <div className="flex justify-center items-center gap-2 mb-3">
                  <Button variant="outline" size="icon" onClick={handlePreviousUnreviewed} disabled={isSubmitting || isContinuing}>
                     <ChevronLeft className="h-4 w-4" />

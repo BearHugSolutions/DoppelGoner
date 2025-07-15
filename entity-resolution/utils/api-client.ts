@@ -4,6 +4,8 @@ import type {
   EntityVisualizationDataResponse,
   EdgeReviewApiPayload, // IMPORT NEW
   EdgeReviewApiResponse, // IMPORT NEW
+  DisconnectDependentServicesRequest, // NEW
+  DisconnectDependentServicesResponse, // NEW
   NodeDetailResponse,
   BulkNodeDetailsRequest,
   BulkConnectionsRequest,
@@ -190,10 +192,24 @@ export async function postEdgeReview(
   }
 }
 
-
-// DELETED: postEntityGroupFeedback
-// DELETED: postServiceGroupFeedback
-
+// NEW: Bulk disconnect dependent services
+export async function postDisconnectDependentServices(
+  payload: DisconnectDependentServicesRequest
+): Promise<DisconnectDependentServicesResponse> {
+  const context = `postDisconnectDependentServices`;
+  const url = `${API_BASE_URL}/disconnect-dependent-service-matches`;
+  try {
+    console.log("[API_CLIENT] Requesting bulk disconnect of dependent services:", payload);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return await validateResponse<DisconnectDependentServicesResponse>(response, context);
+  } catch (error) {
+    return handleApiError(error, context);
+  }
+}
 
 // --- Service Specific Functions ---
 

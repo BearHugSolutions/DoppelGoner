@@ -6,12 +6,24 @@ import { useEntityResolution } from "@/context/entity-resolution-context";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import {
   CheckCircle,
   ChevronLeft,
   ChevronRight,
   Loader2,
   HelpCircle,
+  Filter,
+  AlertTriangle,
 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -21,6 +33,7 @@ import type {
   ClusterFilterStatus,
 } from "@/types/entity-resolution";
 import ResolutionModeSwitcher from "./resolution-mode-switcher";
+import { useToast } from "@/hooks/use-toast";
 
 const LARGE_CLUSTER_THRESHOLD = 200;
 
@@ -250,6 +263,151 @@ const ClusterListContent = ({
   );
 };
 
+// NEW: Post Processing Filters Dialog Component
+const PostProcessingFiltersDialog = () => {
+  const { disconnectDependentServicesEnabled, actions } = useEntityResolution();
+  const { toast } = useToast();
+  const [isOpen, setIsOpen] = useState(false);
+  const [tempEnabled, setTempEnabled] = useState(disconnectDependentServicesEnabled);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Reset temp state when dialog opens
+  useEffect(() => {
+    if (isOpen) {
+      setTempEnabled(disconnectDependentServicesEnabled);
+    }
+  }, [isOpen, disconnectDependentServicesEnabled]);
+
+  const handleConfirm = async () => {
+    if (tempEnabled && !disconnectDependentServicesEnabled) {
+      setIsSubmitting(true);
+      try {
+        await actions.enableDisconnectDependentServices();
+        setIsOpen(false);
+      } catch (error) {
+        // Error handling is done in the action
+      } finally {
+        setIsSubmitting(false);
+      }
+    } else if (!tempEnabled && disconnectDependentServicesEnabled) {
+      // Allow disabling without API call (since it's irreversible according to spec)
+      actions.setDisconnectDependentServicesEnabled(false);
+      setIsOpen(false);
+      toast({
+        title: "Setting Updated",
+        description: "Dependent service disconnection has been disabled for future reviews.",
+      });
+    } else {
+      // No change
+      setIsOpen(false);
+    }
+  };
+
+  const handleCancel = () => {
+    setTempEnabled(disconnectDependentServicesEnabled);
+    setIsOpen(false);
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={setIsOpen}>
+      <DialogTrigger asChild>
+        <Button variant="outline" size="sm" className="w-full mb-2">
+          <Filter className="h-4 w-4 mr-2" />
+          Post Processing Filters
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-[600px]">
+        <DialogHeader>
+          <DialogTitle>Post Processing Filters</DialogTitle>
+          <DialogDescription>
+            Configure automatic actions that apply to your review decisions.
+          </DialogDescription>
+        </DialogHeader>
+        
+        <div className="space-y-4 py-4">
+          <div className="flex items-start space-x-3">
+            <Checkbox
+              id="disconnect-dependent"
+              checked={tempEnabled}
+              onCheckedChange={(checked) => {
+                if (checked === "indeterminate") {
+                  setTempEnabled(false);
+                } else {
+                  setTempEnabled(checked);
+                }
+              }}
+              disabled={isSubmitting || disconnectDependentServicesEnabled}
+            />
+            <div className="grid gap-2 flex-1">
+              <label
+                htmlFor="disconnect-dependent"
+                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+              >
+                Disconnect All Dependent Service Matches
+                {disconnectDependentServicesEnabled && (
+                  <span className="ml-2 text-xs bg-green-100 text-green-800 px-2 py-1 rounded">
+                    Active
+                  </span>
+                )}
+              </label>
+              
+              {tempEnabled && !disconnectDependentServicesEnabled && (
+                <div className="bg-amber-50 border border-amber-200 rounded-md p-3">
+                  <div className="flex items-start space-x-2">
+                    <AlertTriangle className="h-4 w-4 text-amber-600 mt-0.5 flex-shrink-0" />
+                    <div className="text-sm text-amber-800">
+                      <p className="font-medium mb-2">Important: This action is irreversible</p>
+                      <p className="mb-3">
+                        This setting will automatically disconnect service matches when you mark two entities as non-matches. 
+                        It applies to all future decisions and will also process your existing review history.
+                      </p>
+                      
+                      <p className="mb-3">
+                        <strong>How it works:</strong> When two organizations are marked as different entities, 
+                        any service matches between those organizations will also be automatically marked as non-matches.
+                      </p>
+                      
+                      <p className="mb-3">
+                        <strong>Example:</strong> If you mark "Salvation Army - Seattle" and "Salvation Army - Bellevue" 
+                        as different organizations, but want their identical "Coat Drive" services to remain matched, 
+                        you should NOT enable this setting. However, if you want to reduce service management overhead 
+                        by ensuring service matches are consistent with entity decisions, enable this setting.
+                      </p>
+                      
+                      <p className="text-xs text-amber-700">
+                        Once confirmed, this setting cannot be disabled for this opinion set, and the checkbox will be locked.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {!tempEnabled && (
+                <p className="text-sm text-muted-foreground">
+                  When enabled, service matches will be automatically disconnected when their parent entities are marked as non-matches.
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={handleCancel} disabled={isSubmitting}>
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleConfirm} 
+            disabled={isSubmitting || tempEnabled === disconnectDependentServicesEnabled}
+          >
+            {isSubmitting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+            {tempEnabled && !disconnectDependentServicesEnabled ? "Enable & Process History" : "Confirm"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+};
+
 export default function ClusterSelector() {
   const { resolutionMode, actions, clusterFilterStatus, clusters } =
     useEntityResolution();
@@ -309,6 +467,10 @@ export default function ClusterSelector() {
         for Review
       </h3>
       <ResolutionModeSwitcher />
+      
+      {/* NEW: Post Processing Filters Button */}
+      <PostProcessingFiltersDialog />
+      
       {/* This is the key change: apply flex-grow only to this div */}
       <div className="flex flex-col flex-grow min-h-0">
         <Tabs

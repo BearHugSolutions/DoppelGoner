@@ -15,6 +15,8 @@ import {
   ClusterReviewProgress,
   EdgeReviewApiPayload,
   ClusterFilterStatus,
+  DisconnectDependentServicesRequest,
+  DisconnectDependentServicesResponse,
 } from "@/types/entity-resolution";
 import {
   getServiceClusters,
@@ -25,6 +27,7 @@ import {
   getOrganizationConnectionData,
   getServiceConnectionData,
   postEdgeReview,
+  postDisconnectDependentServices, // NEW IMPORT
 } from "@/utils/api-client";
 import {
   createContext,
@@ -98,6 +101,7 @@ export interface EntityResolutionContextType {
   isAutoAdvanceEnabled: boolean;
   isReviewToolsMaximized: boolean;
   clusterFilterStatus: ClusterFilterStatus;
+  disconnectDependentServicesEnabled: boolean; // NEW STATE
 
   clusters: ClustersState;
   visualizationData: Record<string, VisualizationState>;
@@ -123,6 +127,8 @@ export interface EntityResolutionContextType {
     setLastReviewedEdgeId: (id: string | null) => void;
     setIsReviewToolsMaximized: (isMaximized: boolean) => void;
     setClusterFilterStatus: (status: ClusterFilterStatus) => void;
+    setDisconnectDependentServicesEnabled: (enabled: boolean) => void; // NEW ACTION
+    enableDisconnectDependentServices: () => Promise<void>; // NEW ACTION
     triggerRefresh: (
       target?:
         | "all"
@@ -228,6 +234,8 @@ export function EntityResolutionProvider({
     useState<boolean>(false);
   const [clusterFilterStatus, setClusterFilterStatus] =
     useState<ClusterFilterStatus>("unreviewed");
+  const [disconnectDependentServicesEnabled, setDisconnectDependentServicesEnabledState] = 
+    useState<boolean>(false); // NEW STATE
 
   // Data state
   const [clusters, setClusters] = useState<ClustersState>(initialClustersState);
@@ -466,6 +474,57 @@ export function EntityResolutionProvider({
     ]
   );
 
+  // NEW: Function to enable dependent service disconnection
+  const enableDisconnectDependentServices = useCallback(async () => {
+    if (!user?.id) {
+      toast({
+        title: "Auth Error",
+        description: "Login required to enable this feature.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    try {
+      // Show initial toast
+      toast({
+        title: "Processing...",
+        description: "Enabling dependent service disconnection for all future reviews and processing historical data.",
+      });
+
+      // Enable the setting
+      setDisconnectDependentServicesEnabledState(true);
+
+      // Call bulk disconnect API for historical data
+      const bulkRequest: DisconnectDependentServicesRequest = {
+        reviewerId: user.id,
+        notes: "Bulk enable dependent service disconnection",
+        asyncProcessing: true,
+      };
+
+      const response = await postDisconnectDependentServices(bulkRequest);
+
+      // Show completion toast with metrics
+      toast({
+        title: "Dependent Service Disconnection Enabled",
+        description: `Processed ${response.serviceEdgesProcessed} service edges from ${response.entityPairsFound} entity pairs. ${response.clustersFinalized} clusters finalized.`,
+      });
+
+      console.log("Bulk disconnect response:", response);
+    } catch (error) {
+      console.error("Error enabling dependent service disconnection:", error);
+      
+      // Revert the setting on error
+      setDisconnectDependentServicesEnabledState(false);
+      
+      toast({
+        title: "Error",
+        description: `Failed to enable dependent service disconnection: ${(error as Error).message}`,
+        variant: "destructive",
+      });
+    }
+  }, [user?.id, toast]);
+
   // Queries object
   const queries = useMemo(() => {
     const getClusterById = (clusterId: string): EntityCluster | undefined => {
@@ -609,6 +668,7 @@ export function EntityResolutionProvider({
     setLargeClusterConnectionsPage(0);
     setIsLoadingPage(false);
     setEdgeSubmissionStatus({});
+    setDisconnectDependentServicesEnabledState(false); // Reset the new state
   }, []);
 
   const setResolutionMode = useCallback(
@@ -1361,6 +1421,7 @@ export function EntityResolutionProvider({
     [clusters.page, clusters.limit, loadClusters]
   );
 
+  // UPDATED: submitEdgeReview to include disconnectDependentServices flag
   const submitEdgeReview = useCallback(
     async (edgeId: string, decision: GroupReviewDecision, notes?: string) => {
       if (!user?.id) {
@@ -1411,6 +1472,7 @@ export function EntityResolutionProvider({
           reviewerId: user.id,
           notes,
           type: resolutionMode,
+          disconnectDependentServices: disconnectDependentServicesEnabled, // INCLUDE THE FLAG
         };
         const response = await postEdgeReview(edgeId, payload);
 
@@ -1420,6 +1482,14 @@ export function EntityResolutionProvider({
         }));
 
         setLastReviewedEdgeId(edgeId);
+
+        // Show additional feedback if dependent services were disconnected
+        if (response.dependentServicesDisconnected && response.dependentServicesDisconnected > 0) {
+          toast({
+            title: "Review Submitted",
+            description: `Edge reviewed successfully. ${response.dependentServicesDisconnected} dependent service matches were also disconnected.`,
+          });
+        }
 
         if (response.clusterFinalized) {
           setClusters(
@@ -1457,7 +1527,7 @@ export function EntityResolutionProvider({
         }
       }
     },
-    [user, selectedClusterId, visualizationData, resolutionMode, toast]
+    [user, selectedClusterId, visualizationData, resolutionMode, toast, disconnectDependentServicesEnabled]
   );
 
   // Computed values
@@ -2204,7 +2274,7 @@ export function EntityResolutionProvider({
   );
 
   // ==========================================
-  // 4. REPLACE THE PROBLEMATIC useEFFECTS
+  // 4. REPLACE THE PROBLEMATIC useEFFECTs
   // ==========================================
 
   // Effect to auto-select edge when visualization data loads
@@ -2401,6 +2471,8 @@ export function EntityResolutionProvider({
       setClusterFilterStatus,
       setIsReviewToolsMaximized,
       setIsAutoAdvanceEnabled: setIsAutoAdvanceEnabledState,
+      setDisconnectDependentServicesEnabled: setDisconnectDependentServicesEnabledState, // NEW ACTION
+      enableDisconnectDependentServices, // NEW ACTION
       triggerRefresh,
       loadClusters,
       loadBulkNodeDetails,
@@ -2439,6 +2511,8 @@ export function EntityResolutionProvider({
       setResolutionMode,
       handleSetSelectedClusterId,
       setSelectedEdgeIdAction, // ENHANCED
+      setDisconnectDependentServicesEnabledState, // NEW
+      enableDisconnectDependentServices, // NEW
       triggerRefresh,
       loadClusters,
       loadBulkNodeDetails,
@@ -2477,6 +2551,7 @@ export function EntityResolutionProvider({
     isAutoAdvanceEnabled,
     isReviewToolsMaximized,
     clusterFilterStatus,
+    disconnectDependentServicesEnabled, // NEW STATE
     clusters,
     visualizationData,
     connectionData,

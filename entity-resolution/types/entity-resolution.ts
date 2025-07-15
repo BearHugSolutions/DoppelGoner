@@ -33,6 +33,24 @@ export interface BulkVisualizationsRequest {
   items: BulkVisualizationRequestItem[];
 }
 
+// --- NEW: Bulk Disconnect Types ---
+export interface DisconnectDependentServicesRequest {
+  reviewerId: string;
+  notes?: string;
+  asyncProcessing?: boolean; // Default: true
+}
+
+export interface DisconnectDependentServicesResponse {
+  message: string;
+  entityPairsFound: number;
+  serviceEdgesIdentified: number;
+  serviceEdgesProcessed: number;
+  clustersFinalized: number;
+  processingMode: "synchronous" | "asynchronous";
+  jobId?: string;
+  processingTimeMs: number;
+}
+
 // Base entity and cluster types
 export interface Organization {
   id: string;
@@ -244,21 +262,25 @@ export interface VisualizationEntityEdge {
   wasReviewed?: boolean | null;
 }
 
+// UPDATED: Enhanced EdgeReviewApiPayload with new field
 export interface EdgeReviewApiPayload {
   decision: 'ACCEPTED' | 'REJECTED';
   reviewerId: string;
   notes?: string;
   type: 'entity' | 'service';
+  disconnectDependentServices?: boolean; // ✨ NEW FIELD
 }
 
+// UPDATED: Enhanced EdgeReviewApiResponse with new fields
 export interface EdgeReviewApiResponse {
   message: string;
   edgeId: string;
   newStatus: string;
   clusterId: string;
   clusterFinalized: boolean;
+  dependentServicesDisconnected?: number; // ✨ NEW FIELD
+  dependentClustersFinalized?: number;    // ✨ NEW FIELD
 }
-
 
 export type GroupReviewDecision = "ACCEPTED" | "REJECTED" | string;
 

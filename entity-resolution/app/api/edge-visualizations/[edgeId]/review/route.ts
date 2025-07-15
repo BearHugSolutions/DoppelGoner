@@ -26,7 +26,7 @@ export async function POST(
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const { decision, reviewerId, notes, type } = payload;
+  const { decision, reviewerId, notes, type, disconnectDependentServices } = payload;
 
   if (!decision || !reviewerId || !type) {
     return NextResponse.json(
@@ -45,6 +45,14 @@ export async function POST(
   if (type !== 'entity' && type !== 'service') {
     return NextResponse.json(
       { error: 'Invalid type value. Must be "entity" or "service".' },
+      { status: 400 }
+    );
+  }
+
+  // Validate disconnectDependentServices if provided
+  if (disconnectDependentServices !== undefined && typeof disconnectDependentServices !== 'boolean') {
+    return NextResponse.json(
+      { error: 'Invalid disconnectDependentServices value. Must be a boolean.' },
       { status: 400 }
     );
   }

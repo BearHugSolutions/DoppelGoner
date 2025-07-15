@@ -8,7 +8,6 @@ import {
 import ClusterSelector from "@/components/cluster-selector";
 import GraphVisualizer from "@/components/graph-visualizer";
 import ConnectionReviewTools from "@/components/connection-review-tools/connection-review-tools";
-import ResolutionModeSwitcher from "@/components/resolution-mode-switcher";
 import { Skeleton } from "@/components/ui/skeleton";
 
 /**
