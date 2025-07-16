@@ -12,6 +12,11 @@ export async function POST(request: NextRequest) {
   if (authResult instanceof NextResponse) return authResult;
   const { teamContext, user } = authResult;
 
+  // ✨ Extract the opinion name from the request header
+  const opinionName = request.headers.get('X-Opinion-Name');
+  
+  console.log("Bulk Node Details API: Request with opinion header:", opinionName);
+
   let payload: BulkNodeDetailsRequest;
   try {
     payload = await request.json();
@@ -28,6 +33,8 @@ export async function POST(request: NextRequest) {
     console.warn("bulk-node-details: Empty or invalid items array in payload.");
     return NextResponse.json([], { status: 200 });
   }
+
+  console.log(`Fetching bulk node details for ${payload.items.length} items with opinion:`, opinionName || "default");
   
   try {
     const gatewayResponse = await fetchFromGateway<NodeDetailResponse[]>(
@@ -39,7 +46,8 @@ export async function POST(request: NextRequest) {
           "Content-Type": "application/json",
         },
       },
-      teamContext // Pass team context
+      teamContext, // Pass team context
+      opinionName // ✨ Pass opinion name to gateway client
     );
 
     console.log(`Successfully fetched bulk data for ${gatewayResponse?.length || 0} nodes from gateway.`);

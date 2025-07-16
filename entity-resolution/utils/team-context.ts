@@ -2,115 +2,146 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getIronSession } from "iron-session";
 import { sessionOptions } from "@/lib/session";
-import { TeamContext } from "./gateway-client";
 
-// Session data interface (should match the login route)
+// Simple opinion interface that matches auth-context.tsx
+export interface OpinionInfo {
+  name: string;
+  isDefault: boolean;
+}
+
+// Session data interface (should match iron-session augmentation)
+// Represents the user session data stored on the server
 export interface UserSessionData {
   userId: string;
   sessionId: string;
   username: string;
+  email?: string;
   teamId: string;
   teamName: string;
   teamSchema: string;
   userPrefix: string;
   isLoggedIn: true;
+  opinions: OpinionInfo[]; // Store all available opinions in the session
+}
+
+export interface TeamContext {
+  teamSchema: string;
+  userPrefix: string;
+}
+
+interface AuthResult {
+  teamContext: TeamContext;
+  user: UserSessionData;
 }
 
 /**
- * Extracts team context from the user's session.
- * This function should be called by API routes that need to make team-aware requests to the gateway.
+ * ✨ UPDATED: Validates if a session is complete and compatible.
+ * No longer lenient with missing opinions - forces re-authentication.
  */
-// Debug version of team context extraction
-// Add this to your team-context.ts
-
-export async function getTeamContextFromSession(
-  request: NextRequest,
-  response: NextResponse
-): Promise<{ teamContext: TeamContext; user: UserSessionData } | null> {
-  console.log("=== TEAM CONTEXT EXTRACTION DEBUG ===");
-
-  try {
-    console.log("Step 1: Getting iron session...");
-    const session = await getIronSession<UserSessionData>(
-      request,
-      response,
-      sessionOptions
-    );
-
-    console.log("Step 2: Session data:");
-    console.log("  - isLoggedIn:", session.isLoggedIn);
-    console.log("  - userId:", session.userId);
-    console.log("  - username:", session.username);
-    console.log("  - teamId:", session.teamId);
-    console.log("  - teamName:", session.teamName);
-    console.log("  - teamSchema:", session.teamSchema);
-    console.log("  - userPrefix:", session.userPrefix);
-
-    if (!session.isLoggedIn || !session.userId) {
-      console.log("❌ User not logged in or missing userId");
-      return null;
-    }
-
-    // Validate that we have all required team information
-    if (!session.teamSchema || !session.userPrefix) {
-      console.error("❌ Session missing team context:");
-      console.error("  - userId:", session.userId);
-      console.error("  - username:", session.username);
-      console.error("  - hasTeamSchema:", !!session.teamSchema);
-      console.error("  - hasUserPrefix:", !!session.userPrefix);
-      console.error("  - teamSchema value:", session.teamSchema);
-      console.error("  - userPrefix value:", session.userPrefix);
-      return null;
-    }
-
-    const teamContext: TeamContext = {
-      teamSchema: session.teamSchema,
-      userPrefix: session.userPrefix,
-    };
-
-    console.log("✅ Team context created successfully:");
-    console.log("  - teamSchema:", teamContext.teamSchema);
-    console.log("  - userPrefix:", teamContext.userPrefix);
-    console.log("=== END TEAM CONTEXT EXTRACTION DEBUG ===");
-
-    return {
-      teamContext,
-      user: session,
-    };
-  } catch (error) {
-    console.error("❌ Error extracting team context from session:", error);
-    console.log("=== END TEAM CONTEXT EXTRACTION DEBUG ===");
-    return null;
+function validateSessionData(session: Partial<UserSessionData>): session is UserSessionData {
+  // Check basic authentication
+  if (!session.isLoggedIn || !session.userId) {
+    return false;
   }
+
+  // Check required fields
+  if (!session.username || !session.teamId || !session.teamName || 
+      !session.teamSchema || !session.userPrefix) {
+    return false;
+  }
+
+  // ✨ STRICT: Opinions must exist and be a valid array
+  if (!session.opinions || !Array.isArray(session.opinions)) {
+    console.warn("⚠️ Session missing opinions array - pre-refactor session detected", {
+      userId: session.userId,
+      username: session.username
+    });
+    return false;
+  }
+
+  // ✨ STRICT: Must have at least one opinion
+  if (session.opinions.length === 0) {
+    console.warn("⚠️ Session has empty opinions array", {
+      userId: session.userId,
+      username: session.username
+    });
+    return false;
+  }
+
+  // Validate opinion structure
+  for (const opinion of session.opinions) {
+    if (!opinion.name || typeof opinion.isDefault !== 'boolean') {
+      console.warn("⚠️ Session has malformed opinion data", {
+        userId: session.userId,
+        username: session.username,
+        malformedOpinion: opinion
+      });
+      return false;
+    }
+  }
+
+  return true;
 }
 
 /**
- * Middleware-like function to validate team context and return appropriate error responses.
- * This can be used at the beginning of API routes to ensure the user is authenticated
- * and has valid team context.
+ * ✨ UPDATED: Ensures that the user is logged in and has the necessary team context.
+ * Now strictly validates session compatibility and rejects pre-refactor sessions.
+ *
+ * @param request The incoming NextRequest.
+ * @param response The outgoing NextResponse.
+ * @returns A promise that resolves with the user and team context, or a NextResponse for redirection/error.
  */
-
-// Also debug the requireTeamContext function
 export async function requireTeamContext(
   request: NextRequest,
   response: NextResponse
-): Promise<{ teamContext: TeamContext; user: UserSessionData } | NextResponse> {
-  console.log("=== REQUIRE TEAM CONTEXT DEBUG ===");
+): Promise<AuthResult | NextResponse> {
+  try {
+    // Use Partial<UserSessionData> to avoid type issues with incomplete sessions
+    const session = await getIronSession<Partial<UserSessionData>>(request, response, sessionOptions);
 
-  const sessionData = await getTeamContextFromSession(request, response);
+    // ✨ STRICT VALIDATION: Use the new validation function
+    if (!validateSessionData(session)) {
+      console.warn("Invalid or incompatible session in requireTeamContext, rejecting request");
+      
+      // Clear the invalid session
+      try {
+        // Type assertion since we know this is a session object with destroy method
+        (session as any).destroy();
+        const cookieName = sessionOptions.cookieName || 'iron-session';
+        response.cookies.set(cookieName, '', {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: 'lax',
+          path: '/',
+          expires: new Date(0),
+          maxAge: 0
+        });
+      } catch (clearError) {
+        console.error("Error clearing invalid session:", clearError);
+      }
+      
+      return NextResponse.json({ 
+        error: "Invalid session. Please log in again.",
+        sessionCleared: true 
+      }, { status: 401 });
+    }
 
-  if (!sessionData) {
-    console.log("❌ No session data - returning 401");
-    console.log("=== END REQUIRE TEAM CONTEXT DEBUG ===");
-    return NextResponse.json(
-      { error: "Authentication required. Please log in." },
-      { status: 401 }
-    );
+    // At this point, we know session is valid, so cast it to the full type
+    const validSession = session as UserSessionData;
+    return {
+      teamContext: { 
+        teamSchema: validSession.teamSchema, 
+        userPrefix: validSession.userPrefix 
+      },
+      user: validSession,
+    };
+
+  } catch (error) {
+    console.error("Error in requireTeamContext:", error);
+    return NextResponse.json({ 
+      error: "Session validation failed. Please log in again." 
+    }, { status: 401 });
   }
-
-  console.log("✅ Team context validation successful");
-  console.log("=== END REQUIRE TEAM CONTEXT DEBUG ===");
-  return sessionData;
 }
 
 /**
@@ -133,5 +164,40 @@ export function validateUserPermissions(
 ): boolean {
   // For now, all authenticated users with team context have access
   // This can be extended later for role-based access control
-  return !!user.isLoggedIn && !!user.teamSchema && !!user.userPrefix;
+  return !!user.isLoggedIn && !!user.teamSchema && !!user.userPrefix && 
+         !!user.opinions && user.opinions.length > 0;
+}
+
+/**
+ * Helper function to get the default opinion for a user.
+ * Returns the opinion marked as default, or the first opinion if none is marked as default.
+ */
+export function getDefaultOpinionName(opinions: OpinionInfo[]): string | null {
+  if (!opinions || opinions.length === 0) {
+    return null;
+  }
+  
+  const defaultOpinion = opinions.find(opinion => opinion.isDefault);
+  return defaultOpinion ? defaultOpinion.name : opinions[0].name;
+}
+
+/**
+ * Helper function to validate that an opinion name is valid for the user.
+ */
+export function isValidOpinionName(opinions: OpinionInfo[], opinionName: string | null): boolean {
+  if (!opinionName) {
+    return true; // null/undefined is valid (will use default)
+  }
+  
+  return opinions.some(opinion => opinion.name === opinionName);
+}
+
+/**
+ * ✨ NEW: Helper function to check if a session needs to be upgraded/migrated.
+ * This can be used in middleware or other places to detect old sessions.
+ */
+export function isLegacySession(session: Partial<UserSessionData>): boolean {
+  return session.isLoggedIn === true && 
+         !!session.userId && 
+         (!session.opinions || !Array.isArray(session.opinions) || session.opinions.length === 0);
 }

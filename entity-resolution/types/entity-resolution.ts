@@ -1,9 +1,113 @@
-// types/entity-resolution.ts
+/*
+================================================================================
+|
+|   File: /types/entity-resolution.ts
+|
+|   Description: Centralized TypeScript types for the application.
+|   - This file integrates new user/opinion types with the existing application types.
+|
+================================================================================
+*/
+
+import { Node } from "reactflow";
+
+// --- User and Opinion Types ---
+// Represents a single opinion available to a user
+export interface OpinionInfo {
+  name: string;
+  displayName: string;
+  isDefault: boolean;
+}
+
+// ✨ NEW: Opinion preferences stored in the database
+export interface OpinionPreferences {
+  disconnectDependentServices: boolean;
+  // Add other preferences here as needed
+}
+
+// ✨ NEW: API response types for opinion preferences
+export interface GetOpinionPreferencesResponse {
+  preferences: OpinionPreferences;
+  opinionName: string;
+}
+
+export interface UpdateOpinionPreferencesRequest {
+  disconnectDependentServices?: boolean;
+  // Add other preferences here as needed
+}
+
+export interface UpdateOpinionPreferencesResponse {
+  message: string;
+  preferences: OpinionPreferences;
+  opinionName: string;
+}
+
+// Represents the authenticated user, updated with opinions
+export interface User {
+  id: string;
+  username: string;
+  email?: string;
+  teamId: string;
+  teamName: string;
+  teamSchema: string;
+  userPrefix: string;
+  opinions: OpinionInfo[]; // List of available opinions
+}
+
+// Represents the user session data stored on the server
+export interface UserSessionData {
+  userId: string;
+  sessionId: string;
+  username: string;
+  email?: string;
+  teamId: string;
+  teamName: string;
+  teamSchema: string;
+  userPrefix: string;
+  isLoggedIn: true;
+  opinions: OpinionInfo[]; // Store all available opinions in the session
+}
+
+// --- Generic and Graph-Specific Types ---
+// Generic paginated response structure from the API
+export interface PaginatedResponse<T> {
+  items: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
+// Node and Edge types for graph visualization (React Flow)
+export interface BaseNodeData {
+  id: string;
+  name?: string;
+  source_system?: string;
+  source_id?: string;
+  organization_id?: string;
+  contributor_id?: string;
+}
+
+export type GraphNode = Node<BaseNodeData>;
+
+export interface GraphLink {
+  id:string;
+  source: string;
+  target: string;
+  weight: number;
+  status?: string;
+  details?: any;
+  created_at?: string;
+  cluster_id: string;
+  was_reviewed?: boolean;
+}
+
+// --- Core Application Types ---
 
 export type ResolutionMode = "entity" | "service";
 export type ClusterFilterStatus = "all" | "reviewed" | "unreviewed";
 
-// --- Structs for Bulk Node Details ---
+// --- Structs for Bulk API Requests ---
 export interface NodeIdentifier {
   id: string;
   nodeType: ResolutionMode; // 'entity' or 'service'
@@ -13,7 +117,6 @@ export interface BulkNodeDetailsRequest {
   items: NodeIdentifier[];
 }
 
-// --- Structs for Bulk Connections ---
 export interface BulkConnectionRequestItem {
   edgeId: string;
   itemType: ResolutionMode; // 'entity' or 'service'
@@ -23,7 +126,6 @@ export interface BulkConnectionsRequest {
   items: BulkConnectionRequestItem[];
 }
 
-// --- Structs for Bulk Visualizations ---
 export interface BulkVisualizationRequestItem {
   clusterId: string;
   itemType: ResolutionMode; // 'entity' or 'service'
@@ -33,7 +135,7 @@ export interface BulkVisualizationsRequest {
   items: BulkVisualizationRequestItem[];
 }
 
-// --- NEW: Bulk Disconnect Types ---
+// --- Bulk Disconnect Types ---
 export interface DisconnectDependentServicesRequest {
   reviewerId: string;
   notes?: string;
@@ -51,13 +153,13 @@ export interface DisconnectDependentServicesResponse {
   processingTimeMs: number;
 }
 
-// Base entity and cluster types
+// --- Base Entity and Data Structure Types ---
 export interface Organization {
   id: string;
   organizationId: string | null;
   name: string | null;
-  createdAt: string | null; // NaiveDateTime from Rust becomes string
-  updatedAt: string | null; // NaiveDateTime from Rust becomes string
+  createdAt: string | null;
+  updatedAt: string | null;
   sourceSystem: string | null;
   sourceId: string | null;
   url?: string | null;
@@ -74,16 +176,13 @@ export interface Service {
   url?: string | null;
 }
 
-/**
- * Represents a phone number associated with a node, as seen in the 'Node phone' log.
- */
 export interface NodePhone {
   id: string;
   locationId: string | null;
   serviceId: string | null;
   organizationId: string | null;
   contactId: string | null;
-  serviceAtLocationId: string | null; // Based on logs, can be a string
+  serviceAtLocationId: string | null;
   number: string;
   extension: string | null;
   type: string;
@@ -97,10 +196,6 @@ export interface NodePhone {
   contributorId: string | null;
 }
 
-/**
- * Represents a service listed in the attributes of a node, from the 'Node services' log.
- * This is different from the top-level Service type.
- */
 export interface NodeServiceAttribute {
   id: string;
   name: string;
@@ -111,12 +206,7 @@ export interface NodeServiceAttribute {
   url?: string | null;
 }
 
-/**
- * REFACTORED: Represents a unified Location and its primary Address.
- * This replaces the separate NodeLocation and NodeAddress interfaces.
- */
 export interface LocationAndAddress {
-  // Fields from the original NodeLocation
   id: string;
   organizationId: string;
   name: string | null;
@@ -132,8 +222,6 @@ export interface LocationAndAddress {
   originalId: string | null;
   originalTranslationsId: string | null;
   contributorId: string | null;
-
-  // Fields from the original NodeAddress (all nullable due to LEFT JOIN)
   attention: string | null;
   address1: string | null;
   address2: string | null;
@@ -172,23 +260,36 @@ export interface EntityGroup {
   notes?: string | null;
 }
 
-// More accurately reflects optional fields from Rust backend
+// --- Cluster Types ---
 export interface BaseCluster {
   id: string;
   name?: string | null;
   description?: string | null;
   averageCoherenceScore: number | null;
-  createdAt?: string | null; // NaiveDateTime serializes to string
+  createdAt?: string | null;
   updatedAt?: string | null;
   wasReviewed?: boolean | null;
 }
 
-// This now perfectly matches the Rust `EntityClusterItem` and is used for both modes
 export interface EntityCluster extends BaseCluster {
   entityCount?: number | null;
   groupCount?: number | null;
 }
 
+export interface ServiceCluster extends BaseCluster {
+  service_count?: number;
+  service_group_count?: number;
+}
+
+export interface PaginatedClustersResponse<T> {
+  clusters: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
+// --- Match Decision and Feedback Types ---
 export interface MatchDecisionDetails {
   id: string;
   groupId: string;
@@ -219,6 +320,7 @@ export interface ServiceMatchHumanFeedback extends HumanFeedbackBase {
   serviceGroupId: string;
 }
 
+// --- Visualization and Connection Types ---
 export interface BaseNode {
   id: string;
   name: string | null;
@@ -262,36 +364,6 @@ export interface VisualizationEntityEdge {
   wasReviewed?: boolean | null;
 }
 
-// UPDATED: Enhanced EdgeReviewApiPayload with new field
-export interface EdgeReviewApiPayload {
-  decision: 'ACCEPTED' | 'REJECTED';
-  reviewerId: string;
-  notes?: string;
-  type: 'entity' | 'service';
-  disconnectDependentServices?: boolean; // ✨ NEW FIELD
-}
-
-// UPDATED: Enhanced EdgeReviewApiResponse with new fields
-export interface EdgeReviewApiResponse {
-  message: string;
-  edgeId: string;
-  newStatus: string;
-  clusterId: string;
-  clusterFinalized: boolean;
-  dependentServicesDisconnected?: number; // ✨ NEW FIELD
-  dependentClustersFinalized?: number;    // ✨ NEW FIELD
-}
-
-export type GroupReviewDecision = "ACCEPTED" | "REJECTED" | string;
-
-export interface PaginatedClustersResponse<T> {
-  clusters: T[];
-  total: number;
-  page: number;
-  limit: number;
-  totalPages: number;
-}
-
 export interface VisualizationData {
   clusterId: string;
   nodes: BaseNode[];
@@ -300,6 +372,7 @@ export interface VisualizationData {
 }
 export type EntityVisualizationDataResponse = VisualizationData;
 export type BulkVisualizationsResponse = VisualizationData[];
+
 
 export interface EntityConnectionDataResponse {
   edge: VisualizationEntityEdge;
@@ -319,6 +392,32 @@ export function isEntityConnectionData(
 ): data is EntityConnectionDataResponse {
   return "entity1" in data && "entityGroups" in data;
 }
+
+
+// --- Review and Action Types ---
+export type EdgeDecision = "ACCEPTED" | "REJECTED";
+
+export interface EdgeReviewApiPayload {
+  decision: EdgeDecision;
+  reviewerId: string;
+  notes?: string;
+  type: ResolutionMode;
+  disconnectDependentServices?: boolean;
+}
+
+export interface EdgeReviewApiResponse {
+  message: string;
+  edgeId: string;
+  newStatus: string;
+  clusterId: string;
+  clusterFinalized: boolean;
+  dependentServicesDisconnected?: number;
+  dependentClustersFinalized?: number;
+}
+
+export type GroupReviewDecision = "ACCEPTED" | "REJECTED" | string;
+
+
 export interface SuggestedAction {
   id: string;
   pipelineRunId: string | null;
@@ -389,11 +488,6 @@ export interface ClusterReviewProgress {
   confirmedNonMatches: number;
 }
 
-/**
- * REFACTORED: The main response for node details.
- * The `attributes` field now uses a single `locations` array with the unified `LocationAndAddress` type.
- * The `addresses` field has been removed.
- */
 export interface NodeDetailResponse {
   id: string;
   nodeType: "entity" | "service";
@@ -401,11 +495,11 @@ export interface NodeDetailResponse {
   attributes: {
     phones?: NodePhone[];
     services?: NodeServiceAttribute[];
-    locations?: LocationAndAddress[]; // UNIFIED FIELD
-    // The 'addresses' field is no longer present in the API response.
+    locations?: LocationAndAddress[];
   };
 }
 
+// --- UI State Management Types ---
 export interface ClustersState {
   data: EntityCluster[];
   total: number;

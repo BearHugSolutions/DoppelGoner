@@ -1,181 +1,162 @@
-// utils/gateway-client.ts
+/*
+================================================================================
+|
+|   File: /utils/gateway-client.ts
+|
+|   Description: Low-level client for fetching data from the backend Gateway API.
+|   - Merged production-ready error handling and the `opinionName` feature.
+|   - Adds the `X-Opinion-Name` header to outgoing requests to the gateway.
+|
+================================================================================
+*/
 import { NextResponse } from "next/server";
 
-const GATEWAY_BASE_URL =
-  process.env.GATEWAY_BASE_URL || "http://localhost:4001/v1";
-const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY;
-
-interface FetchOptions extends RequestInit {
-  params?: Record<string, string | number | boolean | undefined>;
+// Define TeamContext based on what's passed in headers
+export interface TeamContext {
+  teamSchema: string;
+  userPrefix: string;
 }
 
-// Team context interface for the new system
-export interface TeamContext {
-  teamSchema: string;  // The team's schema name (e.g., "alpha")
-  userPrefix: string;  // The user's prefix within the team (e.g., "john")
+// Define options for the fetch call, including query parameters
+export interface FetchOptions extends RequestInit {
+  params?: Record<string, string | number | boolean>;
+}
+
+// Custom error class to hold more context from the gateway
+export class GatewayError extends Error {
+  status: number;
+  responseBody: any;
+
+  constructor(message: string, status: number, responseBody: any) {
+    super(message);
+    this.name = "GatewayError";
+    this.status = status;
+    this.responseBody = responseBody;
+  }
+}
+
+const GATEWAY_BASE_URL = process.env.GATEWAY_BASE_URL || "http://localhost:4001/v1";
+const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY;
+
+if (!GATEWAY_BASE_URL || !GATEWAY_API_KEY) {
+  throw new Error(
+    "GATEWAY_BASE_URL and GATEWAY_API_KEY must be set in environment variables."
+  );
 }
 
 /**
- * A helper function to make requests to the Rust data gateway.
- * It automatically includes the GATEWAY_API_KEY and team context headers.
+ * A generic fetch wrapper for communicating with the backend Gateway API.
  *
- * @param path - The API path (e.g., "/clusters", "/connections/123").
- * @param options - Fetch options (method, body, etc.).
- * @param teamContext - Team context with schema and user prefix for the new team-based system.
- * @returns A Promise resolving to the JSON response from the gateway.
+ * @param path The API endpoint path (e.g., "/clusters").
+ * @param options Standard fetch options, plus an optional `params` object for query strings.
+ * @param teamContext Optional team context to set `X-Team-Schema` and `X-User-Prefix` headers.
+ * @param opinionName Optional name of the opinion to set the `X-Opinion-Name` header.
+ * @returns The JSON response from the gateway.
+ * @throws {GatewayError} If the fetch request fails or returns a non-2xx status.
  */
-// Debug version of fetchFromGateway function
-// Add this debugging to your gateway-client.ts
-
 export async function fetchFromGateway<T = any>(
   path: string,
   options: FetchOptions = {},
-  teamContext?: TeamContext | null
+  teamContext?: TeamContext | null,
+  opinionName?: string | null // ✨ NEW PARAMETER
 ): Promise<T> {
-  console.log("=== GATEWAY CLIENT DEBUG ===");
-  console.log("Path:", path);
-  console.log("Team context received:", teamContext);
-  
-  if (!GATEWAY_API_KEY) {
-    console.error(
-      "GATEWAY_API_KEY is not defined. Cannot make requests to the gateway."
-    );
-    throw new Error(
-      "Gateway API key is missing. Please check server configuration."
-    );
-  }
+  const { params, ...fetchOptions } = options;
 
-  const { params, ...fetchOpts } = options;
-  let url = `${GATEWAY_BASE_URL}${path}`;
-
+  // Construct URL with query parameters
+  const url = new URL(`${GATEWAY_BASE_URL}${path}`);
   if (params) {
-    const queryParams = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
+      // Ensure value is not undefined before appending
       if (value !== undefined) {
-        queryParams.append(key, String(value));
+        url.searchParams.append(key, String(value));
       }
     });
-    if (queryParams.toString()) {
-      url += `?${queryParams.toString()}`;
-    }
   }
 
-  console.log("Final URL:", url);
-
-  const headers = new Headers(fetchOpts.headers || {});
-  headers.set("X-API-Key", GATEWAY_API_KEY);
-  
-  // Set team context headers if provided
+  // Set up headers
+  const headers = new Headers(fetchOptions.headers || {});
+  headers.set("X-API-Key", GATEWAY_API_KEY || "");
   if (teamContext) {
-    console.log("Setting team context headers:");
-    console.log("  - X-Team-Schema:", teamContext.teamSchema);
-    console.log("  - X-User-Prefix:", teamContext.userPrefix);
-    
     headers.set("X-Team-Schema", teamContext.teamSchema);
     headers.set("X-User-Prefix", teamContext.userPrefix);
-  } else {
-    console.log("⚠️  No team context provided - headers will be missing!");
-  }
-  
-  if (
-    fetchOpts.body &&
-    typeof fetchOpts.body === "object" &&
-    !(fetchOpts.body instanceof FormData)
-  ) {
-    if (!headers.has("Content-Type")) {
-      headers.set("Content-Type", "application/json");
-    }
   }
 
-  // Log all headers being sent
-  console.log("All headers being sent:");
-  headers.forEach((value, key) => {
-    // Don't log the actual API key for security
-    if (key.toLowerCase() === 'x-api-key') {
-      console.log(`  - ${key}: [REDACTED]`);
-    } else {
-      console.log(`  - ${key}: ${value}`);
-    }
-  });
+  // ✨ ADD NEW OPINION HEADER
+  if (opinionName) {
+    headers.set("X-Opinion-Name", opinionName);
+  }
+
+  if (fetchOptions.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const config: RequestInit = {
+    ...fetchOptions,
+    headers,
+  };
 
   try {
-    console.log("Making request to:", url);
-    const response = await fetch(url, {
-      ...fetchOpts,
-      headers,
-    });
-
-    console.log("Response status:", response.status);
-    console.log("Response ok:", response.ok);
+    const response = await fetch(url.toString(), config);
 
     if (!response.ok) {
-      let errorData;
+      let errorBody;
       try {
-        errorData = await response.json();
-        console.log("Error response data:", errorData);
+        errorBody = await response.json();
       } catch (e) {
-        errorData = {
-          message:
-            response.statusText ||
-            `Gateway request failed with status ${response.status}`,
-        };
-        console.log("Could not parse error response as JSON");
+        errorBody = { message: "Failed to parse error response from gateway." };
       }
-      
-      const errorMessage =
-        errorData.error ||
-        errorData.message ||
-        `Gateway request to ${path} failed with status ${response.status}`;
-      
-      console.error(
-        `Gateway API Error (${response.status}) for ${fetchOpts.method} ${url}:`,
-        errorMessage,
-        errorData
+      throw new GatewayError(
+        `Gateway request failed: ${response.statusText}`,
+        response.status,
+        errorBody
       );
-      
-      const error = new Error(errorMessage) as any;
-      error.status = response.status;
-      error.responseBody = errorData;
-      throw error;
     }
 
+    // Handle cases with no content
     if (response.status === 204) {
-      console.log("204 response - returning empty object");
       return {} as T;
     }
 
-    const responseData = await response.json();
-    console.log("✅ Success! Response received");
-    console.log("=== END GATEWAY CLIENT DEBUG ===");
-    return responseData as Promise<T>;
+    return await response.json();
   } catch (error) {
-    console.error("❌ Network or other error when calling gateway:", error);
-    console.log("=== END GATEWAY CLIENT DEBUG ===");
-    throw error;
+    if (error instanceof GatewayError) {
+      // Re-throw gateway errors to be handled by the caller
+      throw error;
+    }
+    // Handle network errors or other fetch-related issues
+    console.error("Network or fetch error in fetchFromGateway:", error);
+    throw new GatewayError(
+      (error as Error).message || "An unexpected network error occurred.",
+      500,
+      { message: "Network Error" }
+    );
   }
 }
 
 /**
- * Handles errors from gateway calls and returns an appropriate NextResponse.
- * @param error The error object.
- * @param defaultMessage A default message if the error doesn't have one.
- * @param defaultStatus A default HTTP status code.
- * @returns NextResponse
+ * Handles GatewayErrors in Next.js API routes, returning a standardized NextResponse.
+ * @param error The error object, expected to be a GatewayError.
+ * @param defaultMessage A fallback message if the error has no specific message.
+ * @returns A NextResponse object with the appropriate status and error message.
  */
 export function handleGatewayError(
   error: any,
-  defaultMessage: string = "An error occurred",
-  defaultStatus: number = 500
+  defaultMessage: string = "An internal server error occurred."
 ): NextResponse {
-  console.error("Handling gateway error:", error);
-  const message =
-    error.responseBody?.message ||
-    error.responseBody?.error ||
-    error.message ||
-    defaultMessage;
-  const status = error.status || defaultStatus;
-  return NextResponse.json(
-    { error: message, details: error.responseBody?.details },
-    { status }
-  );
+  if (error instanceof GatewayError) {
+    return NextResponse.json(
+      {
+        error: error.responseBody?.message || error.message,
+        details: error.responseBody?.details,
+      },
+      {
+        status: error.status,
+      }
+    );
+  }
+
+  console.error("Non-GatewayError caught in handleGatewayError:", error);
+  return NextResponse.json({ error: defaultMessage }, {
+    status: 500,
+  });
 }

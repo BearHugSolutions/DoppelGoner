@@ -1,17 +1,24 @@
-// context/auth-context.tsx
+// context/auth-context.tsx - LOGOUT AND SESSION HANDLING FIXES
 "use client";
 
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { useToast } from '@/hooks/use-toast'; // Assuming you have this toast hook
-import { useRouter } from 'next/navigation'; // Assuming you are using Next.js 13+ app router
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  ReactNode,
+  useCallback,
+} from "react";
+import { useToast } from "@/hooks/use-toast";
 
-// Define user and team types for clarity in the context
-interface TeamContext {
-  teamSchema: string;
-  userPrefix: string;
+// Represents a single available opinion for a user.
+export interface OpinionInfo {
+  name: string;
+  isDefault: boolean;
 }
 
-interface User {
+// Represents the authenticated user.
+export interface User {
   id: string;
   username: string;
   email?: string;
@@ -19,206 +26,324 @@ interface User {
   teamName: string;
   teamSchema: string;
   userPrefix: string;
+  opinions: OpinionInfo[];
 }
 
+// Structure of the backend login API response.
+interface LoginResponse {
+  message: string;
+  user: User;
+  team: any;
+}
+
+// ✨ NEW: Auth status response structure
+interface AuthStatusResponse {
+  isLoggedIn: boolean;
+  user: User | null;
+  sessionCleared?: boolean; // Indicates if an invalid session was cleared
+}
+
+// Defines the shape of the authentication context.
 interface AuthContextType {
   user: User | null;
+  selectedOpinion: string | null;
   isLoading: boolean;
   error: string | null;
   login: (username: string, password: string) => Promise<boolean>;
-  register: (username: string, password: string, email: string, teamName: string, datasets?: string[]) => Promise<boolean>;
-  logout: () => void;
+  register: (
+    username: string,
+    password: string,
+    email: string,
+    teamName: string,
+    datasets?: string[]
+  ) => Promise<boolean>;
+  logout: () => Promise<void>; // ✨ UPDATED: Now returns Promise<void>
+  checkAuthStatus: () => Promise<void>;
   clearError: () => void;
+  selectOpinion: (opinionName: string) => void;
 }
 
+// Create the context with an undefined default value.
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+// The provider component that wraps the application.
+export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
+  const [selectedOpinion, setSelectedOpinion] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { toast } = useToast();
-  const router = useRouter();
 
-  // Effect to load user from local storage on initial app load
-  useEffect(() => {
+  /**
+   * Clears any authentication-related errors from the state.
+   */
+  const clearError = () => setError(null);
+
+  /**
+   * ✨ UPDATED: Enhanced auth status check with better error handling
+   * and detection of cleared sessions.
+   */
+  const checkAuthStatus = useCallback(async () => {
+    setIsLoading(true);
     try {
-      const storedUser = localStorage.getItem('user');
-      if (storedUser) {
-        setUser(JSON.parse(storedUser));
+      const res = await fetch("/api/auth/status", {
+        // Add cache-busting to ensure we get fresh data
+        cache: 'no-cache',
+        headers: {
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache'
+        }
+      });
+      
+      if (res.ok) {
+        const data: AuthStatusResponse = await res.json();
+        
+        // ✨ Check if session was cleared (indicates stale session)
+        if (data.sessionCleared) {
+          console.log("Stale session was detected and cleared by server");
+          toast({
+            title: "Session Expired",
+            description: "Your session has expired. Please log in again.",
+            variant: "destructive",
+          });
+        }
+        
+        if (data.isLoggedIn && data.user) {
+          setUser(data.user);
+          // Set opinions and default selected opinion from session data
+          const defaultOpinion =
+            data.user.opinions?.find((o: OpinionInfo) => o.isDefault) ||
+            data.user.opinions?.[0];
+          setSelectedOpinion(defaultOpinion?.name || "default");
+        } else {
+          // Not logged in, clear user state
+          setUser(null);
+          setSelectedOpinion(null);
+        }
+      } else {
+        console.warn("Auth status check failed:", res.status, res.statusText);
+        // If status check fails, assume logged out
+        setUser(null);
+        setSelectedOpinion(null);
       }
-    } catch (e) {
-      console.error("Failed to parse user from local storage:", e);
-      localStorage.removeItem('user'); // Clear corrupted storage
+    } catch (err) {
+      console.error("Error checking auth status:", err);
+      setError("Failed to check authentication status.");
+      setUser(null);
+      setSelectedOpinion(null);
+    } finally {
+      setIsLoading(false);
     }
-  }, []);
+  }, [toast]);
+
+  // On component mount, check the authentication status.
+  useEffect(() => {
+    checkAuthStatus();
+  }, [checkAuthStatus]);
 
   /**
-   * Clears any authentication-related errors.
+   * Logs a user in by calling the backend API.
+   * On success, it sets the user and opinion state.
    */
-  const clearError = useCallback(() => {
-    setError(null);
-  }, []);
-
-  /**
-   * Handles user login by calling the Next.js local API route.
-   * @param username The user's username.
-   * @param password The user's password.
-   * @returns A boolean indicating login success or failure.
-   */
-  const login = useCallback(async (username: string, password: string): Promise<boolean> => {
+  const login = async (username: string, password: string): Promise<boolean> => {
     setIsLoading(true);
     clearError();
     try {
-      // Call your Next.js API route for login
-      const response = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
       });
 
-      const data = await response.json();
-      console.log("Login API response data:", data); 
+      const data: LoginResponse | { error: string } = await res.json();
 
-      if (response.ok) {
-        if (data.user) { 
-          setUser(data.user);
-          try {
-            localStorage.setItem('user', JSON.stringify(data.user)); // Persist user data
-            console.log("User data saved to local storage:", data.user); 
-          } catch (localStorageError) {
-            console.error("Error saving user to local storage:", localStorageError);
-          }
-          toast({
-            title: "Login Successful",
-            description: "Welcome back!",
-          });
-          // CRITICAL CHANGE: Redirect to the root page (app/page.tsx)
-          // Use window.location.href for a full page refresh to ensure session cookie is picked up
-          window.location.href = '/'; 
-          return true;
-        } else {
-          setError('Login successful, but no user data received.');
-          toast({
-            title: "Login Error",
-            description: "No user data received after successful login.",
-            variant: "destructive",
-          });
-          return false;
-        }
-      } else {
-        setError(data.error || 'Login failed.');
+      if (res.ok && "user" in data) {
+        setUser(data.user);
+        // Set opinions and find the default to select it automatically
+        const defaultOpinion =
+          data.user.opinions?.find((o) => o.isDefault) ||
+          data.user.opinions?.[0];
+        setSelectedOpinion(defaultOpinion?.name || "default");
+
         toast({
-          title: "Login Error",
-          description: data.error || 'Login failed. Please check your credentials.',
+          title: "Login Successful",
+          description: `Welcome back, ${data.user.username}!`,
+        });
+        // A full page reload is often better after login to ensure all state is fresh
+        window.location.href = "/";
+        return true;
+      } else {
+        const errorMessage = (data as { error: string }).error || "Login failed.";
+        setError(errorMessage);
+        toast({
+          title: "Login Failed",
+          description: errorMessage,
           variant: "destructive",
         });
         return false;
       }
-    } catch (err: any) {
-      console.error('Login network or unexpected error:', err);
-      setError(err.message || 'An unexpected error occurred during login.');
+    } catch (err) {
+      const errorMessage = (err as Error).message || "An unexpected error occurred.";
+      setError(errorMessage);
       toast({
         title: "Login Error",
-        description: err.message || 'Network error occurred. Please try again.',
+        description: errorMessage,
         variant: "destructive",
       });
       return false;
     } finally {
       setIsLoading(false);
     }
-  }, [clearError, toast]); // Removed router from dependencies as it's no longer used for push
+  };
 
   /**
-   * Handles user registration by calling the Next.js local API route.
-   * @param username The desired username.
-   * @param password The desired password.
-   * @param email The user's email address.
-   * @param teamName The name of the team to join or create.
-   * @param datasets Optional array of dataset names for new teams.
-   * @returns A boolean indicating registration success or failure.
+   * Registers a new user by calling the backend API.
    */
-  const register = useCallback(async (username: string, password: string, email: string, teamName: string, datasets?: string[]): Promise<boolean> => {
+  const register = async (
+    username: string,
+    password: string,
+    email: string,
+    teamName: string,
+    datasets?: string[]
+  ): Promise<boolean> => {
     setIsLoading(true);
     clearError();
     try {
-      const response = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      const res = await fetch("/api/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password, email, teamName, datasets }),
       });
 
-      const data = await response.json();
+      const data = await res.json();
 
-      if (response.ok) {
+      if (res.ok) {
         toast({
           title: "Registration Successful",
-          description: "Your account has been created. You can now log in.",
+          description: "You can now log in with your new credentials.",
         });
         return true;
       } else {
-        setError(data.error || 'Registration failed.');
+        setError(data.error || "Registration failed.");
         toast({
-          title: "Registration Error",
-          description: data.error || 'Registration failed. Please check the details and try again.',
+          title: "Registration Failed",
+          description: data.error,
           variant: "destructive",
         });
         return false;
       }
-    } catch (err: any) {
-      console.error('Registration network or unexpected error:', err);
-      setError(err.message || 'An unexpected error occurred during registration.');
+    } catch (err) {
+      const errorMessage = (err as Error).message || "An unexpected error occurred.";
+      setError(errorMessage);
       toast({
         title: "Registration Error",
-        description: err.message || 'Network error occurred. Please try again.',
+        description: errorMessage,
         variant: "destructive",
       });
       return false;
     } finally {
       setIsLoading(false);
     }
-  }, [clearError, toast]);
+  };
 
   /**
-   * Logs out the current user, clears local storage, and redirects to login.
+   * ✨ UPDATED: Enhanced logout function with better error handling
+   * and proper session clearing.
    */
-  const logout = useCallback(() => {
-    setUser(null);
-    localStorage.removeItem('user');
-    toast({
-      title: "Logged out",
-      description: "You have been successfully logged out.",
-    });
-    // This can still use router.push as it's redirecting to the login page
-    router.push('/login'); 
-  }, [toast, router]);
+  const logout = async (): Promise<void> => {
+    setIsLoading(true);
+    try {
+      // Call the logout endpoint
+      const response = await fetch("/api/auth/logout", { 
+        method: "POST",
+        cache: 'no-cache',
+        headers: {
+          'Cache-Control': 'no-cache'
+        }
+      });
+      
+      if (!response.ok) {
+        console.warn("Logout API call failed, but continuing with client-side logout");
+      }
+      
+      // Clear client-side state regardless of API response
+      setUser(null);
+      setSelectedOpinion(null);
+      setError(null);
+      
+      toast({
+        title: "Logged Out",
+        description: "You have been successfully logged out.",
+      });
+      
+    } catch (err) {
+      console.error("Logout error:", err);
+      // Even if logout API fails, clear client state
+      setUser(null);
+      setSelectedOpinion(null);
+      setError(null);
+      
+      toast({
+        title: "Logged Out",
+        description: "You have been logged out.",
+      });
+    } finally {
+      setIsLoading(false);
+      
+      // ✨ IMPROVED: Use window.location.replace instead of href to prevent back button issues
+      // Small delay to ensure state updates and toast are processed
+      setTimeout(() => {
+        window.location.replace("/");
+      }, 100);
+    }
+  };
 
-  // Memoize the context value to prevent unnecessary re-renders
-  const value = React.useMemo(() => ({
+  /**
+   * Allows the user to switch their active opinion.
+   * @param opinionName The name of the opinion to switch to.
+   */
+  const selectOpinion = (opinionName: string) => {
+    if (user?.opinions.some((o) => o.name === opinionName)) {
+      setSelectedOpinion(opinionName);
+      toast({
+        title: "Opinion Switched",
+        description: `Now viewing the "${opinionName}" opinion.`,
+      });
+    } else {
+      console.error(`Attempted to select non-existent opinion: ${opinionName}`);
+      toast({
+        title: "Error",
+        description: "Could not switch to the selected opinion.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  // The value provided to consuming components.
+  const value = {
     user,
+    selectedOpinion,
     isLoading,
     error,
     login,
     register,
     logout,
+    checkAuthStatus,
     clearError,
-  }), [user, isLoading, error, login, register, logout, clearError]);
+    selectOpinion,
+  };
 
-  return (
-    <AuthContext.Provider value={value}>
-      {children}
-    </AuthContext.Provider>
-  );
-};
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
 
-export const useAuth = () => {
+/**
+ * Custom hook to easily access the authentication context.
+ * Throws an error if used outside of an AuthProvider.
+ */
+export const useAuth = (): AuthContextType => {
   const context = useContext(AuthContext);
   if (context === undefined) {
-    throw new Error('useAuth must be used within an AuthProvider');
+    throw new Error("useAuth must be used within an AuthProvider");
   }
   return context;
 };

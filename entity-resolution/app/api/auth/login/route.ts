@@ -5,19 +5,27 @@ import { v4 as uuidv4 } from "uuid";
 import { sessionOptions } from "@/lib/session";
 import { fetchFromGateway, handleGatewayError } from "@/utils/gateway-client";
 
-// Updated session data for team-based system
+// Updated session data interface to include opinions AND email
 export interface UserSessionData {
   userId: string;
   sessionId: string;
   username: string;
+  email?: string; // ✨ ADDED: Email field from backend
   teamId: string;
   teamName: string;
   teamSchema: string;
   userPrefix: string;
+  opinions: OpinionInfo[]; // ✨ NEW: Store opinions in session
   isLoggedIn: true;
 }
 
-// Updated to match actual backend response structure
+// Opinion interface that matches auth-context.tsx
+export interface OpinionInfo {
+  name: string;
+  isDefault: boolean;
+}
+
+// Updated interface to match actual backend response structure with opinions
 interface GatewayLoginResponse {
   message: string;
   user: {
@@ -34,6 +42,20 @@ interface GatewayLoginResponse {
     updatedAt: string;
     lastLoginAt?: string;
   };
+  team: {
+    id: string;
+    name: string;
+    displayName: string;
+    schemaName: string;
+  };
+  opinions: {
+    name: string;
+    displayName: string;
+    description?: string;
+    isDefault: boolean;
+    createdAt: string;
+    updatedAt: string;
+  }[]; // Backend opinions have more fields
 }
 
 export async function POST(request: NextRequest) {
@@ -68,7 +90,7 @@ export async function POST(request: NextRequest) {
       // No team context needed for login itself
     );
 
-    const gatewayUser = gatewayResponse.user;
+    const { user: gatewayUser, team: gatewayTeam, opinions: backendOpinions } = gatewayResponse;
 
     // Updated validation to check correct field names from backend
     if (
@@ -89,6 +111,23 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // ✨ Validate opinions array
+    if (!backendOpinions || !Array.isArray(backendOpinions)) {
+      console.error("Gateway login response missing or invalid opinions:", backendOpinions);
+      return NextResponse.json(
+        {
+          error: "Invalid user data received. Missing opinion information.",
+        },
+        { status: 500 }
+      );
+    }
+
+    // ✨ Map backend opinions to frontend format
+    const opinions: OpinionInfo[] = backendOpinions.map(opinion => ({
+      name: opinion.name,
+      isDefault: opinion.isDefault,
+    }));
+
     // Prepare response payload for Next.js AuthContext - map backend fields to expected frontend fields
     const userResponsePayload = {
       id: gatewayUser.id,
@@ -98,17 +137,20 @@ export async function POST(request: NextRequest) {
       teamName: gatewayUser.teamName,
       teamSchema: gatewayUser.teamSchemaName, // Map to expected frontend field name
       userPrefix: gatewayUser.userOpinionPrefix, // Map to expected frontend field name
+      opinions: opinions, // ✨ Include opinions in the payload
     };
 
     const response = NextResponse.json(
       {
         message: gatewayResponse.message,
         user: userResponsePayload,
+        team: gatewayTeam, // ✨ Include team info
+        opinions: opinions, // ✨ Include opinions in response
       },
       { status: 200 }
     );
 
-    // Create/Update Iron Session with team information
+    // Create/Update Iron Session with team and opinion information
     const session = await getIronSession<UserSessionData>(
       request,
       response,
@@ -119,19 +161,24 @@ export async function POST(request: NextRequest) {
     session.userId = gatewayUser.id;
     session.sessionId = newSessionId;
     session.username = gatewayUser.username;
+    session.email = gatewayUser.email; // ✨ STORE EMAIL in session
     session.teamId = gatewayUser.teamId;
     session.teamName = gatewayUser.teamName;
     session.teamSchema = gatewayUser.teamSchemaName; // Use actual backend field name
     session.userPrefix = gatewayUser.userOpinionPrefix; // Use actual backend field name
+    session.opinions = opinions; // ✨ Save opinions to session
     session.isLoggedIn = true;
 
     await session.save();
 
-    console.log("User logged in with team context:", {
+    console.log("User logged in with team context and opinions:", {
       username: gatewayUser.username,
+      email: gatewayUser.email, // ✨ Log email
       teamName: gatewayUser.teamName,
-      teamSchema: gatewayUser.teamSchemaName, // Updated field name
-      userPrefix: gatewayUser.userOpinionPrefix, // Updated field name
+      teamSchema: gatewayUser.teamSchemaName,
+      userPrefix: gatewayUser.userOpinionPrefix,
+      opinionsCount: opinions.length,
+      defaultOpinion: opinions.find(op => op.isDefault)?.name || 'none',
     });
 
     return response;

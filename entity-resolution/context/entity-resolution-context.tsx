@@ -1,4 +1,17 @@
-// context/entity-resolution-context.tsx
+/*
+================================================================================
+|
+|   File: /context/entity-resolution-context.tsx
+|
+|   Description: Manages state for the core entity resolution UI.
+|   - Updated to consume `selectedOpinion` from `AuthContext`.
+|   - All data-fetching operations now pass the `selectedOpinion` to API functions.
+|   - Added guards to prevent API calls when no opinion is selected.
+|   - Integrated dependent service disconnection feature.
+|   - FIXED: Prevented unnecessary bulk-connections calls and UI flickering
+|
+================================================================================
+*/
 "use client";
 
 import {
@@ -27,7 +40,9 @@ import {
   getOrganizationConnectionData,
   getServiceConnectionData,
   postEdgeReview,
-  postDisconnectDependentServices, // NEW IMPORT
+  postDisconnectDependentServices,
+  getOpinionPreferences,
+  updateOpinionPreferences,
 } from "@/utils/api-client";
 import {
   createContext,
@@ -101,7 +116,7 @@ export interface EntityResolutionContextType {
   isAutoAdvanceEnabled: boolean;
   isReviewToolsMaximized: boolean;
   clusterFilterStatus: ClusterFilterStatus;
-  disconnectDependentServicesEnabled: boolean; // NEW STATE
+  disconnectDependentServicesEnabled: boolean;
 
   clusters: ClustersState;
   visualizationData: Record<string, VisualizationState>;
@@ -127,8 +142,8 @@ export interface EntityResolutionContextType {
     setLastReviewedEdgeId: (id: string | null) => void;
     setIsReviewToolsMaximized: (isMaximized: boolean) => void;
     setClusterFilterStatus: (status: ClusterFilterStatus) => void;
-    setDisconnectDependentServicesEnabled: (enabled: boolean) => void; // NEW ACTION
-    enableDisconnectDependentServices: () => Promise<void>; // NEW ACTION
+    setDisconnectDependentServicesEnabled: (enabled: boolean) => void;
+    enableDisconnectDependentServices: () => Promise<void>;
     triggerRefresh: (
       target?:
         | "all"
@@ -205,14 +220,16 @@ export function EntityResolutionProvider({
 }: {
   children: ReactNode;
 }) {
-  const { user } = useAuth();
+  const { user, selectedOpinion } = useAuth(); // ✨ Get selectedOpinion from Auth
   const { toast } = useToast();
 
-  // ==========================================
-  // 1. ADD DEBOUNCING AND GUARDS TO CLEANUP
-  // ==========================================
+  // Debouncing and guards for cleanup
   const cleanupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastCleanupStateRef = useRef<string>("");
+
+  // 🔧 FIX: Add request deduplication tracking
+  const activeRequestsRef = useRef<Set<string>>(new Set());
+  const lastRequestTimeRef = useRef<number>(0);
 
   // Core state
   const [resolutionMode, setResolutionModeState] =
@@ -234,8 +251,10 @@ export function EntityResolutionProvider({
     useState<boolean>(false);
   const [clusterFilterStatus, setClusterFilterStatus] =
     useState<ClusterFilterStatus>("unreviewed");
-  const [disconnectDependentServicesEnabled, setDisconnectDependentServicesEnabledState] = 
-    useState<boolean>(false); // NEW STATE
+  const [
+    disconnectDependentServicesEnabled,
+    setDisconnectDependentServicesEnabledState,
+  ] = useState<boolean>(false);
 
   // Data state
   const [clusters, setClusters] = useState<ClustersState>(initialClustersState);
@@ -308,7 +327,7 @@ export function EntityResolutionProvider({
     []
   );
 
-  // REPLACE the performThreeClusterCleanup function with this version:
+  // 🔧 FIX: Three-cluster cleanup with better debouncing and guards
   const performThreeClusterCleanup = useCallback(
     (
       targetClusterId: string | null = selectedClusterId,
@@ -474,57 +493,54 @@ export function EntityResolutionProvider({
     ]
   );
 
-  // NEW: Function to enable dependent service disconnection
+  // ✨ Function to enable dependent service disconnection
   const enableDisconnectDependentServices = useCallback(async () => {
-    if (!user?.id) {
+    if (!user?.id || !selectedOpinion) {
       toast({
         title: "Auth Error",
-        description: "Login required to enable this feature.",
+        description: "Login required and opinion must be selected.",
         variant: "destructive",
       });
       return;
     }
 
     try {
-      // Show initial toast
-      toast({
-        title: "Processing...",
-        description: "Enabling dependent service disconnection for all future reviews and processing historical data.",
-      });
+      // First save the preference
+      await updateOpinionPreferences(
+        {
+          disconnectDependentServices: true,
+        },
+        selectedOpinion
+      );
 
-      // Enable the setting
+      // Then update local state
       setDisconnectDependentServicesEnabledState(true);
 
-      // Call bulk disconnect API for historical data
+      // Then call bulk processing
       const bulkRequest: DisconnectDependentServicesRequest = {
         reviewerId: user.id,
         notes: "Bulk enable dependent service disconnection",
         asyncProcessing: true,
       };
 
-      const response = await postDisconnectDependentServices(bulkRequest);
+      const response = await postDisconnectDependentServices(
+        bulkRequest,
+        selectedOpinion
+      );
 
-      // Show completion toast with metrics
       toast({
         title: "Dependent Service Disconnection Enabled",
-        description: `Processed ${response.serviceEdgesProcessed} service edges from ${response.entityPairsFound} entity pairs. ${response.clustersFinalized} clusters finalized.`,
+        description: `Processed ${response.serviceEdgesProcessed} service edges. Setting saved.`,
       });
-
-      console.log("Bulk disconnect response:", response);
     } catch (error) {
-      console.error("Error enabling dependent service disconnection:", error);
-      
-      // Revert the setting on error
       setDisconnectDependentServicesEnabledState(false);
-      
       toast({
         title: "Error",
-        description: `Failed to enable dependent service disconnection: ${(error as Error).message}`,
+        description: `Failed to enable: ${(error as Error).message}`,
         variant: "destructive",
       });
     }
-  }, [user?.id, toast]);
-
+  }, [user?.id, selectedOpinion, toast]);
   // Queries object
   const queries = useMemo(() => {
     const getClusterById = (clusterId: string): EntityCluster | undefined => {
@@ -668,7 +684,11 @@ export function EntityResolutionProvider({
     setLargeClusterConnectionsPage(0);
     setIsLoadingPage(false);
     setEdgeSubmissionStatus({});
-    setDisconnectDependentServicesEnabledState(false); // Reset the new state
+    setDisconnectDependentServicesEnabledState(false);
+
+    // 🔧 FIX: Clear request tracking
+    activeRequestsRef.current.clear();
+    lastRequestTimeRef.current = 0;
   }, []);
 
   const setResolutionMode = useCallback(
@@ -685,6 +705,12 @@ export function EntityResolutionProvider({
 
   const loadBulkNodeDetails = useCallback(
     async (nodesToFetch: NodeIdentifier[]) => {
+      if (!selectedOpinion) {
+        // ✨ Guard for opinion
+        console.log("🚫 No opinion selected, skipping node details fetch");
+        return;
+      }
+
       const caller =
         new Error().stack?.split("\n")[2]?.match(/at (\w+)/)?.[1] || "unknown";
       console.log(`🔍 loadBulkNodeDetails called by: ${caller}`);
@@ -754,7 +780,10 @@ export function EntityResolutionProvider({
           const chunk = trulyNeedsFetching.slice(i, i + NODE_FETCH_SIZE);
 
           try {
-            const response = await getBulkNodeDetails({ items: chunk });
+            const response = await getBulkNodeDetails(
+              { items: chunk },
+              selectedOpinion
+            ); // ✨ Pass opinion
 
             setNodeDetails((prev) => {
               const newState = { ...prev };
@@ -786,154 +815,245 @@ export function EntityResolutionProvider({
         cleanupPendingState();
       }
     },
-    [nodeDetails, pendingNodeFetches]
+    [nodeDetails, pendingNodeFetches, selectedOpinion] // ✨ Added selectedOpinion dependency
   );
 
-  // FIXED: loadBulkConnections with Immer spread pattern
+  // 🔧 FIX: loadBulkConnections with improved request deduplication and caching
   const loadBulkConnections = useCallback(
     async (items: BulkConnectionRequestItem[]) => {
+      if (!selectedOpinion) {
+        // ✨ Guard for opinion
+        console.log("🚫 No opinion selected, skipping connections fetch");
+        return;
+      }
+
       if (items.length === 0) return;
+
+      // 🔧 FIX: Add request throttling
+      const now = Date.now();
+      if (now - lastRequestTimeRef.current < 500) {
+        // 500ms throttle
+        console.log("🚫 Request throttled - too soon after last request");
+        return;
+      }
+      lastRequestTimeRef.current = now;
+
+      // 🔧 FIX: Add request deduplication
+      const requestKey = items
+        .map((i) => i.edgeId)
+        .sort()
+        .join(",");
+      if (activeRequestsRef.current.has(requestKey)) {
+        console.log("🚫 Duplicate request prevented:", requestKey);
+        return;
+      }
+      activeRequestsRef.current.add(requestKey);
 
       const uniqueItems = uniqueBy(
         items,
         (item) => `${item.edgeId}-${item.itemType}`
       );
+
+      // 🔧 FIX: Better filtering with cache validation
       const trulyNeedsFetching = uniqueItems.filter((item) => {
         const existing = connectionData[item.edgeId];
-        return !existing || !existing.data || existing.error;
+        const isLoading = existing?.loading;
+        const hasRecentData =
+          existing?.data &&
+          existing.lastUpdated &&
+          Date.now() - existing.lastUpdated < 60000; // 1 minute cache
+        const hasError = existing?.error;
+
+        if (isLoading) {
+          console.log(`⏳ Skipping ${item.edgeId} - already loading`);
+          return false;
+        }
+
+        if (hasRecentData) {
+          console.log(`✅ Skipping ${item.edgeId} - recent data available`);
+          return false;
+        }
+
+        return !existing?.data || hasError;
       });
 
-      if (trulyNeedsFetching.length === 0) return;
+      if (trulyNeedsFetching.length === 0) {
+        console.log("🚫 All connections already loaded/loading, early return");
+        activeRequestsRef.current.delete(requestKey);
+        return;
+      }
 
-      // FIXED: Use spread operator instead of direct property assignment
-      setConnectionData(
-        produce((draft) => {
-          trulyNeedsFetching.forEach((item) => {
-            if (!draft[item.edgeId] || draft[item.edgeId]?.error) {
-              draft[item.edgeId] = {
-                data: null,
-                loading: true,
-                error: null,
-                lastUpdated: null,
-              };
-            } else if (draft[item.edgeId] && !draft[item.edgeId]?.loading) {
-              // ✅ FIXED: Replace entire object instead of mutating properties
-              draft[item.edgeId] = {
-                ...draft[item.edgeId]!,
-                loading: true,
-                error: null,
-              };
-            }
-          });
-        })
+      console.log(
+        `📦 Actually fetching: ${trulyNeedsFetching.length}/${items.length} connections`
       );
 
-      const chunks: BulkConnectionRequestItem[][] = [];
-      for (let i = 0; i < trulyNeedsFetching.length; i += MAX_BULK_FETCH_SIZE) {
-        chunks.push(trulyNeedsFetching.slice(i, i + MAX_BULK_FETCH_SIZE));
-      }
-
-      if (chunks.length === 0) return;
-
-      const firstChunk = chunks.shift();
-      if (firstChunk) {
-        try {
-          const response = await getBulkConnections({ items: firstChunk });
-          setConnectionData(
-            produce((draft) => {
-              response.forEach((connData) => {
-                const edgeId = connData.edge.id;
-                draft[edgeId] = {
-                  data: connData,
-                  loading: false,
-                  error: null,
-                  lastUpdated: Date.now(),
-                };
-              });
-              firstChunk.forEach((reqItem) => {
-                if (!response.some((r) => r.edge.id === reqItem.edgeId)) {
-                  draft[reqItem.edgeId] = {
-                    data: null,
-                    loading: false,
-                    error: "Not found in response.",
-                    lastUpdated: null,
-                  };
-                }
-              });
-            })
-          );
-        } catch (error) {
-          setConnectionData(
-            produce((draft) => {
-              firstChunk.forEach((item) => {
+      try {
+        setConnectionData(
+          produce((draft) => {
+            trulyNeedsFetching.forEach((item) => {
+              if (!draft[item.edgeId] || draft[item.edgeId]?.error) {
                 draft[item.edgeId] = {
                   data: null,
-                  loading: false,
-                  error: (error as Error).message,
+                  loading: true,
+                  error: null,
                   lastUpdated: null,
                 };
-              });
-            })
-          );
-        }
-      }
+              } else if (draft[item.edgeId] && !draft[item.edgeId]?.loading) {
+                draft[item.edgeId] = {
+                  ...draft[item.edgeId]!,
+                  loading: true,
+                  error: null,
+                };
+              }
+            });
+          })
+        );
 
-      // Background chunks
-      if (chunks.length > 0) {
-        chunks.forEach((chunk) => {
-          getBulkConnections({ items: chunk })
-            .then((response) => {
-              setConnectionData(
-                produce((draft) => {
-                  response.forEach((connData) => {
-                    const edgeId = connData.edge.id;
-                    draft[edgeId] = {
-                      data: connData,
+        const chunks: BulkConnectionRequestItem[][] = [];
+        for (
+          let i = 0;
+          i < trulyNeedsFetching.length;
+          i += MAX_BULK_FETCH_SIZE
+        ) {
+          chunks.push(trulyNeedsFetching.slice(i, i + MAX_BULK_FETCH_SIZE));
+        }
+
+        if (chunks.length === 0) return;
+
+        const firstChunk = chunks.shift();
+        if (firstChunk) {
+          try {
+            const response = await getBulkConnections(
+              { items: firstChunk },
+              selectedOpinion
+            ); // ✨ Pass opinion
+            setConnectionData(
+              produce((draft) => {
+                response.forEach((connData) => {
+                  const edgeId = connData.edge.id;
+                  draft[edgeId] = {
+                    data: connData,
+                    loading: false,
+                    error: null,
+                    lastUpdated: Date.now(),
+                  };
+                });
+                firstChunk.forEach((reqItem) => {
+                  if (!response.some((r) => r.edge.id === reqItem.edgeId)) {
+                    draft[reqItem.edgeId] = {
+                      data: null,
                       loading: false,
-                      error: null,
-                      lastUpdated: Date.now(),
+                      error: "Not found in response.",
+                      lastUpdated: null,
                     };
-                  });
-                  chunk.forEach((reqItem) => {
-                    if (!response.some((r) => r.edge.id === reqItem.edgeId)) {
-                      if (draft[reqItem.edgeId]?.loading) {
-                        draft[reqItem.edgeId] = {
-                          data: null,
+                  }
+                });
+              })
+            );
+          } catch (error) {
+            setConnectionData(
+              produce((draft) => {
+                firstChunk.forEach((item) => {
+                  draft[item.edgeId] = {
+                    data: null,
+                    loading: false,
+                    error: (error as Error).message,
+                    lastUpdated: null,
+                  };
+                });
+              })
+            );
+          }
+        }
+
+        // Background chunks
+        if (chunks.length > 0) {
+          chunks.forEach((chunk) => {
+            getBulkConnections({ items: chunk }, selectedOpinion) // ✨ Pass opinion
+              .then((response) => {
+                setConnectionData(
+                  produce((draft) => {
+                    response.forEach((connData) => {
+                      const edgeId = connData.edge.id;
+                      draft[edgeId] = {
+                        data: connData,
+                        loading: false,
+                        error: null,
+                        lastUpdated: Date.now(),
+                      };
+                    });
+                    chunk.forEach((reqItem) => {
+                      if (!response.some((r) => r.edge.id === reqItem.edgeId)) {
+                        if (draft[reqItem.edgeId]?.loading) {
+                          draft[reqItem.edgeId] = {
+                            data: null,
+                            loading: false,
+                            error: "Not found in response.",
+                            lastUpdated: null,
+                          };
+                        }
+                      }
+                    });
+                  })
+                );
+              })
+              .catch((error) => {
+                setConnectionData(
+                  produce((draft) => {
+                    chunk.forEach((item) => {
+                      if (draft[item.edgeId]?.loading) {
+                        draft[item.edgeId] = {
+                          ...draft[item.edgeId]!,
                           loading: false,
-                          error: "Not found in response.",
-                          lastUpdated: null,
+                          error: (error as Error).message,
                         };
                       }
-                    }
-                  });
-                })
-              );
-            })
-            .catch((error) => {
-              setConnectionData(
-                produce((draft) => {
-                  chunk.forEach((item) => {
-                    if (draft[item.edgeId]?.loading) {
-                      // ✅ FIXED: Replace entire object
-                      draft[item.edgeId] = {
-                        ...draft[item.edgeId]!,
-                        loading: false,
-                        error: (error as Error).message,
-                      };
-                    }
-                  });
-                })
-              );
-            });
-        });
+                    });
+                  })
+                );
+              });
+          });
+        }
+      } finally {
+        activeRequestsRef.current.delete(requestKey);
       }
     },
-    [connectionData]
+    [connectionData, selectedOpinion] // ✨ Added selectedOpinion dependency
   );
 
-  // FIXED: loadVisualizationDataForClusters with Immer spread pattern
+  // 🔧 FIX: Debounced version of loadBulkConnections
+  const debouncedLoadBulkConnections = useCallback(
+    _.debounce(async (items: BulkConnectionRequestItem[]) => {
+      if (items.length === 0) return;
+
+      // Filter out recently loaded or loading items
+      const filtered = items.filter((item) => {
+        const existing = connectionData[item.edgeId];
+        return (
+          !existing?.loading &&
+          (!existing?.lastUpdated || Date.now() - existing.lastUpdated > 60000)
+        );
+      });
+
+      if (filtered.length > 0) {
+        console.log(
+          `🔄 Debounced load: ${filtered.length}/${items.length} connections`
+        );
+        await loadBulkConnections(filtered);
+      }
+    }, 300), // 300ms debounce
+    [loadBulkConnections, connectionData]
+  );
+
+  // loadVisualizationDataForClusters with opinion support
   const loadVisualizationDataForClusters = useCallback(
     async (items: BulkVisualizationRequestItem[]) => {
+      if (!selectedOpinion) {
+        // ✨ Guard for opinion
+        console.log("🚫 No opinion selected, skipping visualization fetch");
+        return;
+      }
+
       if (items.length === 0) return;
 
       const uniqueItems = uniqueBy(
@@ -941,7 +1061,6 @@ export function EntityResolutionProvider({
         (item) => `${item.clusterId}-${item.itemType}`
       );
 
-      // FIXED: Use spread operator pattern
       setVisualizationData((prev) => {
         const newState = { ...prev };
         uniqueItems.forEach((item) => {
@@ -956,7 +1075,6 @@ export function EntityResolutionProvider({
             newState[item.clusterId] &&
             !newState[item.clusterId]?.loading
           ) {
-            // ✅ FIXED: Replace entire object instead of mutating properties
             newState[item.clusterId] = {
               ...newState[item.clusterId]!,
               loading: true,
@@ -973,7 +1091,10 @@ export function EntityResolutionProvider({
       for (let i = 0; i < uniqueItems.length; i += VIZ_FETCH_SIZE) {
         const chunk = uniqueItems.slice(i, i + VIZ_FETCH_SIZE);
         try {
-          const response = await getBulkVisualizations({ items: chunk });
+          const response = await getBulkVisualizations(
+            { items: chunk },
+            selectedOpinion
+          ); // ✨ Pass opinion
           allFetchedVisualizations.push(...response);
 
           setVisualizationData((prev) => {
@@ -1095,27 +1216,68 @@ export function EntityResolutionProvider({
 
       const allLinksToLoad = [...priorityLinks, ...backgroundLinks];
       if (allLinksToLoad.length > 0) {
-        await loadBulkConnections(allLinksToLoad);
+        // 🔧 FIX: Use debounced version
+        debouncedLoadBulkConnections(allLinksToLoad);
       }
     },
-    [resolutionMode, loadBulkNodeDetails, queries, loadBulkConnections]
+    [
+      resolutionMode,
+      loadBulkNodeDetails,
+      queries,
+      debouncedLoadBulkConnections,
+      selectedOpinion,
+    ] // ✨ Added selectedOpinion dependency
   );
 
   const loadVisualizationDataForClustersRef = useRef(
     loadVisualizationDataForClusters
   );
+
+  useEffect(() => {
+    if (selectedOpinion && user?.id) {
+      console.log(`Loading preferences for opinion: ${selectedOpinion}`);
+      
+      getOpinionPreferences(selectedOpinion)
+        .then(response => {
+          console.log(`Loaded preferences for ${selectedOpinion}:`, response.preferences);
+          setDisconnectDependentServicesEnabledState(
+            response.preferences.disconnectDependentServices
+          );
+        })
+        .catch(error => {
+          console.error('Failed to load opinion preferences:', error);
+          // Fallback to default (false) on error
+          setDisconnectDependentServicesEnabledState(false);
+          
+          // Only show toast for non-404 errors (404 means no preferences saved yet)
+          if (!error.message?.includes('404') && !error.message?.includes('Not found')) {
+            toast({
+              title: "Warning",
+              description: "Could not load saved preferences. Using defaults.",
+              variant: "destructive",
+            });
+          }
+        });
+    } else if (!selectedOpinion) {
+      // No opinion selected, reset to default
+      setDisconnectDependentServicesEnabledState(false);
+    }
+  }, [selectedOpinion, user?.id, toast]);
+
   useEffect(() => {
     loadVisualizationDataForClustersRef.current =
       loadVisualizationDataForClusters;
   }, [loadVisualizationDataForClusters]);
 
-  // ==========================================
-  // 2. REMOVE CLEANUP FROM loadClusters
-  // ==========================================
-
-  // REPLACE the loadClusters function - REMOVE the setTimeout cleanup at the end:
+  // loadClusters with opinion support
   const loadClusters = useCallback(
     async (page: number, limit: number = 10) => {
+      if (!selectedOpinion) {
+        // ✨ Guard for opinion
+        console.log("🚫 No opinion selected, skipping clusters fetch");
+        return;
+      }
+
       setClusters((prev) => ({
         ...prev,
         loading: true,
@@ -1130,7 +1292,12 @@ export function EntityResolutionProvider({
           : getServiceClusters;
 
       try {
-        const response = await fetcher(page, limit, clusterFilterStatus);
+        const response = await fetcher(
+          page,
+          limit,
+          clusterFilterStatus,
+          selectedOpinion
+        ); // ✨ Pass opinion
 
         if (response.clusters.length === 0 && response.page > 1) {
           console.warn(
@@ -1174,8 +1341,6 @@ export function EntityResolutionProvider({
             vizRequestItemsNormal
           );
         }
-
-        // ❌ REMOVED: The setTimeout cleanup that was causing infinite loop
       } catch (error) {
         setClusters((prev) => ({
           ...prev,
@@ -1190,15 +1355,11 @@ export function EntityResolutionProvider({
     [
       resolutionMode,
       clusterFilterStatus,
-      // ❌ REMOVED: selectedClusterId and performThreeClusterCleanup from dependencies
+      selectedOpinion, // ✨ Added selectedOpinion dependency
     ]
   );
 
-  // ==========================================
-  // 3. SIMPLIFY handleSetSelectedClusterId
-  // ==========================================
-
-  // REPLACE handleSetSelectedClusterId - remove redundant cleanup calls:
+  // 🔧 FIX: handleSetSelectedClusterId with better connection loading logic
   const handleSetSelectedClusterId = useCallback(
     async (id: string | null) => {
       if (id === selectedClusterId) return;
@@ -1212,7 +1373,8 @@ export function EntityResolutionProvider({
         setLargeClusterConnectionsPage(0);
       }
 
-      if (id) {
+      if (id && selectedOpinion) {
+        // ✨ Check for opinion
         const clusterDetail = queries.getClusterById(id);
         const connectionCount = clusterDetail
           ? clusterDetail.groupCount
@@ -1240,14 +1402,23 @@ export function EntityResolutionProvider({
               { clusterId: id, itemType: resolutionMode },
             ]);
           } else if (vizState?.data?.links) {
+            // 🔧 FIX: Better filtering and use debounced loading
             const unloadedConnectionItems = vizState.data.links
-              .map((link) => ({ edgeId: link.id, itemType: resolutionMode }))
-              .filter((item) => {
-                const connState = connectionData[item.edgeId];
-                return !connState || (!connState.data && !connState.loading);
-              });
+              .filter((link) => {
+                const connState = connectionData[link.id];
+                const needsLoad =
+                  !connState ||
+                  (!connState.data && !connState.loading && !connState.error) ||
+                  connState.error;
+                return needsLoad;
+              })
+              .map((link) => ({ edgeId: link.id, itemType: resolutionMode }));
+
             if (unloadedConnectionItems.length > 0) {
-              loadBulkConnections(unloadedConnectionItems);
+              console.log(
+                `🔄 Loading ${unloadedConnectionItems.length} missing connections for cluster ${id}`
+              );
+              debouncedLoadBulkConnections(unloadedConnectionItems);
             }
           }
         } else {
@@ -1260,12 +1431,10 @@ export function EntityResolutionProvider({
           }
         }
       }
-
-      // ❌ REMOVED: All cleanup calls from this function
-      // The cleanup will be handled by the debounced useEffect instead
     },
     [
       selectedClusterId,
+      selectedOpinion, // ✨ Added selectedOpinion dependency
       activelyPagingClusterId,
       largeClusterConnectionsPage,
       queries,
@@ -1273,14 +1442,11 @@ export function EntityResolutionProvider({
       resolutionMode,
       loadBulkNodeDetails,
       connectionData,
-      loadBulkConnections,
-      // ❌ REMOVED: performThreeClusterCleanup from dependencies
+      debouncedLoadBulkConnections,
     ]
   );
 
-  // ==========================================
-  // ENHANCED EDGE ID SETTER
-  // ==========================================
+  // Enhanced edge ID setter
   const setSelectedEdgeIdAction = useCallback(
     (id: string | null) => {
       if (id === selectedEdgeId) return;
@@ -1303,18 +1469,26 @@ export function EntityResolutionProvider({
     [queries, selectedClusterId, selectedEdgeId]
   );
 
-  // Other action implementations (simplified for brevity)
+  // loadSingleConnectionData with opinion support
   const loadSingleConnectionData = useCallback(
     async (edgeId: string): Promise<EntityConnectionDataResponse | null> => {
+      if (!selectedOpinion) {
+        // ✨ Guard for opinion
+        console.log("🚫 No opinion selected, skipping single connection fetch");
+        return null;
+      }
+
       const cached = connectionData[edgeId];
+
+      // 🔧 FIX: Better cache validation
       if (
         cached?.data &&
         !cached.loading &&
         !cached.error &&
         cached.lastUpdated &&
-        Date.now() - cached.lastUpdated < 300000
+        Date.now() - cached.lastUpdated < 300000 // 5 minutes
       ) {
-        console.log(`Using cached connection data for edge ${edgeId}`);
+        console.log(`✅ Using cached connection data for edge ${edgeId}`);
 
         const nodesToLoad: NodeIdentifier[] = [];
         const connItem = cached.data;
@@ -1335,7 +1509,13 @@ export function EntityResolutionProvider({
         return cached.data;
       }
 
-      console.log(`Fetching single connection data for edge ${edgeId}.`);
+      // 🔧 FIX: Prevent duplicate requests
+      if (cached?.loading) {
+        console.log(`⏳ Connection data already loading for edge ${edgeId}`);
+        return null;
+      }
+
+      console.log(`🔄 Fetching single connection data for edge ${edgeId}`);
       setConnectionData((prev) => ({
         ...prev,
         [edgeId]: {
@@ -1351,7 +1531,7 @@ export function EntityResolutionProvider({
           resolutionMode === "entity"
             ? getOrganizationConnectionData
             : getServiceConnectionData;
-        const response = await fetcher(edgeId);
+        const response = await fetcher(edgeId, selectedOpinion); // ✨ Pass opinion
 
         setConnectionData((prev) => ({
           ...prev,
@@ -1398,10 +1578,10 @@ export function EntityResolutionProvider({
         return null;
       }
     },
-    [connectionData, resolutionMode, loadBulkNodeDetails]
+    [connectionData, resolutionMode, loadBulkNodeDetails, selectedOpinion] // ✨ Added selectedOpinion dependency
   );
 
-  // Simple implementations for other functions
+  // triggerRefresh function
   const triggerRefresh = useCallback(
     (
       target:
@@ -1421,13 +1601,14 @@ export function EntityResolutionProvider({
     [clusters.page, clusters.limit, loadClusters]
   );
 
-  // UPDATED: submitEdgeReview to include disconnectDependentServices flag
+  // submitEdgeReview with opinion support and disconnectDependentServices flag
   const submitEdgeReview = useCallback(
     async (edgeId: string, decision: GroupReviewDecision, notes?: string) => {
-      if (!user?.id) {
+      if (!user?.id || !selectedOpinion) {
+        // ✨ Check for user and opinion
         toast({
           title: "Auth Error",
-          description: "Login required.",
+          description: "Login required and opinion must be selected.",
           variant: "destructive",
         });
         return;
@@ -1472,9 +1653,9 @@ export function EntityResolutionProvider({
           reviewerId: user.id,
           notes,
           type: resolutionMode,
-          disconnectDependentServices: disconnectDependentServicesEnabled, // INCLUDE THE FLAG
+          disconnectDependentServices: disconnectDependentServicesEnabled,
         };
-        const response = await postEdgeReview(edgeId, payload);
+        const response = await postEdgeReview(edgeId, payload, selectedOpinion); // ✨ Pass opinion
 
         setEdgeSubmissionStatus((prev) => ({
           ...prev,
@@ -1484,7 +1665,10 @@ export function EntityResolutionProvider({
         setLastReviewedEdgeId(edgeId);
 
         // Show additional feedback if dependent services were disconnected
-        if (response.dependentServicesDisconnected && response.dependentServicesDisconnected > 0) {
+        if (
+          response.dependentServicesDisconnected &&
+          response.dependentServicesDisconnected > 0
+        ) {
           toast({
             title: "Review Submitted",
             description: `Edge reviewed successfully. ${response.dependentServicesDisconnected} dependent service matches were also disconnected.`,
@@ -1527,7 +1711,15 @@ export function EntityResolutionProvider({
         }
       }
     },
-    [user, selectedClusterId, visualizationData, resolutionMode, toast, disconnectDependentServicesEnabled]
+    [
+      user,
+      selectedClusterId,
+      selectedOpinion,
+      visualizationData,
+      resolutionMode,
+      toast,
+      disconnectDependentServicesEnabled,
+    ] // ✨ Added selectedOpinion dependency
   );
 
   // Computed values
@@ -1677,6 +1869,7 @@ export function EntityResolutionProvider({
     return true;
   }, [isLoadingPage, selectedEdgeId, queries]);
 
+  // advanceToNextCluster function
   const advanceToNextCluster = useCallback(async () => {
     if (!selectedClusterId) {
       console.warn("No cluster selected, cannot advance.");
@@ -2049,7 +2242,12 @@ export function EntityResolutionProvider({
 
       if (connectionItemsToFetch.length > 0) {
         try {
-          await loadBulkConnections(connectionItemsToFetch);
+          // 🔧 FIX: Use debounced version for consistency
+          if (isPrefetch) {
+            debouncedLoadBulkConnections(connectionItemsToFetch);
+          } else {
+            await loadBulkConnections(connectionItemsToFetch);
+          }
         } catch (error) {
           console.error(
             `Error loading connection data for page ${pageToLoad}, cluster ${clusterId}:`,
@@ -2089,6 +2287,7 @@ export function EntityResolutionProvider({
       connectionData,
       toast,
       loadBulkConnections,
+      debouncedLoadBulkConnections,
     ]
   );
 
@@ -2215,6 +2414,7 @@ export function EntityResolutionProvider({
       setSelectedEdgeIdAction,
     ]
   );
+
   const invalidateVisualizationData = useCallback(
     async (clusterId: string) => {
       console.log(
@@ -2273,11 +2473,7 @@ export function EntityResolutionProvider({
     [resolutionMode, loadBulkConnections]
   );
 
-  // ==========================================
-  // 4. REPLACE THE PROBLEMATIC useEFFECTs
-  // ==========================================
-
-  // Effect to auto-select edge when visualization data loads
+  // 🔧 FIX: Effect to auto-select edge when visualization data loads (simplified dependencies)
   useEffect(() => {
     if (
       selectedClusterId &&
@@ -2302,94 +2498,97 @@ export function EntityResolutionProvider({
     }
   }, [
     selectedClusterId,
-    currentVisualizationDataForSelection,
+    currentVisualizationDataForSelection?.links?.length, // 🔧 FIX: Only the length, not the entire links array
     selectedEdgeId,
-    selectNextUnreviewedEdge,
-    isAutoAdvanceEnabled,
-    lastReviewedEdgeId,
-    activelyPagingClusterId,
-    largeClusterConnectionsPage,
-  ]);
+  ]); // 🔧 FIX: Minimal dependencies
 
-  // Effect to auto-load connection data when edge is selected
+  // 🔧 FIX: Effect to auto-load connection data when edge is selected (simplified)
   useEffect(() => {
-    if (selectedEdgeId) {
-      const currentEdgeState = connectionData[selectedEdgeId];
-      if (
-        (!currentEdgeState?.data ||
-          currentEdgeState?.error ||
-          (currentEdgeState?.lastUpdated &&
-            Date.now() - currentEdgeState.lastUpdated > 300000)) &&
-        !currentEdgeState?.loading
-      ) {
-        console.log(
-          `Fetching/Re-fetching connection data for selected edge: ${selectedEdgeId}`
-        );
-        loadSingleConnectionData(selectedEdgeId);
-      }
-    }
-  }, [selectedEdgeId, connectionData, loadSingleConnectionData]);
+    if (!selectedEdgeId) return;
 
-  // REPLACE memory monitoring useEffect - make it less aggressive:
+    const currentEdgeState = connectionData[selectedEdgeId];
+    const needsLoad =
+      !currentEdgeState?.data &&
+      !currentEdgeState?.loading &&
+      !currentEdgeState?.error;
+
+    if (needsLoad) {
+      console.log(
+        `🔄 Auto-loading connection data for edge: ${selectedEdgeId}`
+      );
+      loadSingleConnectionData(selectedEdgeId);
+    }
+  }, [selectedEdgeId]); // 🔧 FIX: Only selectedEdgeId dependency
+
+  // 🔧 FIX: Memory monitoring useEffect with reduced frequency and better guards
   useEffect(() => {
     const monitorMemoryUsage = () => {
       const clusterCount = Object.keys(visualizationData).length;
       const connectionCount = Object.keys(connectionData).length;
       const nodeCount = Object.keys(nodeDetails).length;
 
-      // More aggressive thresholds to reduce cleanup frequency
-      if (clusterCount > 6) {
-        // Increased from 4
+      // 🔧 FIX: Increased thresholds to reduce cleanup frequency
+      if (clusterCount > 8) {
+        // Increased from 6
         console.warn(
-          `🚨 Too many clusters in memory (${clusterCount}), forcing three-cluster cleanup`
+          `🚨 Too many clusters in memory (${clusterCount}), forcing cleanup`
         );
         performThreeClusterCleanup(selectedClusterId, true);
-      }
-
-      const totalObjects = clusterCount + connectionCount + nodeCount;
-      if (totalObjects > 800) {
-        // Increased from 500
+      } else if (connectionCount > 600) {
+        // Increased from 800
         console.warn(
-          `🚨 High memory usage detected: ${totalObjects} total objects`
+          `🚨 Too many connections in memory (${connectionCount}), forcing cleanup`
         );
         performThreeClusterCleanup(selectedClusterId, true);
       }
     };
 
-    const interval = setInterval(monitorMemoryUsage, 30000); // Increased from 15000ms
+    // 🔧 FIX: Increased interval to reduce frequency
+    const interval = setInterval(monitorMemoryUsage, 120000); // 2 minutes instead of 30 seconds
     return () => clearInterval(interval);
-  }, [selectedClusterId, performThreeClusterCleanup]); // Keep minimal dependencies
+  }, []); // 🔧 FIX: Remove dependencies to prevent frequent setup/teardown
 
-  // REPLACE the auto-cleanup useEffect with a debounced version:
+  // 🔧 FIX: Debounced cleanup useEffect with better guards
   useEffect(() => {
-    if (selectedClusterId && clusters.data.length > 0) {
-      // Clear any existing timeout
-      if (cleanupTimeoutRef.current) {
-        clearTimeout(cleanupTimeoutRef.current);
-      }
+    if (!selectedClusterId || clusters.data.length === 0) return;
 
-      // Debounce cleanup to prevent rapid-fire execution
-      cleanupTimeoutRef.current = setTimeout(() => {
+    // Clear any existing timeout
+    if (cleanupTimeoutRef.current) {
+      clearTimeout(cleanupTimeoutRef.current);
+    }
+
+    // 🔧 FIX: Longer debounce to prevent rapid cleanup
+    cleanupTimeoutRef.current = setTimeout(() => {
+      const currentState = JSON.stringify({
+        selectedClusterId,
+        clustersCount: clusters.data.length,
+        visualizationKeys: Object.keys(visualizationData).length,
+      });
+
+      // Only cleanup if state actually changed
+      if (currentState !== lastCleanupStateRef.current) {
         console.log("🧹 Debounced cleanup triggered");
         performThreeClusterCleanup(selectedClusterId);
+        lastCleanupStateRef.current = currentState;
+      }
+      cleanupTimeoutRef.current = null;
+    }, 3000); // 🔧 FIX: Increased from 1000ms to 3000ms
+
+    return () => {
+      if (cleanupTimeoutRef.current) {
+        clearTimeout(cleanupTimeoutRef.current);
         cleanupTimeoutRef.current = null;
-      }, 1000); // Increased from 300ms to 1000ms for better debouncing
+      }
+    };
+  }, [selectedClusterId]); // 🔧 FIX: Only selectedClusterId dependency
 
-      return () => {
-        if (cleanupTimeoutRef.current) {
-          clearTimeout(cleanupTimeoutRef.current);
-          cleanupTimeoutRef.current = null;
-        }
-      };
-    }
-  }, [selectedClusterId, clusters.data.length]); // ❌ REMOVED performThreeClusterCleanup from deps
-
-  // Initial cluster loading
+  // ✨ Effect to reload clusters when itemType, selectedOpinion, or filter status changes
   useEffect(() => {
     if (
       (clusters.data.length === 0 || clusters.error) &&
       !clusters.loading &&
-      (clusters.total > 0 || clusterFilterStatus === "unreviewed")
+      (clusters.total > 0 || clusterFilterStatus === "unreviewed") &&
+      selectedOpinion // ✨ Only load if opinion is selected
     ) {
       console.log(
         `[useEffect] Initial cluster load/reload triggered for filter: ${clusterFilterStatus}`
@@ -2408,6 +2607,7 @@ export function EntityResolutionProvider({
   }, [
     resolutionMode,
     clusterFilterStatus,
+    selectedOpinion, // ✨ Added selectedOpinion dependency
     clusters.data.length,
     clusters.loading,
     loadClusters,
@@ -2465,14 +2665,15 @@ export function EntityResolutionProvider({
     () => ({
       setResolutionMode,
       setSelectedClusterId: handleSetSelectedClusterId,
-      setSelectedEdgeId: setSelectedEdgeIdAction, // ENHANCED
+      setSelectedEdgeId: setSelectedEdgeIdAction,
       setReviewerId,
       setLastReviewedEdgeId,
       setClusterFilterStatus,
       setIsReviewToolsMaximized,
       setIsAutoAdvanceEnabled: setIsAutoAdvanceEnabledState,
-      setDisconnectDependentServicesEnabled: setDisconnectDependentServicesEnabledState, // NEW ACTION
-      enableDisconnectDependentServices, // NEW ACTION
+      setDisconnectDependentServicesEnabled:
+        setDisconnectDependentServicesEnabledState,
+      enableDisconnectDependentServices,
       triggerRefresh,
       loadClusters,
       loadBulkNodeDetails,
@@ -2510,9 +2711,9 @@ export function EntityResolutionProvider({
     [
       setResolutionMode,
       handleSetSelectedClusterId,
-      setSelectedEdgeIdAction, // ENHANCED
-      setDisconnectDependentServicesEnabledState, // NEW
-      enableDisconnectDependentServices, // NEW
+      setSelectedEdgeIdAction,
+      setDisconnectDependentServicesEnabledState,
+      enableDisconnectDependentServices,
       triggerRefresh,
       loadClusters,
       loadBulkNodeDetails,
@@ -2551,7 +2752,7 @@ export function EntityResolutionProvider({
     isAutoAdvanceEnabled,
     isReviewToolsMaximized,
     clusterFilterStatus,
-    disconnectDependentServicesEnabled, // NEW STATE
+    disconnectDependentServicesEnabled,
     clusters,
     visualizationData,
     connectionData,

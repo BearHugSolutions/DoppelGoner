@@ -13,6 +13,11 @@ export async function POST(
   if (authResult instanceof NextResponse) return authResult;
   const { teamContext, user } = authResult;
 
+  // ✨ Extract the opinion name from the request header
+  const opinionName = request.headers.get('X-Opinion-Name');
+  
+  console.log("Edge Review API: Request with opinion header:", opinionName);
+
   const { edgeId } = await params;
   if (!edgeId) {
     return NextResponse.json({ error: 'Edge ID is required.' }, { status: 400 });
@@ -59,6 +64,7 @@ export async function POST(
 
   console.log("[API_CLIENT] Requesting edge review for edge", edgeId);
   console.log("[API_CLIENT] Payload:", payload);
+  console.log("[API_CLIENT] Using opinion:", opinionName || "default");
 
   try {
     const gatewayResponse = await fetchFromGateway(
@@ -70,7 +76,8 @@ export async function POST(
         },
         body: JSON.stringify(payload),
       },
-      teamContext // Pass team context
+      teamContext, // Pass team context
+      opinionName // ✨ Pass opinion name to gateway client
     );
 
     return NextResponse.json(gatewayResponse);

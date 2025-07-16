@@ -15,6 +15,11 @@ export async function GET(
   if (authResult instanceof NextResponse) return authResult;
   const { teamContext, user } = authResult;
 
+  // ✨ Extract the opinion name from the request header
+  const opinionName = request.headers.get('X-Opinion-Name');
+  
+  console.log("Node Data API: Request with opinion header:", opinionName);
+
   const { nodeId } = await params;
   const { searchParams } = new URL(request.url);
   const type = searchParams.get("type");
@@ -29,6 +34,8 @@ export async function GET(
     );
   }
 
+  console.log(`Fetching ${type} node data for ${nodeId} with opinion:`, opinionName || "default");
+
   try {
     const gatewayResponse = await fetchFromGateway<NodeDetailResponse>(
       `/nodeData/${nodeId}`,
@@ -36,7 +43,8 @@ export async function GET(
         method: "GET",
         params: { type },
       },
-      teamContext // Pass team context for consistency
+      teamContext, // Pass team context
+      opinionName // ✨ Pass opinion name to gateway client
     );
 
     console.log(`Successfully fetched data for node: ${nodeId}`);

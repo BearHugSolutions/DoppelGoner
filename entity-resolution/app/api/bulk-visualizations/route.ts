@@ -10,6 +10,11 @@ export async function POST(request: NextRequest) {
   if (authResult instanceof NextResponse) return authResult;
   const { teamContext, user } = authResult;
 
+  // ✨ Extract the opinion name from the request header
+  const opinionName = request.headers.get('X-Opinion-Name');
+  
+  console.log("Bulk Visualizations API: Request with opinion header:", opinionName);
+
   let payload: BulkVisualizationsRequest;
   try {
     payload = await request.json();
@@ -32,6 +37,8 @@ export async function POST(request: NextRequest) {
     }
   }
 
+  console.log(`Fetching bulk visualization data for ${payload.items.length} items with opinion:`, opinionName || "default");
+
   try {
     const gatewayResponse = await fetchFromGateway<BulkVisualizationsResponse>(
       `/bulk-visualizations`,
@@ -42,7 +49,8 @@ export async function POST(request: NextRequest) {
           'Content-Type': 'application/json',
         },
       },
-      teamContext // Pass team context
+      teamContext, // Pass team context
+      opinionName // ✨ Pass opinion name to gateway client
     );
 
     return NextResponse.json(gatewayResponse);
