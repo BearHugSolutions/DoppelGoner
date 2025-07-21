@@ -1,37 +1,30 @@
 // src/matching/embedding.rs
 use crate::matching::name::calculate_string_similarity_enhanced;
-use crate::models::matching::MatchMethodType;
-use crate::models::matching::MatchValues;
-use crate::models::matching::ServiceEmbeddingMatchValue;
-use crate::models::matching::ServiceInfo;
-use crate::models::matching::ServiceMatch;
+use crate::models::matching::{MatchMethodType, MatchValues, ServiceEmbeddingMatchValue, ServiceInfo, ServiceMatch};
 use crate::models::stats_models::ServiceEmbeddingMatchingStats;
 use crate::rl::{ServiceRLOrchestrator, SharedServiceFeatureCache};
 use crate::utils::candle::cosine_similarity_candle;
 use crate::utils::db_connect::PgPool;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
-use anyhow::Context;
-use tokio::sync::Mutex;
-use log::{debug, info, warn, error};
-use indicatif::ProgressBar;
-
-// Arroy ANN imports
+use anyhow::Result;
 use arroy::distances::Euclidean;
-use arroy::{Database as ArroyDatabase, Writer, Reader};
+use arroy::{Database as ArroyDatabase, Reader, Writer};
 use heed::EnvOpenOptions;
+use indicatif::ProgressBar;
+use log::{debug, error, info, warn};
+use once_cell::sync::Lazy;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use once_cell::sync::Lazy;
-use std::time::Duration;
+use tokio::sync::Mutex;
 
 const LARGE_CLUSTER_THRESHOLD_EMB: usize = 2000;
 const SERVICE_EMBEDDING_SIMILARITY_THRESHOLD: f64 = 0.80;
 
-// Arroy specific constants
+// Arroy ANN constants
 const ARROY_DB_MAP_SIZE_MIB: usize = 2048; // 2 GiB for the LMDB map size
 const K_NEAREST_NEIGHBORS: usize = 50;
 const NUM_ARROY_TREES: NonZeroUsize = match NonZeroUsize::new(10) {
@@ -44,14 +37,13 @@ const ARROY_SEARCH_MULTIPLIER: NonZeroUsize = match NonZeroUsize::new(15) {
 };
 
 // ANN cache with TTL
-static ANN_CACHE: Lazy<Mutex<HashMap<String, (Instant, Arc<ArroyDatabase<Euclidean>>)>>> = 
+static ANN_CACHE: Lazy<Mutex<HashMap<String, (Instant, Arc<ArroyDatabase<Euclidean>>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 
-/// Runs enhanced embedding matching for services.
-/// Now takes a pool instead of a connection to allow getting fresh connections per pair
+/// Runs enhanced embedding matching for services with conditional RL integration.
 pub async fn run_enhanced_embedding_matching(
-    pool: &PgPool, // Changed from connection to pool
+    pool: &PgPool,
     services: &[ServiceInfo],
     service_rl_orchestrator: Option<Arc<Mutex<ServiceRLOrchestrator>>>,
     service_feature_cache: Option<SharedServiceFeatureCache>,
@@ -60,29 +52,30 @@ pub async fn run_enhanced_embedding_matching(
     let start_time = Instant::now();
     let mut stats = ServiceEmbeddingMatchingStats::default();
 
+    let rl_enabled = service_rl_orchestrator.is_some();
     debug!(
-        "Starting enhanced embedding matching for {} services (RL enabled: {})",
+        "Starting enhanced embedding matching for {} services (RL: {})",
         services.len(),
-        service_rl_orchestrator.is_some()
+        if rl_enabled { "enabled" } else { "disabled" }
     );
 
     let mut matches = Vec::new();
-    let mut similarities = Vec::new();
     let mut features_for_rl_logging: Vec<(String, String, Vec<f64>)> = Vec::new();
 
     if services.len() > LARGE_CLUSTER_THRESHOLD_EMB {
-        info!("Running embedding matching in LARGE CLUSTER (ANN) mode ({} services)", services.len());
+        info!("Running embedding matching in LARGE CLUSTER (ANN) mode ({} services, RL: {})", services.len(), if rl_enabled { "enabled" } else { "disabled" });
         stats.large_cluster_mode = true;
-        
+
         // Use ANN for large clusters
         let (ann_matches, ann_features, ann_stats) = run_ann_embedding_matching(
-            pool, 
-            services, 
-            service_rl_orchestrator, 
-            service_feature_cache, 
-            method_pb.clone()
-        ).await;
-        
+            pool,
+            services,
+            service_rl_orchestrator,
+            service_feature_cache,
+            method_pb.clone(),
+        )
+        .await;
+
         matches.extend(ann_matches);
         features_for_rl_logging.extend(ann_features);
         stats.ann_queries_run = ann_stats.ann_queries_run;
@@ -95,41 +88,43 @@ pub async fn run_enhanced_embedding_matching(
             0.0
         };
 
-        if let Some(pb) = method_pb { pb.finish_and_clear(); }
+        if let Some(pb) = method_pb {
+            pb.finish_and_clear();
+        }
         stats.processing_time = start_time.elapsed();
         return (matches, features_for_rl_logging, stats);
-
     } else {
         // Original O(N^2) logic for smaller clusters
         if let Some(pb) = &method_pb {
             pb.set_length(services.len() as u64 * services.len() as u64 / 2);
-            pb.set_message("Embedding Matching: Comparing all pairs...");
+            pb.set_message(format!("Embedding Matching: Comparing all pairs (RL: {})...", if rl_enabled { "on" } else { "off" }));
             pb.set_position(0);
         }
 
         let mut pair_count_for_pb = 0;
+        let mut similarities = Vec::new();
         for i in 0..services.len() {
             for j in (i + 1)..services.len() {
-                stats.pairs_compared += 1;
-                
                 // Get a fresh connection for this pair
                 let conn = match pool.get().await {
                     Ok(conn) => conn,
                     Err(e) => {
-                        warn!("Failed to get connection for embedding pair ({}, {}): {}", 
+                        warn!("Failed to get connection for embedding pair ({}, {}): {}",
                               services[i].service_id, services[j].service_id, e);
                         continue;
                     }
                 };
-                
+
                 if let Some((embedding_match, features_opt)) = match_services_by_embedding_enhanced(
-                    &*conn, // Pass the dereferenced connection
-                    &services[i], 
+                    &*conn,
+                    &services[i],
                     &services[j],
                     &service_rl_orchestrator,
                     &service_feature_cache,
                     &mut stats,
-                ).await {
+                )
+                .await
+                {
                     matches.push(embedding_match.clone());
                     similarities.push(embedding_match.confidence_score);
                     if let Some(features) = features_opt {
@@ -141,32 +136,34 @@ pub async fn run_enhanced_embedding_matching(
                         features_for_rl_logging.push((s1_id, s2_id, features));
                     }
                 }
-                
+
                 // Connection is automatically dropped here
-                
-                if let Some(pb) = &method_pb { 
+
+                if let Some(pb) = &method_pb {
                     pair_count_for_pb += 1;
                     pb.set_position(pair_count_for_pb);
                 }
             }
         }
         stats.matches_found = matches.len();
-        stats.avg_similarity = if !similarities.is_empty() { 
-            similarities.iter().sum::<f64>() / similarities.len() as f64 
-        } else { 
-            0.0 
+        stats.avg_similarity = if !similarities.is_empty() {
+            similarities.iter().sum::<f64>() / similarities.len() as f64
+        } else {
+            0.0
         };
         stats.processing_time = start_time.elapsed();
-        
+
         info!(
-            "Enhanced embedding matching completed: {} matches from {} pairs in {:.2?} (RL enabled: {})",
+            "Enhanced embedding matching completed: {} matches from {} pairs in {:.2?} (RL: {})",
             stats.matches_found,
             stats.pairs_compared,
             stats.processing_time,
-            service_rl_orchestrator.is_some()
+            if rl_enabled { "enabled" } else { "disabled" }
         );
-        
-        if let Some(pb) = method_pb { pb.finish_and_clear(); }
+
+        if let Some(pb) = method_pb {
+            pb.finish_and_clear();
+        }
 
         (matches, features_for_rl_logging, stats)
     }
@@ -262,7 +259,7 @@ async fn run_ann_embedding_matching(
             }
         });
 
-        let (dimension, service_id_to_idx, idx_to_service_info) = {
+        let (dimension, _service_id_to_idx, _idx_to_service_info) = {
             let mut first_embedding_dim = 0;
             let mut service_id_to_idx_map = HashMap::new();
             let mut idx_to_service_info_map = HashMap::new();
@@ -359,7 +356,7 @@ async fn run_ann_embedding_matching(
     };
 
     // Create service lookup maps
-    let (service_id_to_idx, idx_to_service_info) = {
+    let (_service_id_to_idx, idx_to_service_info) = {
         let mut service_id_to_idx_map = HashMap::new();
         let mut idx_to_service_info_map = HashMap::new();
 
@@ -419,8 +416,10 @@ async fn run_ann_embedding_matching(
             };
 
             let mut query_builder = reader_for_query.nns(K_NEAREST_NEIGHBORS);
-            query_builder.search_k(NonZeroUsize::new(K_NEAREST_NEIGHBORS * NUM_ARROY_TREES.get() * ARROY_SEARCH_MULTIPLIER.get()).unwrap());
-
+            if let Some(search_k) = NonZeroUsize::new(K_NEAREST_NEIGHBORS * NUM_ARROY_TREES.get() * ARROY_SEARCH_MULTIPLIER.get()) {
+                query_builder.search_k(search_k);
+            }
+            
             query_builder.by_vector(&rtxn_for_query, &query_embedding_unwrapped)
                 .map_err(|e| anyhow::anyhow!("Failed to query arroy in blocking task: {}", e))
         }).await;
@@ -472,8 +471,6 @@ async fn run_ann_embedding_matching(
                                 features_for_rl_logging.push((s1_id, s2_id, features));
                             }
                         }
-                        
-                        // Connection is automatically dropped here
                     }
                 }
             },
@@ -494,7 +491,7 @@ async fn run_ann_embedding_matching(
     (matches, features_for_rl_logging, stats)
 }
 
-/// Enhanced embedding similarity matching with better context and RL integration
+/// Enhanced embedding similarity matching with better context and conditional RL integration.
 async fn match_services_by_embedding_enhanced(
     conn: &tokio_postgres::Client,
     service1: &ServiceInfo,
@@ -509,17 +506,18 @@ async fn match_services_by_embedding_enhanced(
             return None;
         }
 
-        stats.pairs_compared += 1;
+        // Note: The stats.pairs_compared is now handled in the calling functions (O(N^2) or ANN)
+        // to avoid double counting.
 
         if let Ok(similarity) = cosine_similarity_candle(emb1, emb2) {
             if similarity >= SERVICE_EMBEDDING_SIMILARITY_THRESHOLD {
                 let name_boost = if let (Some(name1), Some(name2)) = (&service1.name, &service2.name) {
                     let name_sim = calculate_string_similarity_enhanced(name1, name2);
-                    if name_sim > 0.7 { 
+                    if name_sim > 0.7 {
                         stats.contextual_boosts += 1;
-                        0.05 
-                    } else { 
-                        0.0 
+                        0.05
+                    } else {
+                        0.0
                     }
                 } else {
                     0.0
@@ -527,44 +525,71 @@ async fn match_services_by_embedding_enhanced(
 
                 let pre_rl_confidence = (similarity + name_boost).min(0.98);
                 let mut captured_features: Option<Vec<f64>> = None;
+                let rl_enabled = service_rl_orchestrator.is_some();
 
-                // RL Integration with connection-based feature extraction
-                let final_confidence = if let Some(rl_orchestrator_arc) = service_rl_orchestrator {
-                    let context_features_res = if let Some(cache_arc) = service_feature_cache {
-                        let mut cache_guard = cache_arc.lock().await;
-                        cache_guard.get_pair_features(conn, &service1.service_id, &service2.service_id).await
-                    } else {
-                        crate::rl::service_feature_extraction::extract_service_context_for_pair(
-                            conn, &service1.service_id, &service2.service_id
-                        ).await
-                    };
+                // MODIFIED: Conditional RL Integration
+                let final_confidence = if rl_enabled {
+                    if let Some(rl_orchestrator_arc) = service_rl_orchestrator {
+                        // Extract features (always useful for caching)
+                        let context_features_res = if let Some(cache_arc) = service_feature_cache {
+                            let mut cache_guard = cache_arc.lock().await;
+                            cache_guard.get_pair_features(conn, &service1.service_id, &service2.service_id).await
+                        } else {
+                            crate::rl::service_feature_extraction::extract_service_context_for_pair(
+                                conn, &service1.service_id, &service2.service_id
+                            ).await
+                        };
 
-                    if let Ok(features) = context_features_res {
-                        captured_features = Some(features.clone());
-                        let rl_guard = rl_orchestrator_arc.lock().await;
-                        match rl_guard.get_tuned_confidence(
-                            &MatchMethodType::ServiceEmbeddingSimilarity,
-                            pre_rl_confidence,
-                            &features,
-                        ) {
-                            Ok(tuned_conf) => {
-                                debug!("RL tuned confidence for embedding match ({}, {}): {:.3} -> {:.3}",
-                                       service1.service_id, service2.service_id, pre_rl_confidence, tuned_conf);
-                                tuned_conf
+                        if let Ok(features) = context_features_res {
+                            captured_features = Some(features.clone());
+                            let rl_guard = rl_orchestrator_arc.lock().await;
+                            match rl_guard.get_tuned_confidence(
+                                &MatchMethodType::ServiceEmbeddingSimilarity,
+                                pre_rl_confidence,
+                                &features,
+                            ) {
+                                Ok(tuned_conf) => {
+                                    debug!("RL tuned confidence for embedding match ({}, {}): {:.3} -> {:.3}",
+                                           service1.service_id, service2.service_id, pre_rl_confidence, tuned_conf);
+                                    tuned_conf
+                                }
+                                Err(e) => {
+                                    warn!("Failed to get tuned confidence: {}. Using pre-RL confidence.", e);
+                                    pre_rl_confidence
+                                }
                             }
-                            Err(e) => {
-                                warn!("Failed to get tuned confidence: {}. Using pre-RL confidence.", e);
-                                pre_rl_confidence
-                            }
+                        } else {
+                            warn!("Failed to extract features for service pair ({}, {}): {}. Using pre-RL confidence.",
+                                  service1.service_id, service2.service_id, context_features_res.unwrap_err());
+                            pre_rl_confidence
                         }
                     } else {
-                        warn!("Failed to extract features for service pair ({}, {}): {}. Using pre-RL confidence.", 
-                                service1.service_id, service2.service_id, context_features_res.unwrap_err());
+                        // This shouldn't happen if rl_enabled is true, but handle gracefully
+                        warn!("RL enabled but no orchestrator available, using pre-RL confidence");
                         pre_rl_confidence
                     }
                 } else {
+                    // RL disabled - still extract features for caching if cache is available
+                    if let Some(cache_arc) = service_feature_cache {
+                        let context_features_res = {
+                            let mut cache_guard = cache_arc.lock().await;
+                            cache_guard.get_pair_features(conn, &service1.service_id, &service2.service_id).await
+                        };
+
+                        if let Ok(features) = context_features_res {
+                            captured_features = Some(features);
+                            debug!("Extracted features for caching (RL disabled) for pair ({}, {})",
+                                   service1.service_id, service2.service_id);
+                        }
+                    }
                     pre_rl_confidence
                 };
+
+                debug!(
+                    "Embedding match: {} <-> {} (similarity: {:.3}, pre-RL: {:.3}, final: {:.3}, RL: {})",
+                    service1.service_id, service2.service_id, similarity, pre_rl_confidence, final_confidence,
+                    if rl_enabled { "enabled" } else { "disabled" }
+                );
 
                 return Some((ServiceMatch {
                     service_id_1: service1.service_id.clone(),

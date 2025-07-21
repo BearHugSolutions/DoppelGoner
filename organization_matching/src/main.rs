@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use dedupe_lib::clustering::entity_clustering::run_entity_clustering;
-use dedupe_lib::entity_identification::{identify_entities, link_and_update_entity_features};
-use dedupe_lib::matching::manager::run_entity_matching_pipeline;
+use dedupe_lib::entity_identification::{identify_entities_with_filter, link_and_update_entity_features};
+use dedupe_lib::matching::manager::run_entity_matching_pipeline_with_filter;
 use dedupe_lib::rl::extract_and_store_all_contextual_features;
 use dedupe_lib::rl::feature_cache::{create_shared_cache, SharedFeatureCache};
 use dedupe_lib::rl::orchestrator::RLOrchestrator;
@@ -10,10 +10,11 @@ use dedupe_lib::utils::db_connect::{connect, get_pool_status};
 use dedupe_lib::utils::get_memory_usage;
 use dedupe_lib::utils::progress_bars::progress_config::ProgressConfig;
 use dedupe_lib::utils::{env::load_env, instantiate_run::create_initial_pipeline_run};
+use dedupe_lib::utils::contributor_filter::ContributorFilterConfig; // NEW: Add contributor filter
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::info;
 use std::collections::HashMap;
-use std::sync::Arc; // Import Arc
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -25,8 +26,11 @@ async fn main() -> Result<()> {
     info!("Starting HSDS organization grouping and clustering pipeline");
     load_env();
 
+    // NEW: Load and validate contributor filter configuration
+    let contributor_filter = ContributorFilterConfig::from_env();
+    contributor_filter.log_config();
+
     // Load progress configuration from environment
-    // Wrap progress_config in an Arc so it can be shared and cloned for multiple async tasks/closures
     let progress_config_arc = Arc::new(ProgressConfig::from_env());
     info!(
         "Progress tracking: enabled={}, detailed={}",
@@ -56,12 +60,20 @@ async fn main() -> Result<()> {
     let pool = connect().await.context("Failed to connect to database")?;
     info!("Successfully connected to the database");
 
+    // NEW: Validate contributor configuration against database
+    contributor_filter.validate_contributors(&pool).await
+        .context("Failed to validate contributor configuration")?;
+
     info!("Instantiating variables for run");
     let mut phase_times = HashMap::new();
     let run_id_uuid = Uuid::new_v4();
     let run_id = run_id_uuid.to_string();
     let run_timestamp = Utc::now().naive_utc();
-    let description = Some("Regular pipeline run with progress tracking".to_string());
+    let description = if contributor_filter.is_active() {
+        Some(format!("Pipeline run with contributor filtering: {:?}", contributor_filter.allowed_contributors))
+    } else {
+        Some("Regular pipeline run with progress tracking".to_string())
+    };
 
     let mut stats =
         create_initial_pipeline_run(&pool, &run_id, run_timestamp, description.as_deref())
@@ -72,17 +84,14 @@ async fn main() -> Result<()> {
         run_id
     );
 
-    // Helper closure to update progress message with common stats.
-    // This closure now takes owned copies of ProgressBar, Arc<ProgressConfig>, and PgPool.
-    // When called, the actual variables `main_pb`, `progress_config_arc`, and `pool` will be cloned
-    // and those clones moved into the async block.
+    // Helper closure to update progress message with common stats
     let update_main_pb_message = |
-        pb_clone: ProgressBar, // Take an owned clone of the ProgressBar
-        phase_name: String,    // Take an owned String for phase_name
+        pb_clone: ProgressBar,
+        phase_name: String,
         current_step: usize,
-        config_arc: Arc<ProgressConfig>, // Take an Arc clone
-        db_pool_clone: dedupe_lib::utils::db_connect::PgPool // Take an owned clone of the Pool
-    | async move { // The async block owns all its captured variables
+        config_arc: Arc<ProgressConfig>,
+        db_pool_clone: dedupe_lib::utils::db_connect::PgPool
+    | async move {
         if config_arc.should_show_memory() || config_arc.should_show_db_connection_stats() {
             let mut parts = Vec::new();
             if config_arc.should_show_memory() {
@@ -90,7 +99,7 @@ async fn main() -> Result<()> {
                 parts.push(format!("Memory: {} MB", memory_mb));
             }
             if config_arc.should_show_db_connection_stats() {
-                let (size, available, recycled) = get_pool_status(&db_pool_clone);
+                let (size, available, _recycled) = get_pool_status(&db_pool_clone);
                 parts.push(format!("DB: {}/{} (used/total)", size - available, size));
             }
             pb_clone.set_message(format!("{}: {} ({})", phase_name, current_step, parts.join(", ")));
@@ -99,10 +108,8 @@ async fn main() -> Result<()> {
         }
     };
 
-
-    // Phase 1: Entity Identification & Feature Linking
+    // Phase 1: Entity Identification & Feature Linking (WITH CONTRIBUTOR FILTERING)
     if let Some(pb) = &main_pb {
-        // Clone `pb`, `progress_config_arc`, and `pool` for this specific call to the closure
         update_main_pb_message(
             pb.clone(),
             "Phase 1: Entity identification and feature linking".to_string(),
@@ -115,9 +122,10 @@ async fn main() -> Result<()> {
 
     info!("Phase 1: Entity identification and feature linking starting...");
 
-    let total_entities = identify_entities(&pool, multi_progress.clone())
+    // NEW: Use filtered entity identification
+    let total_entities = identify_entities_with_filter(&pool, multi_progress.clone(), Some(&contributor_filter))
         .await
-        .context("Failed to identify entities")?;
+        .context("Failed to identify entities with contributor filter")?;
     stats.total_entities = total_entities;
 
     let total_entity_features = link_and_update_entity_features(&pool, multi_progress.clone())
@@ -185,7 +193,7 @@ async fn main() -> Result<()> {
         ).await;
     }
 
-    // Phase 3: Entity Matching
+    // Phase 3: Entity Matching (WITH CONTRIBUTOR FILTERING)
     if let Some(pb) = &main_pb {
         update_main_pb_message(
             pb.clone(),
@@ -203,12 +211,14 @@ async fn main() -> Result<()> {
         .context("Failed to initialize entity RLOrchestrator")?;
     let entity_matching_orchestrator = Arc::new(Mutex::new(entity_matching_orchestrator_instance));
 
-    let (total_groups, method_stats_match) = run_entity_matching_pipeline(
+    // NEW: Use filtered matching pipeline
+    let (total_groups, method_stats_match) = run_entity_matching_pipeline_with_filter(
         &pool,
         entity_matching_orchestrator.clone(),
         stats.run_id.clone(),
         entity_feature_cache.clone(),
         multi_progress.clone(),
+        Some(&contributor_filter), // Pass contributor filter
     )
     .await?;
 
@@ -267,7 +277,7 @@ async fn main() -> Result<()> {
             progress_config_arc.clone(),
             pool.clone(),
         ).await;
-        pb.finish(); // Finish the main progress bar
+        pb.finish();
     }
 
     // Print comprehensive summary
@@ -275,6 +285,9 @@ async fn main() -> Result<()> {
 
     info!("=== Pipeline Summary ===");
     info!("Run ID: {}", run_id);
+    if contributor_filter.is_active() {
+        info!("🔍 Contributor Filter: ACTIVE ({:?})", contributor_filter.allowed_contributors);
+    }
     info!("Total entities: {}", stats.total_entities);
     info!("Total entity features: {}", stats.total_entity_features);
     info!("Total groups created: {}", stats.total_groups);
@@ -286,7 +299,6 @@ async fn main() -> Result<()> {
     info!("Phase 4 (Clustering): {:.2?}", phase4_duration);
     info!("Total execution time: {:.2?}", total_time);
 
-    // Use the original `progress_config_arc` here after all calls
     if progress_config_arc.should_show_memory() {
         let final_memory_mb = get_memory_usage().await;
         info!("Final memory usage: {} MB", final_memory_mb);

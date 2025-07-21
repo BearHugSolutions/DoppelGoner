@@ -1,4 +1,4 @@
-// src/matching/name.rs - Progress Callback Integration (Complex Method)
+// src/matching/name.rs - Progress Callback and Contributor Filtering Integration
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, warn};
@@ -17,13 +17,13 @@ use crate::models::stats_models::{MatchMethodStats, MatchMethodType};
 use crate::rl::orchestrator::RLOrchestrator;
 use crate::rl::SharedFeatureCache;
 use crate::utils::db_connect::PgPool;
-use crate::utils::progress_bars::logging::MatchingLogger; // Import the new logger
+use crate::utils::progress_bars::logging::MatchingLogger;
 use crate::utils::pipeline_state::{
     batch_check_comparison_cache, batch_get_current_signatures_for_pairs,
     batch_store_in_comparison_cache, ComparisonCacheEntry, EntitySignature as SignatureData,
-    batch_check_entity_completion_status, // NEW
-    batch_mark_entity_completion,         // NEW
-    EntityCompletionCheck,                // NEW
+    batch_check_entity_completion_status,
+    batch_mark_entity_completion,
+    EntityCompletionCheck,
 };
 use crate::{
     matching::db::{
@@ -32,13 +32,15 @@ use crate::{
     },
     models::core::Entity,
     utils::candle::cosine_similarity_candle,
-    utils::constants::MAX_DISTANCE_FOR_SAME_CITY_METERS, // Import the new constant
+    utils::constants::MAX_DISTANCE_FOR_SAME_CITY_METERS,
 };
-use tokio_postgres::GenericClient; // For get_all_entities_with_names_and_locations_filtered
-
-// NEW IMPORTS: Progress callback functionality
+use tokio_postgres::GenericClient;
 use crate::utils::progress_bars::progress_callback::ProgressCallback;
 use crate::{update_progress, update_detailed_progress};
+
+// NEW: Import for contributor filtering
+use crate::utils::contributor_filter::ContributorFilterConfig;
+use tokio_postgres::types::ToSql;
 
 const MIN_FUZZY_SIMILARITY_THRESHOLD: f32 = 0.94;
 const MIN_SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.80;
@@ -48,8 +50,8 @@ const SEMANTIC_WEIGHT: f32 = 0.7;
 pub const MIN_TOKEN_OVERLAP: usize = 2;
 pub const MIN_TOKEN_LENGTH: usize = 2;
 
-const BATCH_SIZE: usize = 100; // Batch size for processing pairs in memory
-const BATCH_DB_OPS_SIZE: usize = 500; // Batch size for database operations
+const BATCH_SIZE: usize = 100;
+const BATCH_DB_OPS_SIZE: usize = 500;
 const MAX_CONCURRENT_BATCHES: usize = 5;
 const MAX_CANDIDATES_PER_ENTITY: usize = 50;
 const MAX_TOTAL_CANDIDATE_PAIRS: usize = 100_000;
@@ -78,19 +80,19 @@ pub const STOPWORDS: [&str; 132] = [
 
 #[derive(Clone)]
 pub struct EntityNameData {
-    pub entity: Entity, // Keep the original Entity for ID and original name
+    pub entity: Entity,
     pub normalized_name: String,
-    pub entity_type: Option<&'static str>, // Detected type
-    pub tokens: HashSet<String>,           // For quick overlap checks
-    pub latitude: Option<f64>, // Added latitude
-    pub longitude: Option<f64>, // Added longitude
+    pub entity_type: Option<&'static str>,
+    pub tokens: HashSet<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
 }
 
 #[derive(Clone)]
 struct SharedNameMatchingData {
     existing_entity_group_pairs: Arc<HashSet<(String, String)>>,
     org_embeddings_map: Arc<HashMap<String, Option<Vec<f32>>>>,
-    entity_data: Arc<Vec<EntityNameData>>, // Arc for shared access
+    entity_data: Arc<Vec<EntityNameData>>,
 }
 
 struct NameMatchingStats {
@@ -101,14 +103,14 @@ struct NameMatchingStats {
     cache_hits_count: usize,
     feature_extraction_count: usize,
     feature_extraction_failures: usize,
-    pairs_processed: usize, // Total pairs considered for detailed comparison
-    feature_extraction_attempted: usize, // Added for tracking
-    feature_extraction_success: usize, // Added for tracking
-    pairs_with_fuzzy_scores: usize, // Added for tracking fuzzy scores
-    avg_fuzzy_score: f64, // Added for tracking avg fuzzy score
-    pairs_above_fuzzy_threshold: usize, // Added for tracking pairs above fuzzy threshold
-    entities_skipped_complete: usize, // NEW: For completion tracking
-    entities_total_potential: usize,  // NEW: For completion tracking
+    pairs_processed: usize,
+    feature_extraction_attempted: usize,
+    feature_extraction_success: usize,
+    pairs_with_fuzzy_scores: usize,
+    avg_fuzzy_score: f64,
+    pairs_above_fuzzy_threshold: usize,
+    entities_skipped_complete: usize,
+    entities_total_potential: usize,
 }
 
 impl Default for NameMatchingStats {
@@ -127,38 +129,43 @@ impl Default for NameMatchingStats {
             pairs_with_fuzzy_scores: 0,
             avg_fuzzy_score: 0.0,
             pairs_above_fuzzy_threshold: 0,
-            entities_skipped_complete: 0, // NEW
-            entities_total_potential: 0,  // NEW
+            entities_skipped_complete: 0,
+            entities_total_potential: 0,
         }
     }
 }
 
-/// Internal struct to hold data for a pair that needs to be processed,
-/// including all information required for DB upsert and decision detail insert.
 struct PairToProcessName {
-    entity_id_1: String, // Ordered
-    entity_id_2: String, // Ordered
+    entity_id_1: String,
+    entity_id_2: String,
     match_values: MatchValues,
     pre_rl_confidence_score: f64,
-    final_confidence_score: f64, // Can be updated by RL
+    final_confidence_score: f64,
     features_for_snapshot: Option<Vec<f64>>,
     original_signature_1: Option<SignatureData>,
     original_signature_2: Option<SignatureData>,
     comparison_cache_hit: bool,
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
-pub async fn find_matches(
+// NEW: Filtered version of find_matches
+pub async fn find_matches_with_filter(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedFeatureCache>,
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
+    progress_callback: Option<ProgressCallback>,
+    contributor_filter: Option<&ContributorFilterConfig>, // NEW PARAMETER
 ) -> Result<AnyMatchResult> {
-    let logger = MatchingLogger::new(MatchMethodType::Name); // Initialize logger
+    let logger = MatchingLogger::new(MatchMethodType::Name);
     logger.log_start(pipeline_run_id, reinforcement_orchestrator_option.is_some());
 
-    // PROGRESS UPDATE: Starting phase
+    // Log filtering status
+    if let Some(filter) = contributor_filter {
+        if filter.is_active() {
+            info!("👤 Name matching with contributor filtering: {:?}", filter.allowed_contributors);
+        }
+    }
+
     update_progress!(progress_callback, "Starting", "Initializing name matching");
 
     let initial_memory = get_memory_usage().await;
@@ -172,7 +179,6 @@ pub async fn find_matches(
     logger.log_phase("Loading data", Some("querying all potential entities with names"));
     update_progress!(progress_callback, "Loading data", "querying entities with names");
 
-    // NEW: First get all potential entity IDs
     let all_potential_entity_ids_query = "
         SELECT DISTINCT e.id
         FROM public.entity e
@@ -188,11 +194,9 @@ pub async fn find_matches(
         .collect();
     logger.log_debug(&format!("Name: Found {} entities with names", all_potential_entity_ids.len()));
 
-    // PROGRESS UPDATE: Potential entities found
     update_progress!(progress_callback, "Loading data", 
         format!("Found {} entities with names", all_potential_entity_ids.len()));
 
-    // Check completion status
     update_progress!(progress_callback, "Loading data", "checking completion status");
     let completion_status = batch_check_entity_completion_status(
         pool,
@@ -200,7 +204,6 @@ pub async fn find_matches(
         &MatchMethodType::Name
     ).await?;
 
-    // Filter out completed entities
     let incomplete_entity_ids: Vec<String> = completion_status
         .iter()
         .filter_map(|(entity_id, status)| {
@@ -220,11 +223,9 @@ pub async fn find_matches(
         incomplete_entity_ids.len()
     ));
 
-    // PROGRESS UPDATE: Completion status results
     update_progress!(progress_callback, "Loading data", 
         format!("{} to process ({} already complete)", incomplete_entity_ids.len(), completed_count));
 
-    // Initialize stats with total potential entities and skipped count
     let stats_arc = Arc::new(Mutex::new(NameMatchingStats {
         entities_total_potential: all_potential_entity_ids.len(),
         entities_skipped_complete: completed_count,
@@ -232,11 +233,10 @@ pub async fn find_matches(
     }));
 
     if incomplete_entity_ids.is_empty() {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No incomplete entities to process");
         
-        logger.log_completion(0, 0, 0.0, 0); // Log with 0 new groups
-        let final_stats_guard = stats_arc.lock().await; // Lock here to access stats
+        logger.log_completion(0, 0, 0.0, 0);
+        let final_stats_guard = stats_arc.lock().await;
         return Ok(AnyMatchResult::Name(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -245,29 +245,30 @@ pub async fn find_matches(
                 entities_matched: 0,
                 avg_confidence: 0.0,
                 avg_group_size: 0.0,
-                entities_skipped_complete: final_stats_guard.entities_skipped_complete, // Pass skipped count
-                entities_total: final_stats_guard.entities_total_potential,           // Pass total potential
+                entities_skipped_complete: final_stats_guard.entities_skipped_complete,
+                entities_total: final_stats_guard.entities_total_potential,
             },
         }));
     }
 
-    // Load only incomplete entities
+    // Load only incomplete entities WITH FILTERING
     update_progress!(progress_callback, "Loading data", "querying detailed entity data");
-    let all_entities_with_names_vec = get_all_entities_with_names_and_locations_filtered(&*initial_conn, &incomplete_entity_ids).await?;
+    let all_entities_with_names_vec = get_all_entities_with_names_and_locations_filtered_with_contributors(
+        &*initial_conn, 
+        &incomplete_entity_ids,
+        contributor_filter
+    ).await?;
     let total_entities = all_entities_with_names_vec.len();
     logger.log_data_loaded(total_entities, "entity name");
 
-    // PROGRESS UPDATE: Data loaded
     update_progress!(progress_callback, "Loading data", 
         format!("Loaded {} entity records", total_entities));
 
     if total_entities < 2 {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "Not enough entities to form pairs");
         
         logger.log_completion(0, 0, 0.0, 0);
-        // Not enough entities to form pairs
-        let final_stats_guard = stats_arc.lock().await; // Lock here to access stats
+        let final_stats_guard = stats_arc.lock().await;
         return Ok(AnyMatchResult::Name(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -276,8 +277,8 @@ pub async fn find_matches(
                 entities_matched: 0,
                 avg_confidence: 0.0,
                 avg_group_size: 0.0,
-                entities_skipped_complete: final_stats_guard.entities_skipped_complete, // Pass skipped count
-                entities_total: final_stats_guard.entities_total_potential,           // Pass total potential
+                entities_skipped_complete: final_stats_guard.entities_skipped_complete,
+                entities_total: final_stats_guard.entities_total_potential,
             },
         }));
     }
@@ -289,7 +290,6 @@ pub async fn find_matches(
         Arc::new(fetch_existing_entity_group_pairs(&*initial_conn, MatchMethodType::Name).await?);
     logger.log_existing_pairs(existing_entity_group_pairs.len());
 
-    // PROGRESS UPDATE: Existing pairs loaded
     update_progress!(progress_callback, "Loading existing pairs", 
         format!("Found {} existing pairs", existing_entity_group_pairs.len()));
 
@@ -298,9 +298,8 @@ pub async fn find_matches(
     
     let org_embeddings_map =
         Arc::new(get_organization_embeddings(&*initial_conn, &all_entities_with_names_vec).await?);
-    drop(initial_conn); // Release connection
+    drop(initial_conn);
 
-    // PROGRESS UPDATE: Embeddings loaded
     update_progress!(progress_callback, "Loading embeddings", 
         format!("Loaded embeddings for {} organizations", org_embeddings_map.len()));
 
@@ -308,14 +307,13 @@ pub async fn find_matches(
     update_progress!(progress_callback, "Processing entities", "normalizing names and building index");
     
     let stopwords: HashSet<String> = STOPWORDS.iter().map(|&s| s.to_string()).collect();
-    let (entity_data_vec, token_to_entities_idx_map, _) = // Removed token_stats as it's not directly used in pair generation logic here
+    let (entity_data_vec, token_to_entities_idx_map, _) =
         prepare_entity_data_and_index(&all_entities_with_names_vec, &stopwords).await;
 
     let entity_data_arc = Arc::new(entity_data_vec);
-    let groups_with_multiple = entity_data_arc.len(); // All entities are potential groups
+    let groups_with_multiple = entity_data_arc.len();
     logger.log_processing_complete(total_entities, entity_data_arc.len(), groups_with_multiple);
 
-    // PROGRESS UPDATE: Processing complete
     update_progress!(progress_callback, "Processing entities", 
         format!("Processed {} entities into searchable index", entity_data_arc.len()));
 
@@ -326,18 +324,16 @@ pub async fn find_matches(
         generate_candidate_pairs_indices_limited(&entity_data_arc, &token_to_entities_idx_map, progress_callback.clone())
             .await?;
     let total_conceptual_pairs = candidate_pairs_indices.len();
-    logger.log_pair_generation(total_conceptual_pairs, groups_with_multiple); // groups_with_multiple is total entities in this context for names
+    logger.log_pair_generation(total_conceptual_pairs, groups_with_multiple);
 
-    // PROGRESS UPDATE: Pair generation complete
     update_progress!(progress_callback, "Generating pairs", 
         format!("{} candidate pairs generated", total_conceptual_pairs));
 
     if total_conceptual_pairs == 0 {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No candidate pairs generated");
         
         logger.log_completion(0, 0, 0.0, 0);
-        let final_stats_guard = stats_arc.lock().await; // Lock here to access stats
+        let final_stats_guard = stats_arc.lock().await;
         return Ok(AnyMatchResult::Name(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -346,13 +342,13 @@ pub async fn find_matches(
                 entities_matched: 0,
                 avg_confidence: 0.0,
                 avg_group_size: 0.0,
-                entities_skipped_complete: final_stats_guard.entities_skipped_complete, // Pass skipped count
-                entities_total: final_stats_guard.entities_total_potential,           // Pass total potential
+                entities_skipped_complete: final_stats_guard.entities_skipped_complete,
+                entities_total: final_stats_guard.entities_total_potential,
             },
         }));
     }
 
-    logger.log_phase("Evaluating pairs with RL confidence tuning", None); // This phase now covers full evaluation
+    logger.log_phase("Evaluating pairs with RL confidence tuning", None);
     update_progress!(progress_callback, "Evaluating pairs", "starting batch processing with RL confidence tuning");
     
     let shared_data = SharedNameMatchingData {
@@ -361,8 +357,6 @@ pub async fn find_matches(
         entity_data: entity_data_arc,
     };
 
-    // Pass a clone of the Arc to the processing function.
-    // The original stats_arc will be unwrapped after this function returns.
     process_candidate_pairs_in_batches(
         candidate_pairs_indices,
         shared_data,
@@ -370,16 +364,14 @@ pub async fn find_matches(
         reinforcement_orchestrator_option,
         pipeline_run_id,
         feature_cache,
-        completion_status, // Pass completion_status
-        stats_arc.clone(), // Pass the Arc<Mutex<NameMatchingStats>>
-        progress_callback.clone(), // NEW: Pass progress callback
+        completion_status,
+        stats_arc.clone(),
+        progress_callback.clone(),
     )
     .await?;
 
-    // Now that all processing (and thus all other Arc clones) are complete,
-    // we can safely unwrap the original stats_arc to get the final statistics.
     let final_stats = Arc::try_unwrap(stats_arc)
-        .map_err(|_| anyhow::anyhow!("Failed to unwrap stats mutex for final return (should be sole owner after all tasks complete)"))?
+        .map_err(|_| anyhow::anyhow!("Failed to unwrap stats mutex for final return"))?
         .into_inner();
 
     let final_memory = get_memory_usage().await;
@@ -406,19 +398,19 @@ pub async fn find_matches(
         } else {
             0.0
         },
-        entities_skipped_complete: final_stats.entities_skipped_complete, // Pass skipped count
-        entities_total: final_stats.entities_total_potential,           // Pass total potential
+        entities_skipped_complete: final_stats.entities_skipped_complete,
+        entities_total: final_stats.entities_total_potential,
     };
 
     logger.log_completion(
         method_stats.groups_created,
         method_stats.entities_matched,
         avg_confidence,
-        final_stats.pairs_processed, // Use the total pairs processed from the shared stats
+        final_stats.pairs_processed,
     );
     logger.log_performance_summary(
-        final_stats.cache_hits_count, // Use from shared stats
-        final_stats.individual_operation_errors, // Use from shared stats
+        final_stats.cache_hits_count,
+        final_stats.individual_operation_errors,
         Some((final_stats.feature_extraction_attempted, final_stats.feature_extraction_success, final_stats.feature_extraction_failures))
     );
     if final_stats.pairs_with_fuzzy_scores > 0 {
@@ -428,7 +420,6 @@ pub async fn find_matches(
         ));
     }
 
-    // FINAL PROGRESS UPDATE: Completion
     update_progress!(progress_callback, "Completed", 
         format!("{} name groups created, {} entities matched", 
                 method_stats.groups_created, method_stats.entities_matched));
@@ -439,7 +430,24 @@ pub async fn find_matches(
     }))
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
+// Keep original function for backward compatibility
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>,
+    progress_callback: Option<ProgressCallback>,
+) -> Result<AnyMatchResult> {
+    find_matches_with_filter(
+        pool,
+        reinforcement_orchestrator_option,
+        pipeline_run_id,
+        feature_cache,
+        progress_callback,
+        None, // No filtering
+    ).await
+}
+
 async fn process_candidate_pairs_in_batches(
     candidate_pairs_indices: Vec<(usize, usize)>,
     shared_data: SharedNameMatchingData,
@@ -447,10 +455,10 @@ async fn process_candidate_pairs_in_batches(
     reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedFeatureCache>,
-    completion_status: HashMap<String, EntityCompletionCheck>, // NEW PARAMETER
-    stats_mutex: Arc<Mutex<NameMatchingStats>>,              // Pass the Arc
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
-) -> Result<()> { // Changed return type to Result<()>
+    completion_status: HashMap<String, EntityCompletionCheck>,
+    stats_mutex: Arc<Mutex<NameMatchingStats>>,
+    progress_callback: Option<ProgressCallback>,
+) -> Result<()> {
     let total_pairs = candidate_pairs_indices.len();
     let total_conceptual_batches = (total_pairs + BATCH_SIZE - 1) / BATCH_SIZE;
     debug!(
@@ -458,11 +466,9 @@ async fn process_candidate_pairs_in_batches(
         total_pairs, BATCH_SIZE
     );
 
-    // PROGRESS UPDATE: Batch processing start
     update_progress!(progress_callback, "Batch processing", 
         format!("Processing {} pairs in {} batches", total_pairs, total_conceptual_batches));
 
-    // Create progress bar for batch processing
     let batch_pb = ProgressBar::new(total_conceptual_batches as u64);
     batch_pb.set_style(
         ProgressStyle::default_bar()
@@ -473,9 +479,8 @@ async fn process_candidate_pairs_in_batches(
             .progress_chars("█▉▊▋▌▍▎▏  "),
     );
 
-    // stats_mutex is already Arc'd and passed in, so no need to create a new one here
     let processed_pairs_this_run = Arc::new(Mutex::new(HashSet::<(String, String)>::new()));
-    let logger = MatchingLogger::new(MatchMethodType::Name); // Local logger for batch logging
+    let logger = MatchingLogger::new(MatchMethodType::Name);
 
     for (chunk_idx, chunk) in candidate_pairs_indices
         .chunks(BATCH_SIZE * MAX_CONCURRENT_BATCHES)
@@ -491,11 +496,11 @@ async fn process_candidate_pairs_in_batches(
             let ro_option_clone = reinforcement_orchestrator_option.clone();
             let run_id_clone = pipeline_run_id.to_string();
             let feature_cache_clone = feature_cache.clone();
-            let stats_arc_clone = Arc::clone(&stats_mutex); // Use the passed in Arc
+            let stats_arc_clone = Arc::clone(&stats_mutex);
             let processed_pairs_clone = Arc::clone(&processed_pairs_this_run);
-            let logger_clone = Arc::new(logger.clone()); // Clone logger for each task
-            let completion_status_clone = completion_status.clone(); // Clone for each task
-            let progress_callback_clone = progress_callback.clone(); // NEW: Clone progress callback
+            let logger_clone = Arc::new(logger.clone());
+            let completion_status_clone = completion_status.clone();
+            let progress_callback_clone = progress_callback.clone();
 
             batch_futures.push(tokio::spawn(async move {
                 process_name_batch(
@@ -510,8 +515,8 @@ async fn process_candidate_pairs_in_batches(
                     stats_arc_clone,
                     processed_pairs_clone,
                     logger_clone,
-                    completion_status_clone, // Pass to batch processing function
-                    progress_callback_clone, // NEW: Pass progress callback
+                    completion_status_clone,
+                    progress_callback_clone,
                 )
                 .await
             }));
@@ -521,16 +526,13 @@ async fn process_candidate_pairs_in_batches(
         for (i, result) in results.iter().enumerate() {
             if let Err(e) = result {
                 logger.log_warning(&format!("Batch processing task {} panicked or failed: {}", i, e));
-                // Error already logged inside task if it's a processing error
             }
         }
 
-        batch_pb.inc(results.len() as u64); // Increment by number of batches processed in this chunk
+        batch_pb.inc(results.len() as u64);
 
-        // Log batch progress
         logger.log_batch_progress(chunk_idx + 1, total_conceptual_batches / MAX_CONCURRENT_BATCHES, chunk.len() * MAX_CONCURRENT_BATCHES);
 
-        // PROGRESS UPDATE: Batch chunk progress
         if chunk_idx % 5 == 0 {
             let current_memory = get_memory_usage().await;
             let stats_guard = stats_mutex.lock().await;
@@ -543,7 +545,6 @@ async fn process_candidate_pairs_in_batches(
                 stats_guard.feature_extraction_success
             ));
             
-            // PROGRESS UPDATE: Detailed batch progress
             update_detailed_progress!(progress_callback, "Batch processing", 
                 chunk_idx + 1, (candidate_pairs_indices.len() + BATCH_SIZE * MAX_CONCURRENT_BATCHES - 1) / (BATCH_SIZE * MAX_CONCURRENT_BATCHES),
                 format!("Memory: {}MB, Groups: {}", current_memory, stats_guard.new_pairs_created_count));
@@ -552,33 +553,24 @@ async fn process_candidate_pairs_in_batches(
 
     batch_pb.finish_with_message("Name batch processing complete");
 
-    // After all batches are processed, perform final completion marking
     logger.log_phase("Tracking completion status", Some("marking entities with no remaining name comparisons"));
     update_progress!(progress_callback, "Completion tracking", "marking completed entities");
 
-    let mut completion_batch: Vec<(String, MatchMethodType, String, String, i32)> = Vec::new(); // Make mutable
-    let stats_guard = stats_mutex.lock().await; // Lock stats for final aggregate and completion logic
+    let mut completion_batch: Vec<(String, MatchMethodType, String, String, i32)> = Vec::new();
+    let stats_guard = stats_mutex.lock().await;
 
-    // Iterate over all entities that were initially considered as incomplete
-    // and are part of the original candidate set for Name matching
     for (entity_id, status_check) in completion_status.iter() {
-        if !status_check.is_complete { // Only attempt to mark incomplete ones
+        if !status_check.is_complete {
             if let Some(current_sig) = &status_check.current_signature {
-                // If the entity was processed in this run and has no more pending comparisons
-                // (this logic is simplified for the example, a real system would need to track all potential pairs)
-                // For now, assume if it was considered and no new pairs for it were created, it might be complete.
-                // A more robust solution would involve tracking "potential pairs remaining".
-                // For this integration, we'll mark entities as complete if they were involved in *any* comparison
-                // in this run and their signature hasn't changed.
-                let comparison_count = stats_guard.entities_in_new_pairs.get(entity_id).map_or(0, |_| 1); // Simple check if it was involved in a new pair
+                let comparison_count = stats_guard.entities_in_new_pairs.get(entity_id).map_or(0, |_| 1);
 
-                if comparison_count > 0 { // If it participated in at least one comparison
+                if comparison_count > 0 {
                     completion_batch.push((
                         entity_id.clone(),
                         MatchMethodType::Name,
                         pipeline_run_id.to_string(),
                         current_sig.clone(),
-                        comparison_count, // Placeholder, a real count would be accumulated
+                        comparison_count,
                     ));
                 }
             }
@@ -599,14 +591,12 @@ async fn process_candidate_pairs_in_batches(
         }
     }
 
-    // No need to unwrap stats_mutex here; it's owned by the caller (find_matches)
-    Ok(()) // Return Ok(()) instead of unwrapping NameMatchingStats
+    Ok(())
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
 #[allow(clippy::too_many_arguments)]
 async fn process_name_batch(
-    _batch_num_for_log: usize, // Not strictly needed for progress bar, but useful for debugging
+    _batch_num_for_log: usize,
     _total_batches_for_log: usize,
     batch_pair_indices: Vec<(usize, usize)>,
     shared_data: SharedNameMatchingData,
@@ -616,22 +606,19 @@ async fn process_name_batch(
     feature_cache: Option<&SharedFeatureCache>,
     stats_mutex: Arc<Mutex<NameMatchingStats>>,
     processed_pairs_this_run_global: Arc<Mutex<HashSet<(String, String)>>>,
-    logger: Arc<MatchingLogger>, // Pass logger down
-    completion_status: HashMap<String, EntityCompletionCheck>, // NEW PARAMETER
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
+    logger: Arc<MatchingLogger>,
+    completion_status: HashMap<String, EntityCompletionCheck>,
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<()> {
-    // Result indicates if the task itself failed, not individual pair errors
     logger.log_debug(&format!("Processing batch ({} pairs)", batch_pair_indices.len()));
     let mut local_batch_errors = 0;
-    let mut local_fuzzy_scores: Vec<f64> = Vec::new(); // Collect fuzzy scores for this batch
+    let mut local_fuzzy_scores: Vec<f64> = Vec::new();
 
     let mut pairs_for_signature_fetch: Vec<(String, String)> = Vec::new();
     let mut pairs_to_evaluate: Vec<PairToProcessName> = Vec::new();
 
-    // Track comparison counts for entities within this specific batch
     let mut local_entity_comparison_counts: HashMap<String, i32> = HashMap::new();
 
-    // PROGRESS UPDATE: Batch processing start
     update_progress!(progress_callback, "Batch processing", 
         format!("Processing name batch with {} pairs", batch_pair_indices.len()));
 
@@ -676,7 +663,6 @@ async fn process_name_batch(
             }
         }
 
-        // Initial filtering based on incompatible types and empty names
         let original_name1 = entity1_data
             .entity
             .name
@@ -710,7 +696,6 @@ async fn process_name_batch(
             }
         }
 
-        // --- Geospatial Filtering ---
         if let (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) =
             (e1_lat, e1_lon, e2_lat, e2_lon)
         {
@@ -723,14 +708,11 @@ async fn process_name_batch(
             }
         }
 
-        // Add to list for batch signature fetch
         pairs_for_signature_fetch.push(current_pair_ordered.clone());
 
-        // Increment local comparison counts for both entities in the pair
         *local_entity_comparison_counts.entry(e1_id.clone()).or_insert(0) += 1;
         *local_entity_comparison_counts.entry(e2_id.clone()).or_insert(0) += 1;
 
-        // Prepare initial PairToProcessName
         let pair_to_proc = PairToProcessName {
             entity_id_1: current_pair_ordered.0.clone(),
             entity_id_2: current_pair_ordered.1.clone(),
@@ -738,31 +720,30 @@ async fn process_name_batch(
                 values: NameMatchDetailValues {
                     normalized_name1: normalized_name1.clone(),
                     normalized_name2: normalized_name2.clone(),
-                    fuzzy_score: Some(0.0), // Initialize with default value
-                    semantic_score: Some(0.0), // Initialize with default value
-                    pre_rl_match_type: None, // Will be set later
+                    fuzzy_score: Some(0.0),
+                    semantic_score: Some(0.0),
+                    pre_rl_match_type: None,
                 },
-                original1: original_name1.clone(), // Ensure cloning for owned data
-                original2: original_name2.clone(), // Ensure cloning for owned data
+                original1: original_name1.clone(),
+                original2: original_name2.clone(),
                 normalized_shared: format!("{} | {}", normalized_name1, normalized_name2),
                 metadata: NameMetadata {
                     normalized_name1: normalized_name1.clone(),
                     normalized_name2: normalized_name2.clone(),
-                    pre_rl_match_type: None, // Initial, will be updated
-                    features_snapshot: None, // Initial, will be updated
+                    pre_rl_match_type: None,
+                    features_snapshot: None,
                 },
             }),
-            pre_rl_confidence_score: 0.0, // Will be calculated
-            final_confidence_score: 0.0,  // Will be calculated/tuned
+            pre_rl_confidence_score: 0.0,
+            final_confidence_score: 0.0,
             features_for_snapshot: None,
             original_signature_1: None,
             original_signature_2: None,
             comparison_cache_hit: false,
         };
         pairs_to_evaluate.push(pair_to_proc);
-    } // End of initial pair collection
+    }
 
-    // --- Batch Fetch Signatures and Check Cache ---
     let signatures_map =
         batch_get_current_signatures_for_pairs(pool, &pairs_for_signature_fetch).await?;
     let mut cache_check_inputs = Vec::new();
@@ -794,21 +775,19 @@ async fn process_name_batch(
             if let Some(_cached_eval) = cache_results_map.get(&pair_key) {
                 stats_guard.cache_hits_count += 1;
                 pair_data.comparison_cache_hit = true;
-                processed_set.insert(pair_key); // Mark as processed due to cache hit
+                processed_set.insert(pair_key);
             } else {
                 pairs_for_full_evaluation.push(pair_data);
             }
         }
-    } // Release locks
+    }
 
-    // --- Full Evaluation and Batch DB Operations ---
     let mut batch_entity_group_data: Vec<EntityGroupBatchData> = Vec::new();
     let mut batch_decision_detail_data: Vec<MatchDecisionDetailBatchData> = Vec::new();
     let mut batch_cache_store_data: Vec<ComparisonCacheEntry> = Vec::new();
     let pairs_len = pairs_for_full_evaluation.len();
 
     for (pair_idx, pair_data_ref) in pairs_for_full_evaluation.iter_mut().enumerate() {
-        // PROGRESS UPDATE: Detailed pair evaluation progress
         if pair_idx % 50 == 0 {
             update_progress!(progress_callback, "Batch processing", 
                 format!("Evaluating pair {}/{} in batch", pair_idx + 1, pairs_len));
@@ -833,9 +812,8 @@ async fn process_name_batch(
         let normalized_name2 = &entity2_data.normalized_name;
 
         let fuzzy_score = jaro_winkler(normalized_name1, normalized_name2) as f32;
-        local_fuzzy_scores.push(fuzzy_score as f64); // Collect fuzzy score
+        local_fuzzy_scores.push(fuzzy_score as f64);
 
-        // Update fuzzy_score in pair_data_ref.match_values
         if let MatchValues::Name(ref mut name_detail) = pair_data_ref.match_values {
             name_detail.values.fuzzy_score = Some(fuzzy_score);
         }
@@ -875,7 +853,6 @@ async fn process_name_batch(
             _ => 0.0,
         };
 
-        // Update semantic_score in pair_data_ref.match_values
         if let MatchValues::Name(ref mut name_detail) = pair_data_ref.match_values {
             name_detail.values.semantic_score = Some(semantic_score);
         }
@@ -941,7 +918,7 @@ async fn process_name_batch(
         }
 
         pair_data_ref.pre_rl_confidence_score = pre_rl_score as f64;
-        pair_data_ref.final_confidence_score = pre_rl_score as f64; // Start with pre-RL
+        pair_data_ref.final_confidence_score = pre_rl_score as f64;
         if let MatchValues::Name(ref mut name_detail) = pair_data_ref.match_values {
             name_detail.metadata.pre_rl_match_type = Some(pre_rl_match_type_str.to_string());
             name_detail.values.pre_rl_match_type = Some(pre_rl_match_type_str.to_string());
@@ -949,9 +926,8 @@ async fn process_name_batch(
 
         if let Some(ro_arc) = reinforcement_orchestrator_option {
             {
-                // Scoped for stats_guard
                 let mut stats_guard = stats_mutex.lock().await;
-                stats_guard.feature_extraction_attempted += 1; // Increment here
+                stats_guard.feature_extraction_attempted += 1;
             }
 
             match if let Some(fc_arc) = feature_cache {
@@ -965,9 +941,8 @@ async fn process_name_batch(
             } {
                 Ok(features) => {
                     {
-                        // Scoped for stats_guard
                         let mut stats_guard = stats_mutex.lock().await;
-                        stats_guard.feature_extraction_success += 1; // Increment here
+                        stats_guard.feature_extraction_success += 1;
                     }
                     if !features.is_empty() {
                         pair_data_ref.features_for_snapshot = Some(features.clone());
@@ -1002,8 +977,7 @@ async fn process_name_batch(
             }
         }
 
-        // Prepare for batch upsert
-        let new_entity_group_id_str = Uuid::new_v4().to_string(); // Generate ID upfront
+        let new_entity_group_id_str = Uuid::new_v4().to_string();
         batch_entity_group_data.push(EntityGroupBatchData {
             proposed_id: new_entity_group_id_str.clone(),
             entity_id_1: ordered_e1_id.clone(),
@@ -1014,7 +988,6 @@ async fn process_name_batch(
             match_values: pair_data_ref.match_values.clone(),
         });
 
-        // Prepare data for batch cache store (MATCH outcome)
         if let (Some(s1_data), Some(s2_data)) = (
             &pair_data_ref.original_signature_1,
             &pair_data_ref.original_signature_2,
@@ -1034,9 +1007,8 @@ async fn process_name_batch(
                     .map(|f| serde_json::to_value(f).unwrap_or_default()),
             });
         }
-    } // End of loop through pairs_for_full_evaluation
+    }
 
-    // Aggregate local fuzzy scores into global stats
     {
         let mut stats_guard = stats_mutex.lock().await;
         stats_guard.pairs_with_fuzzy_scores += local_fuzzy_scores.len();
@@ -1050,7 +1022,6 @@ async fn process_name_batch(
                                                     .count();
     }
 
-    // --- Execute all collected batch DB operations ---
     if !batch_entity_group_data.is_empty() {
         match batch_upsert_entity_groups(pool, batch_entity_group_data).await {
             Ok(results_map) => {
@@ -1058,7 +1029,6 @@ async fn process_name_batch(
                 let mut processed_set = processed_pairs_this_run_global.lock().await;
 
                 for pair_data_ref in pairs_for_full_evaluation {
-                    // Iterate original items to get initial IDs
                     let pair_key = (
                         pair_data_ref.entity_id_1.clone(),
                         pair_data_ref.entity_id_2.clone(),
@@ -1099,7 +1069,7 @@ async fn process_name_batch(
                             }
                         }
                     }
-                    processed_set.insert(pair_key); // Mark as processed for this run
+                    processed_set.insert(pair_key);
                 }
             }
             Err(e) => {
@@ -1115,7 +1085,7 @@ async fn process_name_batch(
         {
             logger.log_warning(&format!("Batch insert decision details failed: {}", e));
             let mut stats_guard = stats_mutex.lock().await;
-            stats_guard.individual_operation_errors += 1; // Count as a single batch error
+            stats_guard.individual_operation_errors += 1;
         }
     }
 
@@ -1123,16 +1093,14 @@ async fn process_name_batch(
         if let Err(e) = batch_store_in_comparison_cache(pool, batch_cache_store_data).await {
             logger.log_warning(&format!("Batch store comparison cache failed: {}", e));
             let mut stats_guard = stats_mutex.lock().await;
-            stats_guard.individual_operation_errors += 1; // Count as a single batch error
+            stats_guard.individual_operation_errors += 1;
         }
     }
 
-    // NEW: Add completion tracking logic for entities in this batch
     let mut completion_batch: Vec<(String, MatchMethodType, String, String, i32)> = Vec::new();
     for (entity_id, current_sig_check) in completion_status.iter() {
-        if !current_sig_check.is_complete { // Only mark incomplete entities
+        if !current_sig_check.is_complete {
             if let Some(current_sig) = &current_sig_check.current_signature {
-                // If the entity was processed in this batch and has comparisons
                 let comparison_count = local_entity_comparison_counts.get(entity_id).copied().unwrap_or(0);
                 if comparison_count > 0 {
                     completion_batch.push((
@@ -1158,10 +1126,8 @@ async fn process_name_batch(
     Ok(())
 }
 
-// Re-use `calculate_distance` from `url.rs` by making it `pub` in a shared `utils` module or by copying.
-// For now, let's copy it for simplicity within this module, assuming it's not made public yet.
 fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6371000.0; // Earth radius in meters
+    const R: f64 = 6371000.0;
     let (phi1, phi2) = (lat1.to_radians(), lat2.to_radians());
     let (delta_phi, delta_lambda) = ((lat2 - lat1).to_radians(), (lon2 - lon1).to_radians());
     let a = (delta_phi / 2.0).sin().powi(2)
@@ -1169,13 +1135,11 @@ fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
-// Helper functions remain the same but some need updating for progress callbacks...
-
 async fn get_memory_usage() -> u64 {
     use sysinfo::System;
     let mut sys = System::new_all();
-    sys.refresh_memory(); // Refresh memory information
-    sys.used_memory() / (1024 * 1024) // Convert bytes to MB
+    sys.refresh_memory();
+    sys.used_memory() / (1024 * 1024)
 }
 
 pub fn normalize_name(name: &str) -> (String, Option<&'static str>) {
@@ -1238,7 +1202,6 @@ pub fn normalize_name(name: &str) -> (String, Option<&'static str>) {
         " incorporated", " inc.", " inc", " corporation", " corp.", " corp", " limited liability company", " llc.", " llc", " limited", " ltd.", " ltd", " limited partnership", " lp.", " lp", " limited liability partnership", " llp.", " llp", " foundation", " trust", " charitable trust", " company", " co.", " co", " non-profit", " nonprofit", " nfp", " association", " assn.", " assn", " coop", " co-op", " cooperative", " npo", " organisation", " organization", " org.", " org", " coalition", " fund", " partnership", " academy", " consortium", " institute", " services", " group", " society", " network", " federation", " international", " global", " national", " alliance", " gmbh", " ag", " sarl", " bv", " spa", " pty", " plc", " p.c.", " pc",
     ];
     if entity_type != Some("city") {
-        // Don't strip suffixes if it's a city
         for suffix in suffixes {
             if normalized.ends_with(suffix) {
                 normalized = normalized[..normalized.len() - suffix.len()]
@@ -1248,11 +1211,9 @@ pub fn normalize_name(name: &str) -> (String, Option<&'static str>) {
         }
     }
 
-    // Handle parenthesized location suffixes like "(Tacoma)" or "(Seattle Office)"
-    let paren_regex = Regex::new(r"\s*\((.*?)\)\s*$").unwrap(); // Pre-compile for efficiency if possible, or handle error
+    let paren_regex = Regex::new(r"\s*\((.*?)\)\s*$").unwrap();
     if let Some(captures) = paren_regex.captures(&normalized) {
         if let Some(_location_match) = captures.get(1) {
-            // We don't need to store it, just remove it
             normalized = paren_regex.replace(&normalized, "").trim().to_string();
         }
     }
@@ -1270,14 +1231,14 @@ pub fn normalize_name(name: &str) -> (String, Option<&'static str>) {
         (r"\b(inst)\b", "institute"),
         (r"\b(mfg)\b", "manufacturing"),
         (r"\b(tech)\b", "technology"),
-        (r"\b(st)\b", "saint"), // Avoid "st" -> "street" if it's "saint"
+        (r"\b(st)\b", "saint"),
         (r"\bwa\b", "washington"),
         (r"\b(fd)\b", "fire department"),
         (r"\b(pd)\b", "police department"),
         (r"\binc\b", ""),
         (r"\bcorp\b", ""),
         (r"\bllc\b", ""),
-        (r"\bltd\b", ""), // Remove common abbreviations if they survived suffix stripping
+        (r"\bltd\b", ""),
     ];
 
     for (pattern, replacement) in &replacements {
@@ -1326,10 +1287,10 @@ fn detect_entity_type(normalized_name: &str) -> Option<&'static str> {
 pub fn tokenize_name(
     normalized_name: &str,
     stopwords: &HashSet<String>,
-    _entity_type: Option<&'static str>, // entity_type currently not used in token weighting here
+    _entity_type: Option<&'static str>,
 ) -> (HashSet<String>, Vec<(String, f32)>) {
     let mut tokens = HashSet::new();
-    let mut weighted_tokens = Vec::new(); // Not currently used for tf-idf, but kept for structure
+    let mut weighted_tokens = Vec::new();
 
     let words: Vec<&str> = normalized_name.split_whitespace().collect();
 
@@ -1337,7 +1298,6 @@ pub fn tokenize_name(
         let token = word.to_lowercase();
         if !stopwords.contains(&token) && token.len() >= MIN_TOKEN_LENGTH {
             tokens.insert(token.clone());
-            // Basic weighting (can be expanded)
             let weight = if LOCATION_PREFIXES.contains(&token.as_str()) {
                 0.8
             } else {
@@ -1346,13 +1306,11 @@ pub fn tokenize_name(
             weighted_tokens.push((token, weight));
         }
     }
-    // Add bigrams
     for i in 0..words.len().saturating_sub(1) {
         let bigram = format!("{} {}", words[i], words[i + 1]).to_lowercase();
         if bigram.len() >= 2 * MIN_TOKEN_LENGTH {
-            // Ensure bigram is reasonably long
             tokens.insert(bigram.clone());
-            weighted_tokens.push((bigram, 1.5)); // Higher weight for bigrams
+            weighted_tokens.push((bigram, 1.5));
         }
         }
     (tokens, weighted_tokens)
@@ -1365,7 +1323,6 @@ fn apply_domain_rules(
     entity_type1: Option<&'static str>,
     entity_type2: Option<&'static str>,
 ) -> f32 {
-    // Rule 1: If both are "city of X" and X is different, penalize heavily.
     if normalized_name1.starts_with("city of ") && normalized_name2.starts_with("city of ") {
         let city1 = normalized_name1
             .strip_prefix("city of ")
@@ -1376,29 +1333,23 @@ fn apply_domain_rules(
             .unwrap_or("")
             .trim();
         if city1 != city2 {
-            // If city names are substantially different (e.g., high Levenshtein distance)
             if levenshtein_distance(city1, city2) > city1.len().min(city2.len()) / 2 {
-                return pre_rl_score * 0.6; // Heavy penalty
+                return pre_rl_score * 0.6;
             }
-            return pre_rl_score * 0.8; // Moderate penalty
+            return pre_rl_score * 0.8;
         }
     }
 
-    // Rule 2: If entity types are known and different, apply a penalty.
     if let (Some(t1), Some(t2)) = (entity_type1, entity_type2) {
         if t1 != t2 {
-            // More nuanced penalty based on type incompatibility could be added here
             return pre_rl_score * 0.85;
         }
     }
 
-    // Rule 3: Specific department types (police, fire) should generally not match if one is X dept and other is Y dept.
     if (normalized_name1.contains("department") || normalized_name2.contains("department"))
         && (normalized_name1.contains("police") != normalized_name2.contains("police")
             || normalized_name1.contains("fire") != normalized_name2.contains("fire"))
     {
-        // This logic might be too simple; consider if "Police Dept" vs "Police Services" should match.
-        // For now, if one has "police" and other doesn't (and both are depts), penalize.
         if (normalized_name1.contains("police") && !normalized_name2.contains("police"))
             || (!normalized_name1.contains("police") && normalized_name2.contains("police"))
             || (normalized_name1.contains("fire") && !normalized_name2.contains("fire"))
@@ -1407,7 +1358,7 @@ fn apply_domain_rules(
             return pre_rl_score * 0.75;
         }
     }
-    pre_rl_score // Return original score if no specific rule applied
+    pre_rl_score
 }
 
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
@@ -1415,29 +1366,17 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     let s2_chars: Vec<char> = s2.chars().collect();
     let (len1, len2) = (s1_chars.len(), s2_chars.len());
 
-    if len1 == 0 {
-        return len2;
-    }
-    if len2 == 0 {
-        return len1;
-    }
+    if len1 == 0 { return len2; }
+    if len2 == 0 { return len1; }
 
     let mut matrix = vec![vec![0; len2 + 1]; len1 + 1];
 
-    for i in 0..=len1 {
-        matrix[i][0] = i;
-    }
-    for j in 0..=len2 {
-        matrix[0][j] = j;
-    }
+    for i in 0..=len1 { matrix[i][0] = i; }
+    for j in 0..=len2 { matrix[0][j] = j; }
 
     for i in 1..=len1 {
         for j in 1..=len2 {
-            let cost = if s1_chars[i - 1] == s2_chars[j - 1] {
-                0
-            } else {
-                1
-            };
+            let cost = if s1_chars[i - 1] == s2_chars[j - 1] { 0 } else { 1 };
             matrix[i][j] = (matrix[i - 1][j] + 1)
                 .min(matrix[i][j - 1] + 1)
                 .min(matrix[i - 1][j - 1] + cost);
@@ -1446,19 +1385,16 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     matrix[len1][len2]
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
 pub async fn generate_candidate_pairs_indices_limited(
     entity_data_arc: &std::sync::Arc<Vec<EntityNameData>>,
     token_to_entities_idx_map: &HashMap<String, Vec<usize>>,
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<Vec<(usize, usize)>> {
     let mut candidate_pairs_set: HashSet<(usize, usize)> = HashSet::new();
     let entity_data = entity_data_arc.as_ref();
 
-    // PROGRESS UPDATE: Candidate generation start
     update_progress!(progress_callback, "Generating pairs", "analyzing token overlaps");
 
-    // Create progress bar for candidate generation
     let gen_pb = ProgressBar::new(entity_data.len() as u64);
     gen_pb.set_style(
         ProgressStyle::default_bar()
@@ -1475,7 +1411,6 @@ pub async fn generate_candidate_pairs_indices_limited(
                 candidate_pairs_set.len()
             ));
             
-            // PROGRESS UPDATE: Detailed candidate generation progress
             update_detailed_progress!(progress_callback, "Generating pairs", 
                 idx1 + 1, entity_data.len(),
                 format!("{} candidate pairs found", candidate_pairs_set.len()));
@@ -1483,11 +1418,9 @@ pub async fn generate_candidate_pairs_indices_limited(
 
         let mut potential_matches: HashMap<usize, usize> = HashMap::new();
 
-        // Find potential matches through token overlap
         for token in &entity1.tokens {
             if let Some(entity_indices) = token_to_entities_idx_map.get(token) {
                 for &idx2 in entity_indices {
-                    // Ensure idx1 and idx2 are different to avoid self-comparison
                     if idx1 != idx2 {
                         *potential_matches.entry(idx2).or_insert(0) += 1;
                     }
@@ -1495,24 +1428,17 @@ pub async fn generate_candidate_pairs_indices_limited(
             }
         }
 
-        // Filter by MIN_TOKEN_OVERLAP and sort by overlap count
         let mut filtered_matches: Vec<(usize, usize)> = potential_matches
             .into_iter()
             .filter(|&(_, overlap_count)| overlap_count >= MIN_TOKEN_OVERLAP)
             .collect();
 
-        filtered_matches.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by overlap count
+        filtered_matches.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Limit candidates per entity
         for (idx2, _) in filtered_matches.into_iter().take(MAX_CANDIDATES_PER_ENTITY) {
-            let pair = if idx1 < idx2 {
-                (idx1, idx2)
-            } else {
-                (idx2, idx1)
-            };
+            let pair = if idx1 < idx2 { (idx1, idx2) } else { (idx2, idx1) };
             candidate_pairs_set.insert(pair);
 
-            // Check if we reached the total limit
             if candidate_pairs_set.len() >= MAX_TOTAL_CANDIDATE_PAIRS {
                 break;
             }
@@ -1537,18 +1463,17 @@ pub async fn generate_candidate_pairs_indices_limited(
 pub struct TokenStats {
     token: String,
     frequency: usize,
-    idf: f32, // Inverse Document Frequency
+    idf: f32,
 }
 
 pub async fn prepare_entity_data_and_index(
-    all_entities: &[EntityNameData], // Changed input type to EntityNameData which includes lat/lon
+    all_entities: &[EntityNameData],
     stopwords: &HashSet<String>,
 ) -> (
     Vec<EntityNameData>,
     HashMap<String, Vec<usize>>,
     HashMap<String, TokenStats>,
 ) {
-    // Create progress bar for entity data preparation
     let prep_pb = ProgressBar::new(all_entities.len() as u64);
     prep_pb.set_style(
         ProgressStyle::default_bar()
@@ -1559,11 +1484,9 @@ pub async fn prepare_entity_data_and_index(
 
     let mut entity_data_vec = Vec::with_capacity(all_entities.len());
     let mut token_frequency: HashMap<String, usize> = HashMap::new();
-
-    // Use a temporary HashSet to track entity_ids added to `entity_data_vec`
     let mut added_entity_ids: HashSet<String> = HashSet::new();
 
-    for (i, entity_name_data) in all_entities.iter().enumerate() { // Iterate over EntityNameData
+    for (i, entity_name_data) in all_entities.iter().enumerate() {
         prep_pb.inc(1);
         if i % 1000 == 0 {
             prep_pb.set_message(format!(
@@ -1573,7 +1496,6 @@ pub async fn prepare_entity_data_and_index(
             ));
         }
 
-        // Only process if this entity_id hasn't been added yet
         if added_entity_ids.contains(&entity_name_data.entity.id) {
             continue;
         }
@@ -1586,7 +1508,7 @@ pub async fn prepare_entity_data_and_index(
                 *token_frequency.entry(token.clone()).or_insert(0) += 1;
             }
             entity_data_vec.push(EntityNameData {
-                entity: entity_name_data.clone().entity, // Clone the entire Entity struct
+                entity: entity_name_data.clone().entity,
                 normalized_name,
                 entity_type,
                 tokens,
@@ -1599,11 +1521,10 @@ pub async fn prepare_entity_data_and_index(
 
     prep_pb.finish_with_message(format!("Prepared {} entities", entity_data_vec.len()));
 
-    // Calculate IDF for tokens (optional, if needed for more advanced scoring)
     let total_docs = entity_data_vec.len() as f32;
     let mut token_stats_map = HashMap::new();
     for (token, freq) in token_frequency {
-        let idf = (total_docs / (freq as f32 + 1.0)).ln_1p(); // ln(N / (df + 1)) + 1 (or similar variant)
+        let idf = (total_docs / (freq as f32 + 1.0)).ln_1p();
         token_stats_map.insert(
             token.clone(),
             TokenStats {
@@ -1614,14 +1535,12 @@ pub async fn prepare_entity_data_and_index(
         );
     }
 
-    // Create inverted index: token -> list of entity indices
     let mut token_to_entities_map: HashMap<String, Vec<usize>> = HashMap::new();
-    let max_common_token_freq = (entity_data_vec.len() as f32 * 0.05).max(10.0) as usize; // Ignore very common tokens
+    let max_common_token_freq = (entity_data_vec.len() as f32 * 0.05).max(10.0) as usize;
 
     for (idx, data) in entity_data_vec.iter().enumerate() {
         for token in &data.tokens {
             if let Some(stats) = token_stats_map.get(token) {
-                // Only index tokens that are not extremely common and appear more than once
                 if stats.frequency <= max_common_token_freq && stats.frequency > 1 {
                     token_to_entities_map
                         .entry(token.clone())
@@ -1634,7 +1553,6 @@ pub async fn prepare_entity_data_and_index(
     (entity_data_vec, token_to_entities_map, token_stats_map)
 }
 
-// Renamed from `get_all_entities_with_names` to include location data
 pub async fn get_all_entities_with_names_and_locations(
     conn: &impl tokio_postgres::GenericClient,
 ) -> Result<Vec<EntityNameData>> {
@@ -1661,9 +1579,9 @@ pub async fn get_all_entities_with_names_and_locations(
                     source_system: row.try_get("source_system").ok(),
                     source_id: row.try_get("source_id").ok(),
                 },
-                normalized_name: "".to_string(), // Will be filled by prepare_entity_data_and_index
-                entity_type: None, // Will be filled by prepare_entity_data_and_index
-                tokens: HashSet::new(), // Will be filled by prepare_entity_data_and_index
+                normalized_name: "".to_string(),
+                entity_type: None,
+                tokens: HashSet::new(),
                 latitude: row.try_get("latitude").ok(),
                 longitude: row.try_get("longitude").ok(),
             })
@@ -1671,23 +1589,46 @@ pub async fn get_all_entities_with_names_and_locations(
         .collect()
 }
 
-// NEW: Add this new function before the existing get_all_entities_with_names_and_locations
-pub async fn get_all_entities_with_names_and_locations_filtered(
+// NEW: Helper function to get entities with names and locations with contributor filtering
+pub async fn get_all_entities_with_names_and_locations_filtered_with_contributors(
     conn: &impl GenericClient,
     entity_ids: &[String],
+    contributor_filter: Option<&ContributorFilterConfig>,
 ) -> Result<Vec<EntityNameData>> {
-    let query = "
+    let mut query = "
         SELECT e.id, e.organization_id, e.name, e.created_at, e.updated_at, e.source_system, e.source_id,
                l.latitude, l.longitude
         FROM public.entity e
+        JOIN public.organization o ON e.organization_id = o.id
         LEFT JOIN public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'location'
         LEFT JOIN public.location l ON ef.table_id = l.id
-        WHERE e.id = ANY($1) AND e.name IS NOT NULL AND e.name != ''";
+        WHERE e.id = ANY($1) AND e.name IS NOT NULL AND e.name != ''".to_string();
+
+    let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+    params.push(Box::new(entity_ids.to_vec()));
+    let param_offset = 1;
+
+    // Add contributor filtering if enabled
+    if let Some(filter) = contributor_filter {
+        if let Some((where_clause, contributor_params)) = filter.build_sql_filter_with_offset(param_offset) {
+            query.push_str(&format!(" AND {}", where_clause));
+            for param in contributor_params {
+                params.push(Box::new(param));
+            }
+            info!("🔍 Applied contributor filter to name query");
+        }
+    }
+
+    // Execute with filtered query
+    let params_slice: Vec<&(dyn ToSql + Sync)> = params
+        .iter()
+        .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+        .collect();
 
     let rows = conn
-        .query(query, &[&entity_ids])
+        .query(&query, &params_slice)
         .await
-        .context("Failed to query entities with names and locations (filtered)")?;
+        .context("Failed to query entities with names and locations (filtered with contributors)")?;
 
     rows.iter()
         .map(|row| {
@@ -1701,9 +1642,9 @@ pub async fn get_all_entities_with_names_and_locations_filtered(
                     source_system: row.try_get("source_system").ok(),
                     source_id: row.try_get("source_id").ok(),
                 },
-                normalized_name: "".to_string(), // Will be filled by prepare_entity_data_and_index
-                entity_type: None, // Will be filled by prepare_entity_data_and_index
-                tokens: HashSet::new(), // Will be filled by prepare_entity_data_and_index
+                normalized_name: "".to_string(),
+                entity_type: None,
+                tokens: HashSet::new(),
                 latitude: row.try_get("latitude").ok(),
                 longitude: row.try_get("longitude").ok(),
             })
@@ -1711,14 +1652,22 @@ pub async fn get_all_entities_with_names_and_locations_filtered(
         .collect()
 }
 
+pub async fn get_all_entities_with_names_and_locations_filtered(
+    conn: &impl GenericClient,
+    entity_ids: &[String],
+) -> Result<Vec<EntityNameData>> {
+    get_all_entities_with_names_and_locations_filtered_with_contributors(conn, entity_ids, None).await
+}
+
+
 pub async fn get_organization_embeddings(
     conn: &impl tokio_postgres::GenericClient,
-    entities: &[EntityNameData], // Changed input type
+    entities: &[EntityNameData],
 ) -> Result<HashMap<String, Option<Vec<f32>>>> {
     let mut embeddings_map = HashMap::new();
     let org_ids: Vec<String> = entities
         .iter()
-        .map(|e| e.entity.organization_id.clone()) // Access org_id from the nested Entity
+        .map(|e| e.entity.organization_id.clone())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -1727,7 +1676,6 @@ pub async fn get_organization_embeddings(
         return Ok(embeddings_map);
     }
 
-    // Create progress bar for embedding loading
     let emb_pb = ProgressBar::new(org_ids.len() as u64);
     emb_pb.set_style(
         ProgressStyle::default_bar()
@@ -1736,9 +1684,7 @@ pub async fn get_organization_embeddings(
             .progress_chars("█▉▊▋▌▍▎▏  "),
     );
 
-    // Fetch in batches
     for (batch_idx, org_ids_chunk) in org_ids.chunks(100).enumerate() {
-        // Batch size of 100
         emb_pb.set_position((batch_idx * 100) as u64);
         emb_pb.set_message(format!("Loading embeddings... (batch {})", batch_idx + 1));
 
@@ -1749,11 +1695,9 @@ pub async fn get_organization_embeddings(
             .context("Failed to query organization embeddings")?;
         for row in rows {
             let org_id_str: String = row.get("id");
-            // Assuming pgvector::Vector can be converted to Vec<f32>
             let embedding_pgvector: Option<pgvector::Vector> = row.get("embedding");
             let embedding_vec_f32: Option<Vec<f32>> = embedding_pgvector.map(|v| v.to_vec());
 
-            // Map this org_id's embedding to all entities associated with this org_id
             for entity_data in entities.iter().filter(|e| e.entity.organization_id == org_id_str) {
                 embeddings_map.insert(entity_data.entity.id.clone(), embedding_vec_f32.clone());
             }
@@ -1765,7 +1709,6 @@ pub async fn get_organization_embeddings(
         org_ids.len()
     ));
 
-    // Ensure all entities have an entry, even if it's None
     for entity_data in entities {
         embeddings_map.entry(entity_data.entity.id.clone()).or_insert(None);
     }

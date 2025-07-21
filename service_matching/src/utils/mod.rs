@@ -4,6 +4,8 @@ pub mod env;
 pub mod instantiate_run;
 pub mod pipeline_state;
 pub mod progress_config;
+pub mod service_contributor_filter;
+pub mod rl_config;
 
 pub async fn get_memory_usage() -> u64 {
     use sysinfo::System;

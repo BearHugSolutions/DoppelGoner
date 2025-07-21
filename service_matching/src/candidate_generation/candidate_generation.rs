@@ -1,3 +1,5 @@
+// src/candidate_generation/candidate_generation.rs
+
 use crate::{models::{matching::ServiceInfo, stats_models::ServiceCluster}, utils::db_connect::PgPool};
 use anyhow::{Context, Result};
 use log::debug;
@@ -73,10 +75,12 @@ pub async fn add_unmatched_entities(
     Ok(unmatched_count)
 }
 
-/// Load services for each cluster
+/// Load services for each cluster with optional service contributor filtering
+/// NEW: Updated to accept and apply service contributor filter
 pub async fn load_service_clusters(
     pool: &PgPool,
-    entity_clusters: HashMap<Option<String>, Vec<String>>
+    entity_clusters: HashMap<Option<String>, Vec<String>>,
+    service_contributor_filter: Option<&crate::utils::service_contributor_filter::ServiceContributorFilterConfig>,
 ) -> Result<Vec<ServiceCluster>> {
     if entity_clusters.is_empty() {
         return Ok(Vec::new());
@@ -101,15 +105,31 @@ pub async fn load_service_clusters(
     debug!("Loading services for {} entities across {} clusters",
           all_entity_ids.len(), entity_clusters.len());
 
-    let query = "
+    // NEW: Build query with optional service contributor filtering
+    let mut query = "
         SELECT s.id, s.name, s.email, s.url, s.embedding_v2, ef.entity_id
         FROM public.service s
         JOIN public.entity_feature ef ON ef.table_id = s.id AND ef.table_name = 'service'
-        WHERE ef.entity_id = ANY($1)
-        ORDER BY ef.entity_id, s.id
-    ";
+        WHERE ef.entity_id = ANY($1)".to_string();
+    
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+    params.push(Box::new(all_entity_ids));
+    let mut param_offset = 1;
 
-    let rows = conn.query(query, &[&all_entity_ids]).await
+    // NEW: Add service contributor filtering if enabled
+    if let Some(filter) = service_contributor_filter {
+        if let Some((where_clause, contributor_params)) = filter.build_service_sql_filter_with_offset(param_offset) {
+            query.push_str(&format!(" AND {}", where_clause));
+            for param in contributor_params {
+                params.push(Box::new(param));
+            }
+            debug!("Applied service contributor filter to query");
+        }
+    }
+
+    query.push_str(" ORDER BY ef.entity_id, s.id");
+
+    let rows = conn.query(&query, &params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect::<Vec<_>>()).await
         .context("Failed to query services for all clusters")?;
 
     debug!("Retrieved {} service rows from database", rows.len());
@@ -157,5 +177,13 @@ pub async fn load_service_clusters(
     }
 
     debug!("Created {} service clusters with services", service_clusters.len());
+    
+    // Log filtering results if filtering was applied
+    if let Some(filter) = service_contributor_filter {
+        if filter.enabled {
+            debug!("Service contributor filtering was applied - {} clusters created from filtered services", service_clusters.len());
+        }
+    }
+    
     Ok(service_clusters)
 }

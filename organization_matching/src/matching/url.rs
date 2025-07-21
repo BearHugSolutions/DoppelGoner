@@ -1,4 +1,4 @@
-// src/matching/url.rs - Progress Callback Integration
+// src/matching/url.rs - Contributor Filtering and Progress Callback Integration
 use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -24,15 +24,17 @@ use crate::utils::pipeline_state::{
     batch_check_comparison_cache,
     batch_get_current_signatures_for_pairs,
     batch_store_in_comparison_cache,
-    batch_check_entity_completion_status, // NEW
-    batch_mark_entity_completion,         // NEW
+    batch_check_entity_completion_status,
+    batch_mark_entity_completion,
     ComparisonCacheEntry,
     EntitySignature as SignatureData,
-    EntityCompletionCheck,                // NEW
+    EntityCompletionCheck,
 };
 use crate::utils::constants::MAX_DISTANCE_FOR_SAME_CITY_METERS;
-use tokio_postgres::types::ToSql; // Required for dynamic query parameters
+use tokio_postgres::types::ToSql;
 
+// NEW: Import for contributor filtering
+use crate::utils::contributor_filter::ContributorFilterConfig;
 // NEW IMPORTS: Progress callback functionality
 use crate::utils::progress_bars::progress_callback::ProgressCallback;
 use crate::{update_progress, update_detailed_progress};
@@ -90,8 +92,8 @@ struct UrlMatchingStats {
     rl_feature_failures: usize,
     domains_completed_processing: usize,
     comparison_cache_hits: usize,
-    entities_skipped_complete: usize, // NEW: For completion tracking
-    entities_total_potential: usize,  // NEW: For completion tracking
+    entities_skipped_complete: usize,
+    entities_total_potential: usize,
 }
 
 /// Holds data for a potential pair to be inserted.
@@ -107,16 +109,24 @@ struct PairToProcessUrl {
     comparison_cache_hit: bool,
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
-pub async fn find_matches(
+// NEW: Filtered version of find_matches
+pub async fn find_matches_with_filter(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedFeatureCache>,
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
+    progress_callback: Option<ProgressCallback>,
+    contributor_filter: Option<&ContributorFilterConfig>, // NEW PARAMETER
 ) -> Result<AnyMatchResult> {
     let logger = MatchingLogger::new(MatchMethodType::Url);
     logger.log_start(pipeline_run_id, reinforcement_orchestrator_option.is_some());
+
+    // Log filtering status
+    if let Some(filter) = contributor_filter {
+        if filter.is_active() {
+            info!("🌐 URL matching with contributor filtering: {:?}", filter.allowed_contributors);
+        }
+    }
 
     // PROGRESS UPDATE: Starting phase
     update_progress!(progress_callback, "Starting", "Initializing URL matching");
@@ -127,35 +137,30 @@ pub async fn find_matches(
     let existing_groups = fetch_existing_entity_groups(pool).await?;
     logger.log_existing_pairs(existing_groups.len());
 
-    // PROGRESS UPDATE: Existing groups loaded
     update_progress!(progress_callback, "Loading existing groups", 
         format!("Found {} existing pairs", existing_groups.len()));
 
-    // NEW: Check entity completion before loading URL data
     logger.log_phase("Checking entity completion status", Some("filtering completed entities"));
     update_progress!(progress_callback, "Loading URL data", "checking entity completion status");
 
-    // First get all potential entity IDs
-    let all_potential_entities = fetch_entities_with_urls_and_locations_filtered(pool, None).await?;
+    // First get all potential entity IDs, applying contributor filter here if present
+    let all_potential_entities = fetch_entities_with_urls_and_locations_filtered_with_contributors(pool, None, contributor_filter).await?;
     let all_potential_entity_ids: Vec<String> = all_potential_entities
         .iter()
         .map(|e| e.entity_id.clone())
-        .collect::<std::collections::HashSet<_>>() // Deduplicate
+        .collect::<HashSet<_>>() // Deduplicate
         .into_iter()
         .collect();
 
-    // PROGRESS UPDATE: Potential entities found
     update_progress!(progress_callback, "Loading URL data", 
         format!("Found {} entities with URLs", all_potential_entity_ids.len()));
 
-    // Check completion status
     let completion_status = batch_check_entity_completion_status(
         pool,
         &all_potential_entity_ids,
         &MatchMethodType::Url
     ).await?;
 
-    // Filter out completed entities
     let incomplete_entity_ids: Vec<String> = completion_status
         .iter()
         .filter_map(|(entity_id, status)| {
@@ -175,11 +180,9 @@ pub async fn find_matches(
         incomplete_entity_ids.len()
     ));
 
-    // PROGRESS UPDATE: Completion status results
     update_progress!(progress_callback, "Loading URL data", 
         format!("{} to process ({} already complete)", incomplete_entity_ids.len(), completed_count));
 
-    // Initialize stats with total potential entities and skipped count
     let stats_arc = Arc::new(Mutex::new(UrlMatchingStats {
         entities_total_potential: all_potential_entity_ids.len(),
         entities_skipped_complete: completed_count,
@@ -187,11 +190,9 @@ pub async fn find_matches(
     }));
 
     if incomplete_entity_ids.is_empty() {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No incomplete entities to process");
         
-        // All entities are already complete, return early
-        logger.log_completion(0, 0, 0.0, 0); // Log with 0 new groups
+        logger.log_completion(0, 0, 0.0, 0);
         let final_stats = stats_arc.lock().await;
         return Ok(AnyMatchResult::Url(MatchResult {
             groups_created: 0,
@@ -201,19 +202,23 @@ pub async fn find_matches(
                 entities_matched: 0,
                 avg_confidence: 0.0,
                 avg_group_size: 0.0,
-                entities_skipped_complete: final_stats.entities_skipped_complete, // Pass skipped count
-                entities_total: final_stats.entities_total_potential,           // Pass total potential
+                entities_skipped_complete: final_stats.entities_skipped_complete,
+                entities_total: final_stats.entities_total_potential,
             },
         }));
     }
 
-    logger.log_phase("Loading entities with URLs", Some("querying entities and related URL data (incomplete only)"));
+    logger.log_phase("Loading entities with URLs", Some("querying entities and related URL data (incomplete only with contributor filter)"));
     update_progress!(progress_callback, "Loading URL data", "querying URL records for incomplete entities");
     
-    let entities_with_urls = fetch_entities_with_urls_and_locations_filtered(pool, Some(&incomplete_entity_ids)).await?;
+    // Load detailed data only for incomplete entities WITH FILTERING
+    let entities_with_urls = fetch_entities_with_urls_and_locations_filtered_with_contributors(
+        pool, 
+        Some(&incomplete_entity_ids),
+        contributor_filter
+    ).await?;
     logger.log_data_loaded(entities_with_urls.len(), "URL");
 
-    // PROGRESS UPDATE: Data loaded
     update_progress!(progress_callback, "Loading URL data", 
         format!("Loaded {} URL records", entities_with_urls.len()));
 
@@ -234,7 +239,6 @@ pub async fn find_matches(
 
     logger.log_domain_stats(total_domains_to_process, avg_entities_per_domain, largest_domain_size);
 
-    // PROGRESS UPDATE: Domain processing stats
     update_progress!(progress_callback, "Processing domains", 
         format!("{} domains to process after filtering", total_domains_to_process));
 
@@ -244,7 +248,6 @@ pub async fn find_matches(
     );
 
     if total_domains_to_process == 0 {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No domains to process");
         
         logger.log_completion(0, 0, 0.0, 0);
@@ -257,8 +260,8 @@ pub async fn find_matches(
                 entities_matched: 0,
                 avg_confidence: 0.0,
                 avg_group_size: 0.0,
-                entities_skipped_complete: final_stats.entities_skipped_complete, // Pass skipped count
-                entities_total: final_stats.entities_total_potential,           // Pass total potential
+                entities_skipped_complete: final_stats.entities_skipped_complete,
+                entities_total: final_stats.entities_total_potential,
             },
         }));
     }
@@ -266,12 +269,9 @@ pub async fn find_matches(
     logger.log_phase("Processing domains in parallel", Some(&format!("max {} concurrent tasks", MAX_PARALLEL_DOMAINS_IN_FLIGHT)));
     update_progress!(progress_callback, "Processing domains", "starting parallel domain processing");
     
-    // stats_arc is already initialized above
     let processed_pairs_cache_arc = Arc::new(Mutex::new(HashSet::<(String, String)>::new()));
-
     let domain_entries: Vec<_> = filtered_domains.into_iter().collect();
 
-    // Create progress bar for domain processing
     let domain_pb = ProgressBar::new(domain_entries.len() as u64);
     domain_pb.set_style(
         ProgressStyle::default_bar()
@@ -326,8 +326,8 @@ pub async fn find_matches(
                 let stats_c = Arc::clone(&stats_arc);
                 let processed_cache_c = Arc::clone(&processed_pairs_cache_arc);
                 let existing_groups_c = Arc::clone(&existing_groups);
-                let completion_status_c = completion_status.clone(); // Capture completion_status
-                let progress_callback_c = progress_callback.clone(); // NEW: Pass progress callback
+                let completion_status_c = completion_status.clone();
+                let progress_callback_c = progress_callback.clone();
 
                 async move {
                     process_domain_task(
@@ -340,8 +340,8 @@ pub async fn find_matches(
                         stats_c,
                         processed_cache_c,
                         existing_groups_c,
-                        completion_status_c, // Pass completion_status
-                        progress_callback_c, // NEW: Pass progress callback
+                        completion_status_c,
+                        progress_callback_c,
                     )
                     .await
                 }
@@ -349,9 +349,7 @@ pub async fn find_matches(
         }
 
         let task_results = join_all(task_futures).await;
-        let mut completed_domains_in_chunk = 0;
         for res in task_results {
-            completed_domains_in_chunk += 1;
             domain_pb.inc(1);
             domains_processed += 1;
 
@@ -362,7 +360,6 @@ pub async fn find_matches(
             }
         }
 
-        // Log progress periodically
         if domains_processed % 50 == 0 || domains_processed == domain_entries.len() {
             let stats_guard = stats_arc.lock().await;
             logger.log_progress_update(
@@ -371,7 +368,6 @@ pub async fn find_matches(
                 Some(&format!("{} groups created so far", stats_guard.new_pairs_created_db))
             );
             
-            // PROGRESS UPDATE: Domain processing progress
             update_detailed_progress!(progress_callback, "Processing domains", 
                 domains_processed, domain_entries.len(),
                 format!("{} groups created so far", stats_guard.new_pairs_created_db));
@@ -409,8 +405,8 @@ pub async fn find_matches(
         } else {
             0.0
         },
-        entities_skipped_complete: final_stats.entities_skipped_complete, // Pass skipped count
-        entities_total: final_stats.entities_total_potential,           // Pass total potential
+        entities_skipped_complete: final_stats.entities_skipped_complete,
+        entities_total: final_stats.entities_total_potential,
     };
 
     logger.log_completion(
@@ -439,7 +435,6 @@ pub async fn find_matches(
         final_stats.task_errors
     );
 
-    // FINAL PROGRESS UPDATE: Completion
     update_progress!(progress_callback, "Completed", 
         format!("{} URL groups created, {} entities matched", 
                 final_stats.new_pairs_created_db, final_stats.entities_in_new_pairs.len()));
@@ -450,7 +445,149 @@ pub async fn find_matches(
     }))
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
+// Keep original function for backward compatibility
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>,
+    progress_callback: Option<ProgressCallback>,
+) -> Result<AnyMatchResult> {
+    find_matches_with_filter(
+        pool,
+        reinforcement_orchestrator_option,
+        pipeline_run_id,
+        feature_cache,
+        progress_callback,
+        None, // No filtering
+    ).await
+}
+
+// NEW: Helper function to fetch entities with URLs with contributor filtering
+async fn fetch_entities_with_urls_and_locations_filtered_with_contributors(
+    pool: &PgPool,
+    entity_ids: Option<&[String]>,
+    contributor_filter: Option<&ContributorFilterConfig>,
+) -> Result<Vec<EntityUrlInfo>> {
+    let conn = pool.get().await.context("URL: DB conn for entities/URLs")?;
+
+    let base_query = r#"
+    WITH EntityServiceURLs AS (
+        SELECT e.id AS entity_id, s.url AS service_url, e.name AS entity_name,
+               o.contributor as contributor
+        FROM public.entity e
+        JOIN public.organization o ON e.organization_id = o.id
+        JOIN public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'service'
+        JOIN public.service s ON ef.table_id = s.id
+        WHERE s.url IS NOT NULL AND s.url != '' AND s.url !~ '^\s*$' AND s.url NOT LIKE 'mailto:%' AND s.url NOT LIKE 'tel:%'
+    ), EntityOrgURLs AS (
+        SELECT e.id AS entity_id, o.url AS org_url, e.name AS entity_name,
+               o.contributor as contributor
+        FROM public.entity e
+        JOIN public.organization o ON e.organization_id = o.id
+        WHERE o.url IS NOT NULL AND o.url != '' AND o.url !~ '^\s*$' AND o.url NOT LIKE 'mailto:%' AND o.url NOT LIKE 'tel:%'
+    ), CombinedURLs AS (
+        SELECT entity_id, service_url AS url, entity_name, contributor FROM EntityServiceURLs
+        UNION ALL
+        SELECT entity_id, org_url AS url, entity_name, contributor FROM EntityOrgURLs
+    ), DeduplicatedURLs AS (
+        SELECT DISTINCT entity_id, url, entity_name, contributor FROM CombinedURLs
+    ), EntityLocations AS (
+        SELECT e.id AS entity_id, l.latitude, l.longitude,
+               ROW_NUMBER() OVER(PARTITION BY e.id ORDER BY l.created DESC NULLS LAST, l.id) as rn
+        FROM public.entity e
+        JOIN public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'location'
+        JOIN public.location l ON ef.table_id = l.id
+        WHERE l.latitude IS NOT NULL AND l.longitude IS NOT NULL
+    )
+    SELECT du.entity_id, du.url, du.entity_name, el.latitude, el.longitude
+    FROM DeduplicatedURLs du
+    LEFT JOIN EntityLocations el ON du.entity_id = el.entity_id AND el.rn = 1
+    "#;
+
+    let mut query_parts = Vec::new();
+    let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+    let mut param_count = 0;
+
+    // Add entity ID filtering if provided
+    if let Some(ids) = entity_ids {
+        if !ids.is_empty() {
+            param_count += 1;
+            query_parts.push(format!("du.entity_id = ANY(${})", param_count));
+            params.push(Box::new(ids.to_vec()));
+        }
+    }
+
+    // Add contributor filtering if enabled
+    if let Some(filter) = contributor_filter {
+        if let Some((where_clause, contributor_params)) = filter.build_sql_filter_with_offset(param_count) {
+            // The where_clause from the helper is like "o.contributor = ANY($2)". We need to adjust the table alias.
+            let adjusted_where_clause = where_clause.replace("o.contributor", "du.contributor");
+            query_parts.push(adjusted_where_clause);
+            for param in contributor_params {
+                params.push(Box::new(param));
+            }
+            param_count += 1; // Assuming the filter adds one parameter group
+            info!("🔍 Applied contributor filter to URL query");
+        }
+    }
+
+    // Build final query
+    let final_query = if query_parts.is_empty() {
+        base_query.to_string()
+    } else {
+        format!("{} WHERE {}", base_query, query_parts.join(" AND "))
+    };
+
+    // Execute query
+    let params_slice: Vec<&(dyn ToSql + Sync)> = params
+        .iter()
+        .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+        .collect();
+
+    let rows = conn
+        .query(final_query.as_str(), params_slice.as_slice())
+        .await
+        .context("URL: Query entities/URLs (filtered with contributors)")?;
+
+    let mut entities_info = Vec::new();
+    let mut seen_entity_url_ids: HashSet<(String, String)> = HashSet::new();
+
+    for r in rows {
+        let entity_id_str: String = r.get(0);
+        let url_str: String = r.get(1);
+        let entity_name_opt: Option<String> = r.get(2);
+        let latitude_opt: Option<f64> = r.try_get(3).ok();
+        let longitude_opt: Option<f64> = r.try_get(4).ok();
+
+        if let Some(normalized_data) = normalize_url_with_slugs(&url_str) {
+            if !is_ignored_domain(&normalized_data.domain) {
+                if seen_entity_url_ids.insert((entity_id_str.clone(), url_str.clone())) {
+                    entities_info.push(EntityUrlInfo {
+                        entity_id: entity_id_str,
+                        original_url: url_str,
+                        normalized_data,
+                        entity_name: entity_name_opt,
+                        latitude: latitude_opt,
+                        longitude: longitude_opt,
+                    });
+                }
+            }
+        }
+    }
+    
+    Ok(entities_info)
+}
+
+// Keep original function for backward compatibility
+async fn fetch_entities_with_urls_and_locations_filtered(
+    pool: &PgPool,
+    entity_ids: Option<&[String]>,
+) -> Result<Vec<EntityUrlInfo>> {
+    fetch_entities_with_urls_and_locations_filtered_with_contributors(pool, entity_ids, None).await
+}
+
+
 #[allow(clippy::too_many_arguments)]
 async fn process_domain_task(
     domain: &str,
@@ -462,18 +599,15 @@ async fn process_domain_task(
     stats_arc: Arc<Mutex<UrlMatchingStats>>,
     processed_pairs_cache_arc: Arc<Mutex<HashSet<(String, String)>>>,
     existing_groups_arc: Arc<HashSet<(String, String)>>,
-    completion_status: HashMap<String, EntityCompletionCheck>, // NEW: Added completion_status
-    progress_callback: Option<ProgressCallback>, // NEW: Added progress_callback
+    completion_status: HashMap<String, EntityCompletionCheck>,
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<()> {
     let mut pairs_for_domain_preparation = Vec::new();
     let mut pairs_considered_this_domain = 0;
-    let mut geospatial_filtered = 0;
-
-    // Track entities within this domain that were involved in comparisons
+    
     let mut entity_comparison_counts: HashMap<String, i32> = HashMap::new();
     let mut entities_with_comparisons: HashSet<String> = HashSet::new();
 
-    // PROGRESS UPDATE: Domain processing start
     update_progress!(progress_callback, "Processing domains", 
         format!("Processing domain '{}' with {} entities", domain, entities.len()));
 
@@ -494,20 +628,13 @@ async fn process_domain_task(
                 break;
             }
 
-            // Geospatial pre-filtering using MAX_DISTANCE_FOR_SAME_CITY_METERS
             if let (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) = (
                 e1_info.latitude,
                 e1_info.longitude,
                 e2_info.latitude,
                 e2_info.longitude,
             ) {
-                let distance = calculate_distance(lat1, lon1, lat2, lon2);
-                if distance > MAX_DISTANCE_FOR_SAME_CITY_METERS {
-                    geospatial_filtered += 1;
-                    debug!(
-                        "URL: Skipping pair ({}, {}) due to large geospatial distance: {:.2}m > {:.2}m",
-                        e1_info.entity_id, e2_info.entity_id, distance, MAX_DISTANCE_FOR_SAME_CITY_METERS
-                    );
+                if calculate_distance(lat1, lon1, lat2, lon2) > MAX_DISTANCE_FOR_SAME_CITY_METERS {
                     continue;
                 }
             }
@@ -519,7 +646,7 @@ async fn process_domain_task(
             } else {
                 (e2_info.entity_id.clone(), e1_info.entity_id.clone())
             };
-            let current_pair_key = (e1_id_ordered.clone(), e2_id_ordered.clone()); // Clone for local use
+            let current_pair_key = (e1_id_ordered.clone(), e2_id_ordered.clone());
 
             if existing_groups_arc.contains(&current_pair_key) {
                 continue;
@@ -531,7 +658,6 @@ async fn process_domain_task(
                 }
             }
 
-            // Increment comparison counts for both entities in the pair
             *entity_comparison_counts.entry(e1_id_ordered.clone()).or_insert(0) += 1;
             *entity_comparison_counts.entry(e2_id_ordered.clone()).or_insert(0) += 1;
             entities_with_comparisons.insert(e1_id_ordered);
@@ -562,7 +688,6 @@ async fn process_domain_task(
         return Ok(());
     }
 
-    // PROGRESS UPDATE: Pair preparation
     update_progress!(progress_callback, "Processing domains", 
         format!("Domain '{}': {} pairs to process", domain, pairs_for_domain_preparation.len()));
 
@@ -574,12 +699,11 @@ async fn process_domain_task(
         fc_opt,
         processed_pairs_cache_arc,
         stats_arc.clone(),
-        progress_callback.clone(), // NEW: Pass progress callback
+        progress_callback.clone(),
     )
     .await?;
 
     if !db_ready_pairs.is_empty() {
-        // PROGRESS UPDATE: Database operations
         update_progress!(progress_callback, "Processing domains", 
             format!("Domain '{}': inserting {} pairs", domain, db_ready_pairs.len()));
         
@@ -590,9 +714,9 @@ async fn process_domain_task(
                 run_id,
                 ro_opt,
                 stats_arc.clone(),
-                &completion_status, // Pass completion_status
-                &entity_comparison_counts, // Pass entity_comparison_counts
-                progress_callback.clone(), // NEW: Pass progress callback
+                &completion_status,
+                &entity_comparison_counts,
+                progress_callback.clone(),
             )
             .await
         {
@@ -611,21 +735,19 @@ async fn process_domain_task(
     Ok(())
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
 #[allow(clippy::too_many_arguments)]
 async fn prepare_pairs_for_db(
     candidate_pairs: Vec<(EntityUrlInfo, EntityUrlInfo)>,
     pool: &PgPool,
     ro_opt: Option<&Arc<Mutex<RLOrchestrator>>>,
-    run_id: &str,
+    _run_id: &str,
     fc_opt: Option<&SharedFeatureCache>,
     processed_pairs_cache_arc: Arc<Mutex<HashSet<(String, String)>>>,
     stats_arc: Arc<Mutex<UrlMatchingStats>>,
-    progress_callback: Option<ProgressCallback>, // NEW: Added progress_callback
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<Vec<PairToProcessUrl>> {
     let mut db_ready_pairs = Vec::new();
 
-    // PROGRESS UPDATE: Pair preparation start
     update_progress!(progress_callback, "Processing domains", 
         format!("Preparing {} candidate pairs for DB operations", candidate_pairs.len()));
 
@@ -664,7 +786,6 @@ async fn prepare_pairs_for_db(
     let cache_results_map = batch_check_comparison_cache(pool, &cache_check_inputs).await?;
 
     for (pair_idx, (e1_info, e2_info)) in candidate_pairs.into_iter().enumerate() {
-        // PROGRESS UPDATE: Detailed pair processing progress
         if pair_idx % 100 == 0 {
             update_progress!(progress_callback, "Processing domains", 
                 format!("Processing pair {}/{}", pair_idx + 1, pairs_for_signature_fetch.len()));
@@ -786,26 +907,23 @@ async fn prepare_pairs_for_db(
     Ok(db_ready_pairs)
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
 async fn run_inserts_for_domain_pairs(
     pool: &PgPool,
     pairs_to_process: Vec<PairToProcessUrl>,
     pipeline_run_id: &str,
     ro_opt: Option<&Arc<Mutex<RLOrchestrator>>>,
     stats_arc: Arc<Mutex<UrlMatchingStats>>,
-    completion_status: &HashMap<String, EntityCompletionCheck>, // NEW PARAMETER
-    entity_comparison_counts: &HashMap<String, i32>,          // NEW PARAMETER
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
+    completion_status: &HashMap<String, EntityCompletionCheck>,
+    entity_comparison_counts: &HashMap<String, i32>,
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<()> {
     let mut batch_entity_group_data = Vec::new();
     let mut batch_decision_detail_data = Vec::new();
     let mut batch_cache_store_data = Vec::new();
 
-    // PROGRESS UPDATE: Database operations start
     update_progress!(progress_callback, "Processing domains", 
         format!("Inserting {} pairs into database", pairs_to_process.len()));
 
-    // Prepare data for batch upsert and cache store
     for pair_data in &pairs_to_process {
         let new_entity_group_id_str = Uuid::new_v4().to_string();
         batch_entity_group_data.push(EntityGroupBatchData {
@@ -919,19 +1037,18 @@ async fn run_inserts_for_domain_pairs(
         }
     }
 
-    // NEW: Add completion tracking logic
     let mut completion_batch: Vec<(String, MatchMethodType, String, String, i32)> = Vec::new();
     for (entity_id, current_sig_check) in completion_status.iter() {
-        if !current_sig_check.is_complete { // Only mark incomplete entities
+        if !current_sig_check.is_complete {
             if let Some(current_sig) = &current_sig_check.current_signature {
                 let comparison_count = entity_comparison_counts.get(entity_id).copied().unwrap_or(0);
-                if comparison_count > 0 { // Only mark if comparisons were made in this run
+                if comparison_count > 0 {
                     completion_batch.push((
                         entity_id.clone(),
                         MatchMethodType::Url,
                         pipeline_run_id.to_string(),
                         current_sig.clone(),
-                        comparison_count, // Use the count from this domain's processing
+                        comparison_count,
                     ));
                 }
             }
@@ -940,7 +1057,6 @@ async fn run_inserts_for_domain_pairs(
     if !completion_batch.is_empty() {
         if let Err(e) = batch_mark_entity_completion(pool, &completion_batch).await {
             debug!("URL: Failed to batch mark {} entities as complete: {}", completion_batch.len(), e);
-            // Don't propagate this error, but log it
         } else {
             debug!("URL: Marked {} entities as complete", completion_batch.len());
         }
@@ -973,90 +1089,6 @@ async fn fetch_existing_entity_groups(pool: &PgPool) -> Result<Arc<HashSet<(Stri
         })
         .collect();
     Ok(Arc::new(pairs))
-}
-
-// Add new function signature and modify the main function
-async fn fetch_entities_with_urls_and_locations_filtered(
-    pool: &PgPool,
-    entity_ids: Option<&[String]>,
-) -> Result<Vec<EntityUrlInfo>> {
-    let conn = pool.get().await.context("URL: DB conn for entities/URLs")?;
-
-    let base_query = r#"
-    WITH EntityServiceURLs AS (
-        SELECT e.id AS entity_id, s.url AS service_url, e.name AS entity_name
-        FROM public.entity e
-        JOIN public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'service'
-        JOIN public.service s ON ef.table_id = s.id
-        WHERE s.url IS NOT NULL AND s.url != '' AND s.url !~ '^\s*$' AND s.url NOT LIKE 'mailto:%' AND s.url NOT LIKE 'tel:%'
-    ), EntityOrgURLs AS (
-        SELECT e.id AS entity_id, o.url AS org_url, e.name AS entity_name
-        FROM public.entity e
-        JOIN public.organization o ON e.organization_id = o.id
-        WHERE o.url IS NOT NULL AND o.url != '' AND o.url !~ '^\s*$' AND o.url NOT LIKE 'mailto:%' AND o.url NOT LIKE 'tel:%'
-    ), CombinedURLs AS (
-        SELECT entity_id, service_url AS url, entity_name FROM EntityServiceURLs
-        UNION ALL
-        SELECT entity_id, org_url AS url, entity_name FROM EntityOrgURLs
-    ), DeduplicatedURLs AS (
-        SELECT DISTINCT entity_id, url, entity_name FROM CombinedURLs
-    ), EntityLocations AS (
-        SELECT e.id AS entity_id, l.latitude, l.longitude,
-               ROW_NUMBER() OVER(PARTITION BY e.id ORDER BY l.created DESC NULLS LAST, l.id) as rn
-        FROM public.entity e
-        JOIN public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'location'
-        JOIN public.location l ON ef.table_id = l.id
-        WHERE l.latitude IS NOT NULL AND l.longitude IS NOT NULL
-    )
-    SELECT du.entity_id, du.url, du.entity_name, el.latitude, el.longitude
-    FROM DeduplicatedURLs du
-    LEFT JOIN EntityLocations el ON du.entity_id = el.entity_id AND el.rn = 1
-    "#;
-
-    let (query, params): (String, Vec<Box<dyn ToSql + Sync + Send>>) = if let Some(ids) = entity_ids {
-        (format!("{} WHERE du.entity_id = ANY($1)", base_query),
-         vec![Box::new(ids.to_vec())])
-    } else {
-        (base_query.to_string(), vec![])
-    };
-
-    // Use the modified query with parameters...
-    let params_slice: Vec<&(dyn ToSql + Sync)> = params
-        .iter()
-        .map(|p| p.as_ref() as &(dyn ToSql + Sync))
-        .collect();
-
-    let rows = conn
-        .query(query.as_str(), params_slice.as_slice())
-        .await
-        .context("URL: Query entities/URLs (filtered)")?;
-
-    let mut entities_info = Vec::new();
-    let mut seen_entity_url_ids: HashSet<(String, String)> = HashSet::new();
-
-    for r in rows {
-        let entity_id_str: String = r.get(0);
-        let url_str: String = r.get(1);
-        let entity_name_opt: Option<String> = r.get(2);
-        let latitude_opt: Option<f64> = r.try_get(3).ok();
-        let longitude_opt: Option<f64> = r.try_get(4).ok();
-
-        if let Some(normalized_data) = normalize_url_with_slugs(&url_str) {
-            if !is_ignored_domain(&normalized_data.domain) {
-                if seen_entity_url_ids.insert((entity_id_str.clone(), url_str.clone())) {
-                    entities_info.push(EntityUrlInfo {
-                        entity_id: entity_id_str,
-                        original_url: url_str,
-                        normalized_data,
-                        entity_name: entity_name_opt,
-                        latitude: latitude_opt,
-                        longitude: longitude_opt,
-                    });
-                }
-            }
-        }
-    }
-    Ok(entities_info)
 }
 
 fn group_entities_by_domain(entities: &[EntityUrlInfo]) -> HashMap<String, Vec<EntityUrlInfo>> {

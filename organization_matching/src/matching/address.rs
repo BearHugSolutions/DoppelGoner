@@ -1,4 +1,4 @@
-// src/matching/address.rs - Progress Callback Integration
+// src/matching/address.rs - Contributor Filtering Integration
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, warn};
@@ -17,15 +17,18 @@ use crate::models::stats_models::{MatchMethodStats, MatchMethodType};
 use crate::rl::orchestrator::RLOrchestrator;
 use crate::rl::SharedFeatureCache;
 use crate::utils::db_connect::PgPool;
-use crate::utils::progress_bars::logging::MatchingLogger; // Import the new logger
+use crate::utils::progress_bars::logging::MatchingLogger;
 use crate::utils::pipeline_state::{
     batch_check_comparison_cache, batch_check_entity_completion_status, batch_get_current_signatures_for_pairs, batch_mark_entity_completion, batch_store_in_comparison_cache, ComparisonCacheEntry, EntityCompletionCheck, EntitySignature as SignatureData
 };
-use crate::utils::constants::MAX_DISTANCE_FOR_SAME_CITY_METERS; // Import the new constant
-
-// NEW IMPORTS: Progress callback functionality
+use crate::utils::constants::MAX_DISTANCE_FOR_SAME_CITY_METERS;
 use crate::utils::progress_bars::progress_callback::ProgressCallback;
 use crate::{update_progress, update_detailed_progress};
+
+// NEW: Import for contributor filtering
+use crate::utils::contributor_filter::ContributorFilterConfig;
+use tokio_postgres::types::ToSql;
+
 
 /// Internal struct to hold data for a pair that needs to be processed,
 /// including all information required for DB upsert and decision detail insert.
@@ -50,18 +53,25 @@ struct AddressInfo {
     longitude: Option<f64>,
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
-pub async fn find_matches(
+// NEW: Filtered version of find_matches
+pub async fn find_matches_with_filter(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedFeatureCache>,
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
+    progress_callback: Option<ProgressCallback>,
+    contributor_filter: Option<&ContributorFilterConfig>, // NEW PARAMETER
 ) -> Result<AnyMatchResult> {
-    let logger = MatchingLogger::new(MatchMethodType::Address); // Initialize logger
+    let logger = MatchingLogger::new(MatchMethodType::Address);
     logger.log_start(pipeline_run_id, reinforcement_orchestrator_option.is_some());
 
-    // PROGRESS UPDATE: Starting phase
+    // Log filtering status
+    if let Some(filter) = contributor_filter {
+        if filter.is_active() {
+            info!("📍 Address matching with contributor filtering: {:?}", filter.allowed_contributors);
+        }
+    }
+
     update_progress!(progress_callback, "Starting", "Initializing address matching");
 
     let conn_init = pool
@@ -76,15 +86,12 @@ pub async fn find_matches(
         fetch_existing_pairs(&*conn_init, MatchMethodType::Address).await?;
     logger.log_existing_pairs(existing_entity_groups.len());
     
-    // PROGRESS UPDATE: Existing pairs loaded
     update_progress!(progress_callback, "Loading existing pairs", 
         format!("Found {} existing pairs", existing_entity_groups.len()));
 
-    // Phase 1 Changes: Entity Filtering
     logger.log_phase("Loading address data", Some("querying entities with addresses (excluding completed)"));
     update_progress!(progress_callback, "Loading address data", "querying entities with addresses");
     
-    // Step 1: Get all potential entity IDs with addresses
     let potential_entities_query = "
         SELECT DISTINCT e.id
         FROM public.entity e
@@ -103,11 +110,9 @@ pub async fn find_matches(
         .collect();
     logger.log_debug(&format!("Address: Found {} entities with addresses", all_potential_entity_ids.len()));
 
-    // PROGRESS UPDATE: Potential entities found
     update_progress!(progress_callback, "Loading address data", 
         format!("Found {} entities with addresses", all_potential_entity_ids.len()));
 
-    // Step 2: Check completion status
     update_progress!(progress_callback, "Loading address data", "checking completion status");
     let completion_status: HashMap<String, EntityCompletionCheck> = batch_check_entity_completion_status(
         pool,
@@ -127,7 +132,7 @@ pub async fn find_matches(
     .collect();
 
     let completed_count = all_potential_entity_ids.len() - incomplete_entity_ids.len();
-    let total_potential_entities = all_potential_entity_ids.len(); // Change A: Add total_potential_entities
+    let total_potential_entities = all_potential_entity_ids.len();
     logger.log_debug(&format!(
         "Address: {} total entities, {} already complete, {} to process",
         all_potential_entity_ids.len(),
@@ -135,16 +140,13 @@ pub async fn find_matches(
         incomplete_entity_ids.len()
     ));
 
-    // PROGRESS UPDATE: Completion status results
     update_progress!(progress_callback, "Loading address data", 
         format!("{} to process ({} already complete)", incomplete_entity_ids.len(), completed_count));
 
-    // Step 4: Load detailed data only for incomplete entities
-    let phone_rows = if incomplete_entity_ids.is_empty() {
-        // PROGRESS UPDATE: Early return case
+    // Step 4: Load detailed data only for incomplete entities WITH FILTERING
+    let address_rows = if incomplete_entity_ids.is_empty() {
         update_progress!(progress_callback, "Completed", "No incomplete entities to process");
         
-        // Change B: Early Return #1 (no incomplete entities)
         return Ok(AnyMatchResult::Address(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -160,35 +162,58 @@ pub async fn find_matches(
     } else {
         update_progress!(progress_callback, "Loading address data", "querying address records");
         
-        let address_query = "
+        // NEW: Build filtered address query
+        let mut address_query = "
             SELECT e.id AS entity_id, l.id as location_id,
                    a.address_1, a.address_2, a.city, a.state_province, a.postal_code, a.country,
                    l.latitude, l.longitude
             FROM public.entity e
+            JOIN public.organization o ON e.organization_id = o.id
             JOIN public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'location'
             JOIN public.location l ON ef.table_id = l.id
             JOIN public.address a ON a.location_id = l.id
             WHERE e.id = ANY($1)
             AND a.address_1 IS NOT NULL AND a.address_1 != ''
-            AND a.city IS NOT NULL AND a.city != ''";
+            AND a.city IS NOT NULL AND a.city != ''".to_string();
+
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+        params.push(Box::new(incomplete_entity_ids.clone()));
+        let param_offset = 1;
+
+        // Add contributor filtering if enabled
+        if let Some(filter) = contributor_filter {
+            if let Some((where_clause, contributor_params)) = filter.build_sql_filter_with_offset(param_offset) {
+                address_query.push_str(&format!(" AND {}", where_clause));
+                for param in contributor_params {
+                    params.push(Box::new(param));
+                }
+                info!("🔍 Applied contributor filter to address query");
+            }
+        }
+
+        // Execute with filtered query
+        let params_slice: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+
         conn_init
-            .query(address_query, &[&incomplete_entity_ids])
+            .query(&address_query, &params_slice)
             .await
-            .context("Address: Failed to query addresses for incomplete entities")?
+            .context("Address: Failed to query addresses for incomplete entities with contributor filter")?
     };
 
-    logger.log_data_loaded(phone_rows.len(), "address");
-    // PROGRESS UPDATE: Data loaded
+
+    logger.log_data_loaded(address_rows.len(), "address");
     update_progress!(progress_callback, "Loading address data", 
-        format!("Loaded {} address records", phone_rows.len()));
+        format!("Loaded {} address records", address_rows.len()));
     
-    drop(conn_init); // Release connection
+    drop(conn_init);
 
     logger.log_phase("Processing and normalizing data", None);
     update_progress!(progress_callback, "Processing addresses", "normalizing address data");
 
-    // Create progress bar for address processing
-    let processing_pb = ProgressBar::new(phone_rows.len() as u64);
+    let processing_pb = ProgressBar::new(address_rows.len() as u64);
     processing_pb.set_style(
         ProgressStyle::default_bar()
             .template("  📍 [{elapsed_precise}] {bar:30.yellow/red} {pos}/{len} Processing addresses...")
@@ -196,18 +221,17 @@ pub async fn find_matches(
             .progress_chars("█▉▊▋▌▍▎▏  ")
     );
 
-    let mut address_map: HashMap<String, Vec<AddressInfo>> = HashMap::new(); // Changed to Vec<AddressInfo>
-    let mut duplicate_entries = 0; // Data quality metric
-    let mut invalid_formats = 0; // Data quality metric
+    let mut address_map: HashMap<String, Vec<AddressInfo>> = HashMap::new();
+    let mut duplicate_entries = 0;
+    let mut invalid_formats = 0;
 
-    for (i, row) in phone_rows.iter().enumerate() {
-        // PROGRESS UPDATE: Update every 1000 items
-        if i % 1000 == 0 || i == phone_rows.len() - 1 {
+    for (i, row) in address_rows.iter().enumerate() {
+        if i % 1000 == 0 || i == address_rows.len() - 1 {
             processing_pb.inc(1);
-            update_detailed_progress!(progress_callback, "Processing addresses", i + 1, phone_rows.len(),
+            update_detailed_progress!(progress_callback, "Processing addresses", i + 1, address_rows.len(),
                 format!("{} unique addresses", address_map.len()));
         }
-        logger.log_progress_update(i + 1, phone_rows.len(), None);
+        logger.log_progress_update(i + 1, address_rows.len(), None);
 
         let entity_id: String = row.get("entity_id");
         let full_address = match format_full_address(row) {
@@ -223,7 +247,6 @@ pub async fn find_matches(
         let longitude: Option<f64> = row.try_get("longitude").ok();
 
         if !normalized_address_str.is_empty() {
-            // Check if an AddressInfo with this entity_id already exists for this normalized address
             let entry = address_map.entry(normalized_address_str.clone()).or_default();
             if !entry.iter().any(|info| info.entity_id == entity_id) {
                 entry.push(AddressInfo {
@@ -234,35 +257,33 @@ pub async fn find_matches(
                     longitude,
                 });
             } else {
-                duplicate_entries += 1; // Increment for duplicate entity-address combinations
+                duplicate_entries += 1;
             }
         } else {
-            invalid_formats += 1; // Increment for entries that result in empty normalized addresses
+            invalid_formats += 1;
         }
     }
     processing_pb.finish_with_message(format!(
         "Processed {} addresses into {} unique normalized addresses (groups)",
-        phone_rows.len(),
+        address_rows.len(),
         address_map.len()
     ));
 
     let groups_with_multiple = address_map.values().filter(|entities| entities.len() >= 2).count();
     logger.log_data_quality_issue("duplicate entity-address combinations", duplicate_entries);
     logger.log_data_quality_issue("invalid address formats", invalid_formats);
-    logger.log_processing_complete(phone_rows.len(), address_map.len(), groups_with_multiple);
+    logger.log_processing_complete(address_rows.len(), address_map.len(), groups_with_multiple);
 
-    // PROGRESS UPDATE: Processing complete
     update_progress!(progress_callback, "Processing addresses", 
-        format!("Processed {} addresses into {} groups", phone_rows.len(), address_map.len()));
+        format!("Processed {} addresses into {} groups", address_rows.len(), address_map.len()));
 
     logger.log_phase("Comparing address pairs", Some("generating and filtering potential matches"));
     update_progress!(progress_callback, "Generating pairs", "creating candidate address pairs");
 
     let mut all_pairs_to_process: Vec<PairToProcessAddress> = Vec::new();
-    let mut processed_pairs_this_run: HashSet<(String, String)> = HashSet::new(); // Local cache for this run's processed pairs
+    let mut processed_pairs_this_run: HashSet<(String, String)> = HashSet::new();
     let mut pairs_for_signature_fetch: Vec<(String, String)> = Vec::new();
 
-    // Calculate total pairs for progress tracking
     let total_conceptual_pairs: usize = address_map
         .values()
         .map(|entities| {
@@ -276,7 +297,6 @@ pub async fn find_matches(
         .sum();
 
     logger.log_pair_generation(total_conceptual_pairs, groups_with_multiple);
-    // PROGRESS UPDATE: Pair generation started
     update_progress!(progress_callback, "Generating pairs", 
         format!("{} potential pairs to evaluate", total_conceptual_pairs));
 
@@ -296,8 +316,8 @@ pub async fn find_matches(
     };
 
     let mut current_pair_count_for_pb = 0;
-    let mut existing_skipped = 0; // Track existing skipped pairs
-    let mut geospatial_filtered = 0; // Track geospatial filtered pairs
+    let mut existing_skipped = 0;
+    let mut geospatial_filtered = 0;
 
     for (normalized_shared_address, current_entity_list) in address_map {
         if current_entity_list.len() < 2 {
@@ -322,7 +342,6 @@ pub async fn find_matches(
                             all_pairs_to_process.len()
                         ));
                         
-                        // PROGRESS UPDATE: Detailed pair generation progress
                         if current_pair_count_for_pb % 500 == 0 {
                             update_detailed_progress!(progress_callback, "Generating pairs", 
                                 current_pair_count_for_pb, total_conceptual_pairs,
@@ -365,7 +384,6 @@ pub async fn find_matches(
                     continue;
                 }
 
-                // --- Geospatial Filtering ---
                 if let (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) =
                     (e1_lat, e1_lon, e2_lat, e2_lon)
                 {
@@ -373,12 +391,11 @@ pub async fn find_matches(
                     if distance > MAX_DISTANCE_FOR_SAME_CITY_METERS {
                         geospatial_filtered += 1;
                         logger.log_debug(&format!("Pair ({}, {}) skipped due to large geospatial distance ({}m > {}m).", e1_id, e2_id, distance, MAX_DISTANCE_FOR_SAME_CITY_METERS));
-                        processed_pairs_this_run.insert(current_pair_ordered); // Mark as processed to prevent re-evaluation
+                        processed_pairs_this_run.insert(current_pair_ordered);
                         continue;
                     }
                 }
 
-                // Add to list for signature fetch and cache check
                 pairs_for_signature_fetch.push(current_pair_ordered.clone());
 
                 let mut pre_rl_confidence_score = 0.95;
@@ -405,11 +422,11 @@ pub async fn find_matches(
                     entity_id_2: e2_id.clone(),
                     match_values: match_values_obj,
                     pre_rl_confidence_score,
-                    final_confidence_score: pre_rl_confidence_score, // Initial, will be tuned
+                    final_confidence_score: pre_rl_confidence_score,
                     features_for_snapshot: None,
-                    original_signature_1: None,  // Will be filled later
-                    original_signature_2: None,  // Will be filled later
-                    comparison_cache_hit: false, // Will be set later
+                    original_signature_1: None,
+                    original_signature_2: None,
+                    comparison_cache_hit: false,
                 });
 
                 processed_pairs_this_run.insert(current_pair_ordered);
@@ -428,15 +445,12 @@ pub async fn find_matches(
         logger.log_geospatial_filtering(total_conceptual_pairs, geospatial_filtered, MAX_DISTANCE_FOR_SAME_CITY_METERS);
     }
 
-    // PROGRESS UPDATE: Pair generation complete
     update_progress!(progress_callback, "Generating pairs", 
         format!("{} candidate pairs after filtering", all_pairs_to_process.len()));
 
     if all_pairs_to_process.is_empty() {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No pairs to process");
         
-        // Change C: Early Return #2 (no pairs to process)
         return Ok(AnyMatchResult::Address(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -451,7 +465,6 @@ pub async fn find_matches(
         }));
     }
 
-    // --- Batch processing starts here ---
     logger.log_cache_and_signatures(pairs_for_signature_fetch.len());
     update_progress!(progress_callback, "Cache checking", "fetching entity signatures");
     
@@ -483,17 +496,14 @@ pub async fn find_matches(
     for mut pair_data in all_pairs_to_process {
         let pair_key = (pair_data.entity_id_1.clone(), pair_data.entity_id_2.clone());
         if let Some(_cached_eval) = cache_results_map.get(&pair_key) {
-            // Assuming cached_eval means 'already processed/matched', skip re-evaluation
             cache_hits_count += 1;
             pair_data.comparison_cache_hit = true;
-            // No need to add to pairs_to_process_after_cache if already handled
         } else {
             pairs_to_process_after_cache.push(pair_data);
         }
     }
 
     logger.log_cache_results(cache_hits_count, pairs_to_process_after_cache.len());
-    // PROGRESS UPDATE: Cache results
     update_progress!(progress_callback, "Cache checking", 
         format!("{} cache hits, {} pairs to evaluate", cache_hits_count, pairs_to_process_after_cache.len()));
 
@@ -511,37 +521,35 @@ pub async fn find_matches(
     let mut final_groups_created_count = 0;
     let mut final_entities_in_new_pairs: HashSet<String> = HashSet::new();
     let mut final_confidence_scores_for_stats: Vec<f64> = Vec::new();
-    let mut individual_operation_errors = 0; // These are errors *during* processing/DB ops, not skipped pairs
+    let mut individual_operation_errors = 0;
     let mut feature_extraction_attempted = 0;
     let mut feature_extraction_successful = 0;
     let mut feature_extraction_failed = 0;
     let total_pairs = pairs_to_process_after_cache.len();
 
-    const BATCH_DB_OPS_SIZE: usize = 1000; // Define a batch size for DB ops
+    const BATCH_DB_OPS_SIZE: usize = 1000;
     logger.log_batch_processing_start(pairs_to_process_after_cache.len(), BATCH_DB_OPS_SIZE);
-    // PROGRESS UPDATE: Batch processing start
     update_progress!(progress_callback, "Batch processing", 
         format!("Processing {} pairs in batches of {}", pairs_to_process_after_cache.len(), BATCH_DB_OPS_SIZE));
 
     let total_batches = (pairs_to_process_after_cache.len() + BATCH_DB_OPS_SIZE - 1) / BATCH_DB_OPS_SIZE;
     for (batch_idx, chunk) in pairs_to_process_after_cache.chunks_mut(BATCH_DB_OPS_SIZE).enumerate() {
         logger.log_batch_progress(batch_idx + 1, total_batches, chunk.len());
-        // PROGRESS UPDATE: Batch progress
         update_detailed_progress!(progress_callback, "Batch processing", 
             batch_idx + 1, total_batches, format!("{} pairs in this batch", chunk.len()));
         
         let chunk_len = chunk.len();
         let mut batch_entity_group_data = Vec::new();
         let mut temp_decision_detail_data_parts: Vec<(
-            (String, String), // Pair key (entity_id_1, entity_id_2)
+            (String, String),
             serde_json::Value,
-            String,      // MatchMethodType as String
-            f64,         // pre_rl_confidence_at_decision
-            f64,         // tuned_confidence_at_decision
-            Option<i32>, // confidence_tuner_version_at_decision
+            String,
+            f64,
+            f64,
+            Option<i32>,
         )> = Vec::new();
         let mut batch_cache_store_data = Vec::new();
-        let mut batch_decision_detail_data = Vec::new(); // Moved here to be collected per chunk
+        let mut batch_decision_detail_data = Vec::new();
 
         for (pair_idx, pair_data) in chunk.iter_mut().enumerate() {
             let mut final_confidence_score = pair_data.pre_rl_confidence_score;
@@ -565,12 +573,12 @@ pub async fn find_matches(
                     Ok(features) => {
                         if !features.is_empty() {
                             feature_extraction_successful += 1;
-                            pair_data.features_for_snapshot = Some(features.clone()); // Now this assignment is valid
+                            pair_data.features_for_snapshot = Some(features.clone());
                             features_json_for_cache = serde_json::to_value(features.clone()).ok();
                             match ro_arc.lock().await.get_tuned_confidence(
                                 &MatchMethodType::Address,
                                 pair_data.pre_rl_confidence_score,
-                                features.as_ref(), // Use the local features variable
+                                features.as_ref(),
                             ) {
                                 Ok(tuned_score) => final_confidence_score = tuned_score,
                                 Err(e) => logger.log_warning(&format!(
@@ -595,11 +603,9 @@ pub async fn find_matches(
                 }
             }
 
-            // Update final_confidence_score on the pair_data struct before batching
             pair_data.final_confidence_score = final_confidence_score;
 
-            // Prepare data for batch upsert
-            let new_entity_group_id_str = Uuid::new_v4().to_string(); // Generate ID upfront
+            let new_entity_group_id_str = Uuid::new_v4().to_string();
             batch_entity_group_data.push(EntityGroupBatchData {
                 proposed_id: new_entity_group_id_str.clone(),
                 entity_id_1: pair_data.entity_id_1.clone(),
@@ -610,7 +616,6 @@ pub async fn find_matches(
                 match_values: pair_data.match_values.clone(),
             });
 
-            // Prepare parts for batch decision detail data, to be completed after upsert_entity_groups
             if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
                 if let Some(features_vec) = &pair_data.features_for_snapshot {
                     let version = ro_arc.lock().await.confidence_tuner.version;
@@ -627,7 +632,6 @@ pub async fn find_matches(
                 }
             }
 
-            // Prepare data for batch cache store (MATCH outcome)
             if let (Some(sig1_data), Some(sig2_data)) = (
                 &pair_data.original_signature_1,
                 &pair_data.original_signature_2,
@@ -645,23 +649,19 @@ pub async fn find_matches(
                 });
             }
 
-            // Update progress bar within batch processing
             eval_pb.set_position((batch_idx * BATCH_DB_OPS_SIZE + pair_idx + 1) as u64);
             
-            // PROGRESS UPDATE: Detailed evaluation progress
             if pair_idx % 100 == 0 || pair_idx == chunk_len - 1 {
                 update_detailed_progress!(progress_callback, "Evaluating pairs", 
                     batch_idx * BATCH_DB_OPS_SIZE + pair_idx + 1, total_pairs,
                     format!("RL features: {}/{}", feature_extraction_successful, feature_extraction_attempted));
             }
-        } // End of chunk.iter_mut()
+        }
 
-        // Execute batch DB operations
         let upsert_results = batch_upsert_entity_groups(pool, batch_entity_group_data).await;
 
         match upsert_results {
             Ok(results_map) => {
-                // Now, iterate over the collected temporary data to create decision details
                 for (
                     pair_key,
                     snapshot_features_json,
@@ -733,8 +733,8 @@ pub async fn find_matches(
         } else {
             0.0
         },
-        entities_skipped_complete: completed_count, // Change D: Add new fields
-        entities_total: total_potential_entities,   // Change D: Add new fields
+        entities_skipped_complete: completed_count,
+        entities_total: total_potential_entities,
     };
     logger.log_completion(
         final_groups_created_count,
@@ -748,15 +748,12 @@ pub async fn find_matches(
         Some((feature_extraction_attempted, feature_extraction_successful, feature_extraction_failed))
     );
 
-    // Phase 2: Mark entities as complete
     logger.log_phase("Tracking completion status", Some("marking entities with no remaining comparisons"));
     update_progress!(progress_callback, "Completion tracking", "marking completed entities");
     
-    // Track entities that had all their possible comparisons processed
     let mut entity_comparison_counts: HashMap<String, i32> = HashMap::new();
     let mut entities_with_comparisons: HashSet<String> = HashSet::new();
 
-    // Count comparisons per entity from the pairs we processed
     for pair_data in &pairs_to_process_after_cache {
         *entity_comparison_counts.entry(pair_data.entity_id_1.clone()).or_insert(0) += 1;
         *entity_comparison_counts.entry(pair_data.entity_id_2.clone()).or_insert(0) += 1;
@@ -764,7 +761,6 @@ pub async fn find_matches(
         entities_with_comparisons.insert(pair_data.entity_id_2.clone());
     }
 
-    // Prepare batch completion data
     let mut completion_batch: Vec<(String, MatchMethodType, String, String, i32)> = Vec::new();
     for entity_id in entities_with_comparisons {
         if let Some(status) = completion_status.get(&entity_id) {
@@ -781,7 +777,6 @@ pub async fn find_matches(
         }
     }
 
-    // Batch mark completions
     if !completion_batch.is_empty() {
         if let Err(e) = batch_mark_entity_completion(pool, &completion_batch).await {
             logger.log_warning(&format!(
@@ -796,7 +791,6 @@ pub async fn find_matches(
         }
     }
 
-    // FINAL PROGRESS UPDATE: Completion
     update_progress!(progress_callback, "Completed", 
         format!("{} address groups created, {} entities matched", 
                 final_groups_created_count, final_entities_in_new_pairs.len()));
@@ -807,8 +801,24 @@ pub async fn find_matches(
     }))
 }
 
-// Re-use `calculate_distance` from `url.rs` by making it `pub` in a shared `utils` module or by copying.
-// For now, let's copy it for simplicity within this module, assuming it's not made public yet.
+// Keep original function for backward compatibility
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>,
+    progress_callback: Option<ProgressCallback>,
+) -> Result<AnyMatchResult> {
+    find_matches_with_filter(
+        pool,
+        reinforcement_orchestrator_option,
+        pipeline_run_id,
+        feature_cache,
+        progress_callback,
+        None, // No filtering
+    ).await
+}
+
 fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const R: f64 = 6371000.0; // Earth radius in meters
     let (phi1, phi2) = (lat1.to_radians(), lat2.to_radians());
@@ -845,7 +855,6 @@ pub fn normalize_address(address: &str) -> String {
         "suite ",
         "ste ",
         "unit ",
-        // "#", // Be careful with removing '#' as it might be part of the primary address
         "bldg ",
         "building ",
         "fl ",
@@ -858,9 +867,7 @@ pub fn normalize_address(address: &str) -> String {
         "p o box ",
         "p.o. box ",
     ];
-    // Handle '#' more carefully to remove unit numbers like "# 123" or "#123"
     if let Some(idx) = normalized.find('#') {
-        // Check if it's likely a unit designator, e.g., followed by a digit or space then digit
         let after_hash = &normalized[idx + 1..];
         if after_hash
             .trim_start()
@@ -873,33 +880,29 @@ pub fn normalize_address(address: &str) -> String {
                 .trim_start_matches('#')
                 .trim_start()
                 .to_string();
-            // Remove the unit number part
             if let Some(space_idx) = rest.find(|c: char| c.is_whitespace() || c == ',') {
-                rest = rest[space_idx..].to_string(); // Keep what's after the unit number
+                rest = rest[space_idx..].to_string();
             } else {
-                rest.clear(); // Unit number was at the end
+                rest.clear();
             }
             normalized = format!("{}{}", before.trim_end(), rest.trim_start());
         }
     }
     for pattern_base in patterns_to_remove {
-        // Ensure we are matching whole words or words followed by numbers
-        // This is a simplified approach; regex would be more robust for word boundaries.
         let pattern_with_space = format!("{} ", pattern_base);
         while let Some(idx) = normalized.find(&pattern_with_space) {
             let (before, after_pattern_full) = normalized.split_at(idx);
             let mut rest_of_string = after_pattern_full
-                .strip_prefix(&pattern_with_space) // Use strip_prefix
-                .unwrap_or(after_pattern_full) // Should not happen if find worked
+                .strip_prefix(&pattern_with_space)
+                .unwrap_or(after_pattern_full)
                 .to_string();
 
-            // Remove the unit identifier (e.g., number or letter)
             if let Some(end_of_unit_idx) =
                 rest_of_string.find(|c: char| c.is_whitespace() || c == ',')
             {
                 rest_of_string = rest_of_string[end_of_unit_idx..].to_string();
             } else {
-                rest_of_string.clear(); // Unit identifier was at the end
+                rest_of_string.clear();
             }
             normalized = format!("{}{}", before.trim_end(), rest_of_string.trim_start());
             normalized = normalized.trim().to_string();
@@ -935,11 +938,9 @@ fn extract_unit(address: &str) -> String {
             let after_pattern_content = lower[after_pattern_start_idx..].trim_start();
 
             if after_pattern_content.is_empty() {
-                // Pattern was at the end with no unit value
                 continue;
             }
 
-            // Find where the unit value ends (next space, comma, or end of string)
             let unit_value_end_idx = after_pattern_content
                 .find(|c: char| c.is_whitespace() || c == ',')
                 .unwrap_or(after_pattern_content.len());
@@ -947,13 +948,11 @@ fn extract_unit(address: &str) -> String {
             let unit_value = after_pattern_content[..unit_value_end_idx].trim();
 
             if !unit_value.is_empty() {
-                // For '#', ensure it's followed by a digit or is a digit itself if pattern is just '#'
                 if pattern == "#"
                     && !unit_value
                         .chars()
                         .all(|c| c.is_ascii_digit() || c.is_alphabetic())
                 {
-                    // Allow alphanumeric unit for #
                     continue;
                 }
                 return format!("{} {}", pattern, unit_value).trim().to_string();

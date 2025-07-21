@@ -5,6 +5,7 @@ pub mod instantiate_run;
 pub mod pipeline_state;
 pub mod progress_bars;
 pub mod constants;
+pub mod contributor_filter;
 
 pub async fn get_memory_usage() -> u64 {
     use sysinfo::System;

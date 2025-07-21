@@ -1,4 +1,4 @@
-// src/matching/email.rs - COMPLETE EXAMPLE with Progress Callback Integration
+// src/matching/email.rs - COMPLETE EXAMPLE with Progress Callback and Contributor Filtering Integration
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, warn};
@@ -22,10 +22,13 @@ use crate::utils::pipeline_state::{
     batch_check_comparison_cache, batch_check_entity_completion_status, batch_get_current_signatures_for_pairs, batch_mark_entity_completion, batch_store_in_comparison_cache, ComparisonCacheEntry, EntityCompletionCheck, EntitySignature as SignatureData
 };
 use crate::utils::constants::MAX_DISTANCE_FOR_SAME_CITY_METERS;
-
-// NEW IMPORTS: Progress callback functionality
 use crate::utils::progress_bars::progress_callback::ProgressCallback;
 use crate::{update_progress, update_detailed_progress};
+
+// NEW: Import for contributor filtering
+use crate::utils::contributor_filter::ContributorFilterConfig;
+use tokio_postgres::types::ToSql;
+
 
 /// Internal struct to hold data for a pair that needs to be processed,
 /// including all information required for DB upsert and decision detail insert.
@@ -51,16 +54,24 @@ struct EmailInfo {
     longitude: Option<f64>,
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
-pub async fn find_matches(
+// NEW: Filtered version of find_matches
+pub async fn find_matches_with_filter(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedFeatureCache>,
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
+    progress_callback: Option<ProgressCallback>,
+    contributor_filter: Option<&ContributorFilterConfig>, // NEW PARAMETER
 ) -> Result<AnyMatchResult> {
     let logger = MatchingLogger::new(MatchMethodType::Email);
     logger.log_start(pipeline_run_id, reinforcement_orchestrator_option.is_some());
+    
+    // Log filtering status
+    if let Some(filter) = contributor_filter {
+        if filter.is_active() {
+            info!("📧 Email matching with contributor filtering: {:?}", filter.allowed_contributors);
+        }
+    }
     
     // PROGRESS UPDATE: Starting phase
     update_progress!(progress_callback, "Starting", "Initializing email matching");
@@ -70,7 +81,6 @@ pub async fn find_matches(
         .await
         .context("Email: Failed to get DB connection for initial reads")?;
 
-    // ENHANCED PHASE LOGGING: Combine logger with progress callback
     logger.log_phase("Loading existing pairs", Some("querying entity_group table"));
     update_progress!(progress_callback, "Loading existing pairs", "querying entity_group table");
     
@@ -78,15 +88,12 @@ pub async fn find_matches(
         fetch_existing_pairs(&*initial_read_conn, MatchMethodType::Email).await?;
     logger.log_existing_pairs(existing_entity_groups.len());
     
-    // PROGRESS UPDATE: Include results in progress
     update_progress!(progress_callback, "Loading existing pairs", 
         format!("Found {} existing pairs", existing_entity_groups.len()));
 
-    // Phase 1 Changes: Entity Filtering
     logger.log_phase("Loading email data", Some("querying entities with email addresses (excluding completed)"));
     update_progress!(progress_callback, "Loading email data", "checking entity completion status");
     
-    // Step 1: Get all potential entity IDs with emails
     let potential_entities_query = "
         WITH EntityEmails AS (
             SELECT DISTINCT e.id as entity_id
@@ -111,11 +118,9 @@ pub async fn find_matches(
         .collect();
     logger.log_debug(&format!("Email: Found {} entities with emails", all_potential_entity_ids.len()));
     
-    // PROGRESS UPDATE: Found potential entities
     update_progress!(progress_callback, "Loading email data", 
         format!("Found {} entities with emails", all_potential_entity_ids.len()));
 
-    // Step 2: Check completion status
     update_progress!(progress_callback, "Loading email data", "checking completion status");
     let completion_status: HashMap<String, EntityCompletionCheck> = batch_check_entity_completion_status(
         pool,
@@ -123,7 +128,6 @@ pub async fn find_matches(
         &MatchMethodType::Email
     ).await?;
 
-    // Step 3: Filter out completed entities
     let incomplete_entity_ids: Vec<String> = completion_status
         .iter()
         .filter_map(|(entity_id, status)| {
@@ -143,16 +147,13 @@ pub async fn find_matches(
         incomplete_entity_ids.len()
     ));
     
-    // PROGRESS UPDATE: Completion status results
     update_progress!(progress_callback, "Loading email data", 
         format!("{} to process ({} already complete)", incomplete_entity_ids.len(), completed_count));
 
-    // Step 4: Load detailed data only for incomplete entities
+    // Step 4: Load detailed data only for incomplete entities WITH FILTERING
     let email_rows = if incomplete_entity_ids.is_empty() {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No incomplete entities to process");
         
-        // Early Return: No incomplete entities
         return Ok(AnyMatchResult::Email(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -168,40 +169,72 @@ pub async fn find_matches(
     } else {
         update_progress!(progress_callback, "Loading email data", "querying email records");
         
-        let email_query = "
+        // NEW: Build filtered email query
+        let mut email_query = "
             SELECT 'organization' as source, e.id as entity_id, o.email, e.name as entity_name,
                    l.latitude, l.longitude
             FROM entity e
             JOIN organization o ON e.organization_id = o.id
             LEFT JOIN public.entity_feature ef_loc ON e.id = ef_loc.entity_id AND ef_loc.table_name = 'location'
             LEFT JOIN public.location l ON ef_loc.table_id = l.id
-            WHERE e.id = ANY($1) AND o.email IS NOT NULL AND o.email != ''
+            WHERE e.id = ANY($1) AND o.email IS NOT NULL AND o.email != ''".to_string();
+
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+        params.push(Box::new(incomplete_entity_ids.clone()));
+        let param_offset = 1;
+
+        // Add contributor filtering if enabled
+        if let Some(filter) = contributor_filter {
+            if let Some((where_clause, contributor_params)) = filter.build_sql_filter_with_offset(param_offset) {
+                email_query.push_str(&format!(" AND {}", where_clause));
+                for param in contributor_params {
+                    params.push(Box::new(param));
+                }
+                info!("🔍 Applied contributor filter to email query (organization part)");
+            }
+        }
+
+        email_query.push_str(" 
             UNION ALL
             SELECT 'service' as source, e.id as entity_id, s.email, e.name as entity_name,
                    l.latitude, l.longitude
             FROM public.entity e
             JOIN public.entity_feature ef_svc ON e.id = ef_svc.entity_id AND ef_svc.table_name = 'service'
             JOIN public.service s ON ef_svc.table_id = s.id
+            JOIN public.organization o ON e.organization_id = o.id
             LEFT JOIN public.entity_feature ef_loc ON e.id = ef_loc.entity_id AND ef_loc.table_name = 'location'
             LEFT JOIN public.location l ON ef_loc.table_id = l.id
-            WHERE e.id = ANY($1) AND s.email IS NOT NULL AND s.email != ''";
+            WHERE e.id = ANY($1) AND s.email IS NOT NULL AND s.email != ''");
+
+        // Add contributor filtering to the UNION part as well
+        if let Some(filter) = contributor_filter {
+            if let Some((where_clause, _)) = filter.build_sql_filter_with_offset(param_offset) {
+                email_query.push_str(&format!(" AND {}", where_clause));
+                info!("🔍 Applied contributor filter to email query (service part)");
+            }
+        }
+
+        // Execute with filtered query
+        let params_slice: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+
         initial_read_conn
-            .query(email_query, &[&incomplete_entity_ids])
+            .query(&email_query, &params_slice)
             .await
-            .context("Email: Failed to query emails for incomplete entities")?
+            .context("Email: Failed to query emails for incomplete entities with contributor filter")?
     };
 
     logger.log_data_loaded(email_rows.len(), "email");
-    // PROGRESS UPDATE: Data loaded
     update_progress!(progress_callback, "Loading email data", 
         format!("Loaded {} email records", email_rows.len()));
     
-    drop(initial_read_conn); // Release connection
+    drop(initial_read_conn);
 
     logger.log_phase("Processing and normalizing emails", None);
     update_progress!(progress_callback, "Processing emails", "normalizing email addresses");
 
-    // Create progress bar for email processing with simpler styling
     let processing_pb = ProgressBar::new(email_rows.len() as u64);
     processing_pb.set_style(
         ProgressStyle::default_bar()
@@ -214,9 +247,7 @@ pub async fn find_matches(
     let mut duplicate_entries = 0;
     let mut invalid_formats = 0;
 
-    // ENHANCED PROCESSING LOOP: Add detailed progress updates
     for (i, row) in email_rows.iter().enumerate() {
-        // PROGRESS UPDATE: Update every 1000 items or on completion
         if i % 1000 == 0 || i == email_rows.len() - 1 {
             processing_pb.set_position(i as u64 + 1);
             update_detailed_progress!(progress_callback, "Processing emails", i + 1, email_rows.len(),
@@ -235,7 +266,6 @@ pub async fn find_matches(
             continue;
         }
 
-        // Check if an EmailInfo with this entity_id already exists for this normalized email
         let entry = email_map.entry(normalized.clone()).or_default();
         if !entry.iter().any(|info| info.entity_id == entity_id) {
             entry.push(EmailInfo {
@@ -264,7 +294,6 @@ pub async fn find_matches(
     logger.log_data_quality_issue("invalid email formats", invalid_formats);
     logger.log_processing_complete(email_rows.len(), email_map.len(), groups_with_multiple);
     
-    // PROGRESS UPDATE: Processing complete
     update_progress!(progress_callback, "Processing emails", 
         format!("Processed {} emails into {} groups", email_rows.len(), email_map.len()));
 
@@ -275,7 +304,6 @@ pub async fn find_matches(
     let mut processed_pairs_this_run: HashSet<(String, String)> = HashSet::new();
     let mut pairs_for_signature_fetch: Vec<(String, String)> = Vec::new();
 
-    // Calculate total pairs for progress tracking
     let total_conceptual_pairs: usize = email_map
         .values()
         .map(|entities| {
@@ -289,7 +317,6 @@ pub async fn find_matches(
         .sum();
 
     logger.log_pair_generation(total_conceptual_pairs, groups_with_multiple);
-    // PROGRESS UPDATE: Pair generation started
     update_progress!(progress_callback, "Generating pairs", 
         format!("{} potential pairs to evaluate", total_conceptual_pairs));
 
@@ -336,7 +363,6 @@ pub async fn find_matches(
                             all_pairs_to_process.len()
                         ));
                         
-                        // PROGRESS UPDATE: Detailed pair generation progress
                         update_detailed_progress!(progress_callback, "Generating pairs", 
                             current_pair_count_for_pb, total_conceptual_pairs,
                             format!("{} candidates created", all_pairs_to_process.len()));
@@ -377,7 +403,6 @@ pub async fn find_matches(
                     continue;
                 }
 
-                // --- Geospatial Filtering ---
                 if let (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) =
                     (e1_lat, e1_lon, e2_lat, e2_lon)
                 {
@@ -392,7 +417,7 @@ pub async fn find_matches(
 
                 pairs_for_signature_fetch.push(current_pair_ordered.clone());
 
-                let mut pre_rl_confidence_score = 1.0; // Default high for email
+                let mut pre_rl_confidence_score = 1.0;
                 if is_generic_organizational_email(&normalized_shared_email) {
                     pre_rl_confidence_score *= 0.9;
                 }
@@ -422,7 +447,7 @@ pub async fn find_matches(
                     entity_id_2: e2_id.clone(),
                     match_values: match_values_obj,
                     pre_rl_confidence_score,
-                    final_confidence_score: pre_rl_confidence_score, // Initial, will be tuned
+                    final_confidence_score: pre_rl_confidence_score,
                     features_for_snapshot: None,
                     original_signature_1: None,
                     original_signature_2: None,
@@ -446,15 +471,12 @@ pub async fn find_matches(
         logger.log_geospatial_filtering(total_conceptual_pairs, geospatial_filtered, MAX_DISTANCE_FOR_SAME_CITY_METERS);
     }
     
-    // PROGRESS UPDATE: Pair generation complete
     update_progress!(progress_callback, "Generating pairs", 
         format!("{} candidate pairs after filtering", all_pairs_to_process.len()));
 
     if all_pairs_to_process.is_empty() {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No pairs to process");
         
-        // Early Return: No pairs to process
         return Ok(AnyMatchResult::Email(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -469,11 +491,9 @@ pub async fn find_matches(
         }));
     }
 
-    // --- Batch processing starts here ---
     logger.log_cache_and_signatures(pairs_for_signature_fetch.len());
     update_progress!(progress_callback, "Cache checking", "fetching entity signatures");
     
-    // Create progress bar for the evaluation phase
     let eval_pb = ProgressBar::new(all_pairs_to_process.len() as u64);
     eval_pb.set_style(
         ProgressStyle::default_bar()
@@ -486,7 +506,6 @@ pub async fn find_matches(
         batch_get_current_signatures_for_pairs(pool, &pairs_for_signature_fetch).await?;
 
     let mut cache_check_inputs = Vec::new();
-    // Iterate mutably over `all_pairs_to_process` to update `original_signature_1/2`
     for pair_data in all_pairs_to_process.iter_mut() {
         let pair_key = (pair_data.entity_id_1.clone(), pair_data.entity_id_2.clone());
         if let Some((sig1_data, sig2_data)) = signatures_map.get(&pair_key) {
@@ -519,7 +538,6 @@ pub async fn find_matches(
     }
 
     logger.log_cache_results(cache_hits_count, pairs_to_process_after_cache.len());
-    // PROGRESS UPDATE: Cache results
     update_progress!(progress_callback, "Cache checking", 
         format!("{} cache hits, {} pairs to evaluate", cache_hits_count, pairs_to_process_after_cache.len()));
 
@@ -530,7 +548,6 @@ pub async fn find_matches(
 
     const BATCH_DB_OPS_SIZE: usize = 1000;
     logger.log_batch_processing_start(pairs_to_process_after_cache.len(), BATCH_DB_OPS_SIZE);
-    // PROGRESS UPDATE: Batch processing start
     update_progress!(progress_callback, "Batch processing", 
         format!("Processing {} pairs in batches of {}", pairs_to_process_after_cache.len(), BATCH_DB_OPS_SIZE));
 
@@ -542,25 +559,23 @@ pub async fn find_matches(
     let mut feature_extraction_successful = 0;
     let mut feature_extraction_failed = 0;
     let mut processed_pairs = 0;
-    let total_pairs = pairs_to_process_after_cache.len();  // Store the total length before iteration
+    let total_pairs = pairs_to_process_after_cache.len();
 
-    // Use .chunks_mut() to get mutable slices, allowing modification of PairToProcessEmail
     let total_batches = (pairs_to_process_after_cache.len() + BATCH_DB_OPS_SIZE - 1) / BATCH_DB_OPS_SIZE;
     for (batch_idx, chunk) in pairs_to_process_after_cache.chunks_mut(BATCH_DB_OPS_SIZE).enumerate() {
         logger.log_batch_progress(batch_idx + 1, total_batches, chunk.len());
-        // PROGRESS UPDATE: Batch progress
         update_detailed_progress!(progress_callback, "Batch processing", 
             batch_idx + 1, total_batches, format!("{} pairs in this batch", chunk.len()));
         
-        let chunk_len = chunk.len(); // Store length here before iteration consumes `chunk`
+        let chunk_len = chunk.len();
         let mut batch_entity_group_data = Vec::new();
         let mut temp_decision_detail_data_parts: Vec<(
-            (String, String), // Pair key (entity_id_1, entity_id_2)
+            (String, String),
             serde_json::Value,
-            String,      // MatchMethodType as String
-            f64,         // pre_rl_confidence_at_decision
-            f64,         // tuned_confidence_at_decision
-            Option<i32>, // confidence_tuner_version_at_decision
+            String,
+            f64,
+            f64,
+            Option<i32>,
         )> = Vec::new();
         let mut batch_cache_store_data = Vec::new();
         let mut batch_decision_detail_data = Vec::new();
@@ -587,12 +602,12 @@ pub async fn find_matches(
                     Ok(features) => {
                         if !features.is_empty() {
                             feature_extraction_successful += 1;
-                            pair_data.features_for_snapshot = Some(features.clone()); // Now this assignment is valid
+                            pair_data.features_for_snapshot = Some(features.clone());
                             features_json_for_cache = serde_json::to_value(features.clone()).ok();
                             match ro_arc.lock().await.get_tuned_confidence(
                                 &MatchMethodType::Email,
                                 pair_data.pre_rl_confidence_score,
-                                features.as_ref(), // Use the local features variable
+                                features.as_ref(),
                             ) {
                                 Ok(tuned_score) => final_confidence_score = tuned_score,
                                 Err(e) => logger.log_warning(&format!(
@@ -617,10 +632,8 @@ pub async fn find_matches(
                 }
             }
 
-            // Update final_confidence_score on the pair_data struct before batching
             pair_data.final_confidence_score = final_confidence_score;
 
-            // Prepare data for batch upsert
             let new_entity_group_id_str = Uuid::new_v4().to_string();
             batch_entity_group_data.push(EntityGroupBatchData {
                 proposed_id: new_entity_group_id_str.clone(),
@@ -632,7 +645,6 @@ pub async fn find_matches(
                 match_values: pair_data.match_values.clone(),
             });
 
-            // Prepare parts for batch decision detail data, to be completed after upsert_entity_groups
             if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
                 if let Some(features_vec) = &pair_data.features_for_snapshot {
                     let version = ro_arc.lock().await.confidence_tuner.version;
@@ -649,7 +661,6 @@ pub async fn find_matches(
                 }
             }
 
-            // Prepare data for batch cache store
             if let (Some(sig1_data), Some(sig2_data)) = (
                 &pair_data.original_signature_1,
                 &pair_data.original_signature_2,
@@ -667,25 +678,21 @@ pub async fn find_matches(
                 });
             }
 
-            // Update progress bar every 10 pairs or on last pair in batch
             processed_pairs += 1;
             if pair_idx % 10 == 0 || pair_idx == chunk_len - 1 {
                 eval_pb.set_position(processed_pairs as u64);
-                // PROGRESS UPDATE: Detailed evaluation progress
                 if pair_idx % 50 == 0 || pair_idx == chunk_len - 1 {
                     update_detailed_progress!(progress_callback, "Evaluating pairs", 
                         processed_pairs, total_pairs,
                         format!("RL features: {}/{}", feature_extraction_successful, feature_extraction_attempted));
                 }
             }
-        } // End of chunk.iter_mut()
+        }
 
-        // Execute batch DB operations
         let upsert_results = batch_upsert_entity_groups(pool, batch_entity_group_data).await;
 
         match upsert_results {
             Ok(results_map) => {
-                // Now, iterate over the collected temporary data to create decision details
                 for (
                     pair_key,
                     snapshot_features_json,
@@ -775,7 +782,6 @@ pub async fn find_matches(
         Some((feature_extraction_attempted, feature_extraction_successful, feature_extraction_failed))
     );
 
-    // Phase 2: Mark entities as complete for Email matching
     logger.log_phase("Tracking completion status", Some("marking entities with no remaining email comparisons"));
     update_progress!(progress_callback, "Completion tracking", "marking completed entities");
     
@@ -818,7 +824,6 @@ pub async fn find_matches(
         }
     }
 
-    // FINAL PROGRESS UPDATE: Completion
     update_progress!(progress_callback, "Completed", 
         format!("{} email groups created, {} entities matched", 
                 final_groups_created_count, final_entities_in_new_pairs.len()));
@@ -829,8 +834,24 @@ pub async fn find_matches(
     }))
 }
 
-// Re-use `calculate_distance` from `url.rs` by making it `pub` in a shared `utils` module or by copying.
-// For now, let's copy it for simplicity within this module, assuming it's not made public yet.
+// Keep original function for backward compatibility
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>,
+    progress_callback: Option<ProgressCallback>,
+) -> Result<AnyMatchResult> {
+    find_matches_with_filter(
+        pool,
+        reinforcement_orchestrator_option,
+        pipeline_run_id,
+        feature_cache,
+        progress_callback,
+        None, // No filtering
+    ).await
+}
+
 fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const R: f64 = 6371000.0; // Earth radius in meters
     let (phi1, phi2) = (lat1.to_radians(), lat2.to_radians());
@@ -874,24 +895,21 @@ fn calculate_email_frequency(
 pub fn normalize_email(email: &str) -> String {
     let email_trimmed = email.trim().to_lowercase();
     if !email_trimmed.contains('@') {
-        return email_trimmed; // Or handle as invalid
+        return email_trimmed;
     }
     let parts: Vec<&str> = email_trimmed.splitn(2, '@').collect();
     if parts.len() != 2 {
-        return email_trimmed; // Or handle as invalid
+        return email_trimmed;
     }
     let (local_part_full, domain_part) = (parts[0], parts[1]);
 
-    // Remove part after '+'
     let local_part_no_plus = local_part_full.split('+').next().unwrap_or("").to_string();
 
-    // Normalize domain (e.g., googlemail.com -> gmail.com)
     let final_domain_part = match domain_part {
         "googlemail.com" => "gmail.com",
         _ => domain_part,
     };
 
-    // Remove dots from local part for Gmail addresses
     let final_local_part = if final_domain_part == "gmail.com" {
         local_part_no_plus.replace('.', "")
     } else {
@@ -899,7 +917,7 @@ pub fn normalize_email(email: &str) -> String {
     };
 
     if final_local_part.is_empty() {
-        String::new() // Invalid or empty local part after normalization
+        String::new()
     } else {
         format!("{}@{}", final_local_part, final_domain_part)
     }

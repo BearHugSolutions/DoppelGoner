@@ -1,4 +1,4 @@
-// manager.rs
+// src/matching/manager.rs
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -39,6 +39,7 @@ const CLUSTER_BATCH_SIZE: usize = 50;
 
 /// Runs the enhanced service matching pipeline across multiple clusters in parallel.
 /// Aggregates all matches and RL decision data for a single batch insertion at the end.
+/// NEW: Updated to accept and pass through service contributor filter
 pub async fn run_enhanced_service_matching_pipeline(
     pool: &PgPool,
     service_clusters: Vec<ServiceCluster>,
@@ -46,6 +47,7 @@ pub async fn run_enhanced_service_matching_pipeline(
     mut stats: ServiceMatchingStats,
     service_rl_orchestrator: Option<Arc<Mutex<ServiceRLOrchestrator>>>,
     service_feature_cache: Option<SharedServiceFeatureCache>,
+    service_contributor_filter: Option<crate::utils::service_contributor_filter::ServiceContributorFilterConfig>, // FIXED: Changed to owned type
     multi_progress: Option<MultiProgress>,
 ) -> Result<(Vec<ServiceMatch>, ServiceMatchingStats)> {
     let stats_mutex = Arc::new(Mutex::new(ServiceMatchingStats::default()));
@@ -64,7 +66,9 @@ pub async fn run_enhanced_service_matching_pipeline(
             .template("    {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
             .context("Failed to set progress bar style")?
             .progress_chars("#>-"));
-        pb.set_message(format!("Processing clusters... (RL enabled: {})", service_rl_orchestrator.is_some()));
+        pb.set_message(format!("Processing clusters... (RL enabled: {}, Filtering enabled: {})", 
+                              service_rl_orchestrator.is_some(),
+                              service_contributor_filter.as_ref().map_or(false, |f| f.enabled)));
         Some(pb)
     } else {
         let pb = ProgressBar::new(total_clusters); 
@@ -72,7 +76,9 @@ pub async fn run_enhanced_service_matching_pipeline(
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
             .context("Failed to set progress bar style")?
             .progress_chars("#>-"));
-        pb.set_message(format!("Processing clusters... (RL enabled: {})", service_rl_orchestrator.is_some()));
+        pb.set_message(format!("Processing clusters... (RL enabled: {}, Filtering enabled: {})", 
+                              service_rl_orchestrator.is_some(),
+                              service_contributor_filter.as_ref().map_or(false, |f| f.enabled)));
         Some(pb)
     };
     let pb_arc = Arc::new(pb.unwrap());
@@ -106,6 +112,9 @@ pub async fn run_enhanced_service_matching_pipeline(
             // Extract cluster_id_str here, before moving cluster_clone
             let cluster_id_str = cluster_clone.cluster_id.as_deref().unwrap_or("unknown").to_string();
 
+            // FIXED: Clone the filter config for each task
+            let service_contributor_filter_clone = service_contributor_filter.clone();
+
             let handle: JoinHandle<()> = tokio::spawn(async move {
                 let _permit = match semaphore_clone.acquire().await {
                     Ok(permit) => permit,
@@ -119,12 +128,14 @@ pub async fn run_enhanced_service_matching_pipeline(
                 let cluster_id_for_log = cluster_id_str.clone(); 
                 
                 // Wrap cluster processing in timeout
+                // FIXED: Pass owned filter to cluster processing
                 match timeout(CLUSTER_PROCESSING_TIMEOUT, run_enhanced_service_matching_for_cluster(
                     &pool_clone, 
                     cluster_clone, // Pass the owned clone here
                     &pipeline_run_id_clone,
                     rl_orchestrator_clone,
                     feature_cache_clone,
+                    service_contributor_filter_clone, // FIXED: Pass owned filter through
                     multi_progress_clone,
                 )).await {
                     Ok(Ok((cluster_matches, cluster_rl_features, cluster_stats))) => {
@@ -256,22 +267,25 @@ pub async fn run_enhanced_service_matching_pipeline(
     ).await.context("Failed to perform final batch insertion of service groups and RL decision details")?;
 
     info!(
-        "Enhanced service matching pipeline completed: {} total matches from {} clusters (RL enabled: {})",
+        "Enhanced service matching pipeline completed: {} total matches from {} clusters (RL enabled: {}, Filtering enabled: {})",
         final_matches.len(),
         stats.total_clusters_processed,
-        service_rl_orchestrator.is_some()
+        service_rl_orchestrator.is_some(),
+        service_contributor_filter.as_ref().map_or(false, |f| f.enabled)
     );
 
     Ok((final_matches, stats))
 }
 
 /// Run enhanced matching strategies for a single cluster with cross-validation and RL integration
+/// FIXED: Updated to accept owned service contributor filter
 async fn run_enhanced_service_matching_for_cluster(
     pool: &PgPool,
     cluster: ServiceCluster, // Takes ownership of ServiceCluster
     pipeline_run_id: &str,
     service_rl_orchestrator: Option<Arc<Mutex<ServiceRLOrchestrator>>>,
     service_feature_cache: Option<SharedServiceFeatureCache>,
+    service_contributor_filter: Option<crate::utils::service_contributor_filter::ServiceContributorFilterConfig>, // FIXED: Changed to owned type
     multi_progress: Option<MultiProgress>, 
 ) -> Result<(Vec<ServiceMatch>, Vec<(String, String, Vec<f64>)>, ServiceMatchingStats)> {
     let cluster_start = Instant::now();
@@ -281,10 +295,11 @@ async fn run_enhanced_service_matching_for_cluster(
     let cluster_id_str = cluster.cluster_id.as_deref().unwrap_or("unknown").to_string(); // Owned string
 
     debug!(
-        "Processing cluster {:?} with {} services using enhanced strategies with RL integration (RL enabled: {})",
+        "Processing cluster {:?} with {} services using enhanced strategies with RL integration (RL enabled: {}, Filtering enabled: {})",
         &cluster_id_str, // Use reference here
         service_count,
-        service_rl_orchestrator.is_some()
+        service_rl_orchestrator.is_some(),
+        service_contributor_filter.as_ref().map_or(false, |f| f.enabled)
     );
 
     if service_count < 2 {
@@ -425,10 +440,11 @@ async fn run_enhanced_service_matching_for_cluster(
     }
 
     debug!(
-        "Cluster {:?} completed in {:.2?} - {} matches found",
+        "Cluster {:?} completed in {:.2?} - {} matches found (Filtering enabled: {})",
         &cluster_id_str,
         total_cluster_time,
-        simple_matches.len()
+        simple_matches.len(),
+        service_contributor_filter.as_ref().map_or(false, |f| f.enabled)
     );
 
     Ok((simple_matches, all_cluster_rl_features, cluster_stats))

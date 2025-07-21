@@ -1,4 +1,4 @@
-// src/matching/phone.rs - Progress Callback Integration
+// src/matching/phone.rs - Progress Callback and Contributor Filtering Integration
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, warn};
@@ -22,10 +22,13 @@ use crate::utils::pipeline_state::{
     batch_check_comparison_cache, batch_check_entity_completion_status, batch_get_current_signatures_for_pairs, batch_mark_entity_completion, batch_store_in_comparison_cache, ComparisonCacheEntry, EntityCompletionCheck, EntitySignature as SignatureData
 };
 use crate::utils::constants::MAX_DISTANCE_FOR_SAME_CITY_METERS;
-
-// NEW IMPORTS: Progress callback functionality
 use crate::utils::progress_bars::progress_callback::ProgressCallback;
 use crate::{update_progress, update_detailed_progress};
+
+// NEW: Import for contributor filtering
+use crate::utils::contributor_filter::ContributorFilterConfig;
+use tokio_postgres::types::ToSql;
+
 
 /// Internal struct to hold data for a pair that needs to be processed,
 /// including all information required for DB upsert and decision detail insert.
@@ -51,19 +54,25 @@ struct PhoneInfo {
     longitude: Option<f64>,
 }
 
-// UPDATED FUNCTION SIGNATURE: Added ProgressCallback parameter
-#[allow(clippy::too_many_arguments)]
-pub async fn find_matches(
+// NEW: Filtered version of find_matches
+pub async fn find_matches_with_filter(
     pool: &PgPool,
     reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
     pipeline_run_id: &str,
     feature_cache: Option<SharedFeatureCache>,
-    progress_callback: Option<ProgressCallback>, // NEW PARAMETER
+    progress_callback: Option<ProgressCallback>,
+    contributor_filter: Option<&ContributorFilterConfig>, // NEW PARAMETER
 ) -> Result<AnyMatchResult> {
     let logger = MatchingLogger::new(MatchMethodType::Phone);
     logger.log_start(pipeline_run_id, reinforcement_orchestrator_option.is_some());
 
-    // PROGRESS UPDATE: Starting phase
+    // Log filtering status
+    if let Some(filter) = contributor_filter {
+        if filter.is_active() {
+            info!("📞 Phone matching with contributor filtering: {:?}", filter.allowed_contributors);
+        }
+    }
+
     update_progress!(progress_callback, "Starting", "Initializing phone matching");
 
     let initial_conn = pool
@@ -78,15 +87,12 @@ pub async fn find_matches(
     let existing_entity_groups = fetch_existing_entity_groups(&*initial_conn).await?;
     logger.log_existing_pairs(existing_entity_groups.len());
 
-    // PROGRESS UPDATE: Existing pairs loaded
     update_progress!(progress_callback, "Loading existing pairs", 
         format!("Found {} existing pairs", existing_entity_groups.len()));
 
-    // Phase 1 Changes: Entity Filtering
     logger.log_phase("Loading phone data", Some("querying entities with phone numbers (excluding completed)"));
     update_progress!(progress_callback, "Loading phone data", "querying entities with phone numbers");
     
-    // Step 1: Get all potential entity IDs with phones
     let potential_entities_query = "
         SELECT DISTINCT e.id
         FROM public.entity e
@@ -103,11 +109,9 @@ pub async fn find_matches(
         .collect();
     logger.log_debug(&format!("Phone: Found {} entities with phones", all_potential_entity_ids.len()));
 
-    // PROGRESS UPDATE: Potential entities found
     update_progress!(progress_callback, "Loading phone data", 
         format!("Found {} entities with phones", all_potential_entity_ids.len()));
 
-    // Step 2: Check completion status
     update_progress!(progress_callback, "Loading phone data", "checking completion status");
     let completion_status: HashMap<String, EntityCompletionCheck> = batch_check_entity_completion_status(
         pool,
@@ -115,7 +119,6 @@ pub async fn find_matches(
         &MatchMethodType::Phone
     ).await?;
 
-    // Step 3: Filter out completed entities
     let incomplete_entity_ids: Vec<String> = completion_status
         .iter()
         .filter_map(|(entity_id, status)| {
@@ -127,7 +130,7 @@ pub async fn find_matches(
         })
         .collect();
     let completed_count = all_potential_entity_ids.len() - incomplete_entity_ids.len();
-    let total_potential_entities = all_potential_entity_ids.len(); // Change A: Add total_potential_entities
+    let total_potential_entities = all_potential_entity_ids.len();
     logger.log_debug(&format!(
         "Phone: {} total entities, {} already complete, {} to process",
         all_potential_entity_ids.len(),
@@ -135,16 +138,13 @@ pub async fn find_matches(
         incomplete_entity_ids.len()
     ));
 
-    // PROGRESS UPDATE: Completion status results
     update_progress!(progress_callback, "Loading phone data", 
         format!("{} to process ({} already complete)", incomplete_entity_ids.len(), completed_count));
 
-    // Step 4: Load detailed data only for incomplete entities
+    // Step 4: Load detailed data only for incomplete entities WITH FILTERING
     let phone_rows = if incomplete_entity_ids.is_empty() {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No incomplete entities to process");
         
-        // Change B: Early Return #1 (no incomplete entities)
         return Ok(AnyMatchResult::Phone(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -160,32 +160,54 @@ pub async fn find_matches(
     } else {
         update_progress!(progress_callback, "Loading phone data", "querying phone records");
         
-        let phone_query = "
+        // NEW: Build filtered phone query
+        let mut phone_query = "
             SELECT e.id as entity_id, p.number, p.extension,
                    l.latitude, l.longitude
             FROM public.entity e
             JOIN public.entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'phone'
             JOIN public.phone p ON ef.table_id = p.id
+            JOIN public.organization o ON e.organization_id = o.id
             LEFT JOIN public.entity_feature ef_loc ON e.id = ef_loc.entity_id AND ef_loc.table_name = 'location'
             LEFT JOIN public.location l ON ef_loc.table_id = l.id
-            WHERE e.id = ANY($1) AND p.number IS NOT NULL AND p.number != ''";
+            WHERE e.id = ANY($1) AND p.number IS NOT NULL AND p.number != ''".to_string();
+
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+        params.push(Box::new(incomplete_entity_ids.clone()));
+        let param_offset = 1;
+
+        // Add contributor filtering if enabled
+        if let Some(filter) = contributor_filter {
+            if let Some((where_clause, contributor_params)) = filter.build_sql_filter_with_offset(param_offset) {
+                phone_query.push_str(&format!(" AND {}", where_clause));
+                for param in contributor_params {
+                    params.push(Box::new(param));
+                }
+                info!("🔍 Applied contributor filter to phone query");
+            }
+        }
+
+        // Execute with filtered query
+        let params_slice: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+
         initial_conn
-            .query(phone_query, &[&incomplete_entity_ids])
+            .query(&phone_query, &params_slice)
             .await
-            .context("Phone: Failed to query phones for incomplete entities")?
+            .context("Phone: Failed to query phones for incomplete entities with contributor filter")?
     };
 
     logger.log_data_loaded(phone_rows.len(), "phone");
-    // PROGRESS UPDATE: Data loaded
     update_progress!(progress_callback, "Loading phone data", 
         format!("Loaded {} phone records", phone_rows.len()));
     
-    drop(initial_conn); // Release connection
+    drop(initial_conn);
 
     logger.log_phase("Processing and normalizing phone numbers", None);
     update_progress!(progress_callback, "Processing phones", "normalizing phone numbers");
 
-    // Create progress bar for phone processing
     let processing_pb = ProgressBar::new(phone_rows.len() as u64);
     processing_pb.set_style(
         ProgressStyle::default_bar()
@@ -198,9 +220,7 @@ pub async fn find_matches(
     let mut duplicate_entries = 0;
     let mut invalid_formats = 0;
 
-    // ENHANCED PROCESSING LOOP: Add detailed progress updates
     for (i, row) in phone_rows.iter().enumerate() {
-        // PROGRESS UPDATE: Update every 500 items (smaller batches for phone processing)
         if i % 500 == 0 || i == phone_rows.len() - 1 {
             processing_pb.set_position(i as u64 + 1);
             update_detailed_progress!(progress_callback, "Processing phones", i + 1, phone_rows.len(),
@@ -224,7 +244,6 @@ pub async fn find_matches(
             continue;
         }
 
-        // Check if a PhoneInfo with this entity_id already exists for this normalized phone
         let entry = phone_map.entry(normalized_phone.clone()).or_default();
         if !entry.iter().any(|info| info.entity_id == entity_id) {
             entry.push(PhoneInfo {
@@ -252,7 +271,6 @@ pub async fn find_matches(
     logger.log_data_quality_issue("invalid phone formats", invalid_formats);
     logger.log_processing_complete(phone_rows.len(), phone_map.len(), groups_with_multiple);
 
-    // PROGRESS UPDATE: Processing complete
     update_progress!(progress_callback, "Processing phones", 
         format!("Processed {} phones into {} groups", phone_rows.len(), phone_map.len()));
 
@@ -263,7 +281,6 @@ pub async fn find_matches(
     let mut processed_pairs_this_run: HashSet<(String, String)> = HashSet::new();
     let mut pairs_for_signature_fetch: Vec<(String, String)> = Vec::new();
 
-    // Calculate total pairs for progress tracking
     let total_conceptual_pairs: usize = phone_map
         .values()
         .map(|entities| {
@@ -277,7 +294,6 @@ pub async fn find_matches(
         .sum();
 
     logger.log_pair_generation(total_conceptual_pairs, groups_with_multiple);
-    // PROGRESS UPDATE: Pair generation started
     update_progress!(progress_callback, "Generating pairs", 
         format!("{} potential pairs to evaluate", total_conceptual_pairs));
 
@@ -324,7 +340,6 @@ pub async fn find_matches(
                             all_pairs_to_process.len()
                         ));
                         
-                        // PROGRESS UPDATE: Detailed pair generation progress
                         if current_pair_count_for_pb % 500 == 0 {
                             update_detailed_progress!(progress_callback, "Generating pairs", 
                                 current_pair_count_for_pb, total_conceptual_pairs,
@@ -372,7 +387,6 @@ pub async fn find_matches(
                     continue;
                 }
 
-                // --- Geospatial Filtering ---
                 if let (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) =
                     (e1_lat, e1_lon, e2_lat, e2_lon)
                 {
@@ -414,7 +428,7 @@ pub async fn find_matches(
                     entity_id_2: e2_id.clone(),
                     match_values: match_values_obj,
                     pre_rl_confidence_score: pre_rl_confidence,
-                    final_confidence_score: pre_rl_confidence, // Initial, will be tuned
+                    final_confidence_score: pre_rl_confidence,
                     features_for_snapshot: None,
                     original_signature_1: None,
                     original_signature_2: None,
@@ -437,15 +451,12 @@ pub async fn find_matches(
         logger.log_geospatial_filtering(total_conceptual_pairs, geospatial_filtered, MAX_DISTANCE_FOR_SAME_CITY_METERS);
     }
 
-    // PROGRESS UPDATE: Pair generation complete
     update_progress!(progress_callback, "Generating pairs", 
         format!("{} candidate pairs after filtering", all_pairs_to_process.len()));
 
     if all_pairs_to_process.is_empty() {
-        // PROGRESS UPDATE: Early return case
         update_progress!(progress_callback, "Completed", "No pairs to process");
         
-        // Change C: Early Return #2 (no pairs to process)
         return Ok(AnyMatchResult::Phone(MatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
@@ -460,7 +471,6 @@ pub async fn find_matches(
         }));
     }
 
-    // --- Batch processing starts here ---
     logger.log_cache_and_signatures(pairs_for_signature_fetch.len());
     update_progress!(progress_callback, "Cache checking", "fetching entity signatures");
     
@@ -500,14 +510,12 @@ pub async fn find_matches(
     }
 
     logger.log_cache_results(cache_hits_count, pairs_to_process_after_cache.len());
-    // PROGRESS UPDATE: Cache results
     update_progress!(progress_callback, "Cache checking", 
         format!("{} cache hits, {} pairs to evaluate", cache_hits_count, pairs_to_process_after_cache.len()));
 
     logger.log_phase("Evaluating pairs with RL confidence tuning", None);
     update_progress!(progress_callback, "Evaluating pairs", "running confidence analysis");
 
-    // Add evaluation progress bar
     let eval_pb = ProgressBar::new(pairs_to_process_after_cache.len() as u64);
     eval_pb.set_style(
         ProgressStyle::default_bar()
@@ -522,7 +530,6 @@ pub async fn find_matches(
 
     const BATCH_DB_OPS_SIZE: usize = 1000;
     logger.log_batch_processing_start(pairs_to_process_after_cache.len(), BATCH_DB_OPS_SIZE);
-    // PROGRESS UPDATE: Batch processing start
     update_progress!(progress_callback, "Batch processing", 
         format!("Processing {} pairs in batches of {}", pairs_to_process_after_cache.len(), BATCH_DB_OPS_SIZE));
 
@@ -537,18 +544,17 @@ pub async fn find_matches(
     let total_pairs = pairs_to_process_after_cache.len();
 
     let total_batches = (pairs_to_process_after_cache.len() + BATCH_DB_OPS_SIZE - 1) / BATCH_DB_OPS_SIZE;
-    for (batch_idx, chunk) in pairs_to_process_after_cache.chunks_mut(BATCH_DB_OPS_SIZE).enumerate() { // Changed to chunks_mut
+    for (batch_idx, chunk) in pairs_to_process_after_cache.chunks_mut(BATCH_DB_OPS_SIZE).enumerate() {
         logger.log_batch_progress(batch_idx + 1, total_batches, chunk.len());
-        // PROGRESS UPDATE: Batch progress
         update_detailed_progress!(progress_callback, "Batch processing", 
             batch_idx + 1, total_batches, format!("{} pairs in this batch", chunk.len()));
         
         let mut batch_entity_group_data = Vec::new();
         let mut batch_decision_detail_data = Vec::new();
         let mut batch_cache_store_data = Vec::new();
-        let mut chunk_len = chunk.len();
+        let chunk_len = chunk.len();
 
-        for (pair_idx, pair_data) in chunk.iter_mut().enumerate() { // Iterate mutably here
+        for (pair_idx, pair_data) in chunk.iter_mut().enumerate() {
             let mut final_confidence_score = pair_data.pre_rl_confidence_score;
             let mut features_vec_for_rl: Option<Vec<f64>> = None;
             let mut features_json_for_cache: Option<serde_json::Value> = None;
@@ -602,23 +608,20 @@ pub async fn find_matches(
                     }
                 }
             }
-            // Update final_confidence_score on the pair_data struct before batching
             pair_data.final_confidence_score = final_confidence_score;
-            pair_data.features_for_snapshot = features_vec_for_rl; // Store the features for later use
+            pair_data.features_for_snapshot = features_vec_for_rl;
 
-            // Prepare data for batch upsert
             let new_entity_group_id_str = Uuid::new_v4().to_string();
             batch_entity_group_data.push(EntityGroupBatchData {
                 proposed_id: new_entity_group_id_str.clone(),
                 entity_id_1: pair_data.entity_id_1.clone(),
                 entity_id_2: pair_data.entity_id_2.clone(),
-                confidence_score: pair_data.final_confidence_score, // Use the potentially tuned score
+                confidence_score: pair_data.final_confidence_score,
                 pre_rl_confidence_score: pair_data.pre_rl_confidence_score,
                 method_type: MatchMethodType::Phone,
                 match_values: pair_data.match_values.clone(),
             });
 
-            // Prepare data for batch cache store
             if let (Some(sig1_data), Some(sig2_data)) = (
                 &pair_data.original_signature_1,
                 &pair_data.original_signature_2,
@@ -636,18 +639,15 @@ pub async fn find_matches(
                 });
             }
 
-            // Update progress bar within the batch loop
             processed_pairs += 1;
             if pair_idx % 50 == 0 || pair_idx == chunk_len - 1 {
                 eval_pb.set_position(processed_pairs as u64);
-                // PROGRESS UPDATE: Detailed evaluation progress
                 update_detailed_progress!(progress_callback, "Evaluating pairs", 
                     processed_pairs, total_pairs,
                     format!("RL features: {}/{}", feature_extraction_successful, feature_extraction_attempted));
             }
-        } // End of chunk iteration
+        }
 
-        // Execute batch DB operations
         let upsert_results = batch_upsert_entity_groups(pool, batch_entity_group_data).await;
 
         match upsert_results {
@@ -727,8 +727,8 @@ pub async fn find_matches(
         } else {
             0.0
         },
-        entities_skipped_complete: completed_count, // Change D: Add new fields
-        entities_total: total_potential_entities,   // Change D: Add new fields
+        entities_skipped_complete: completed_count,
+        entities_total: total_potential_entities,
     };
 
     logger.log_completion(
@@ -744,7 +744,6 @@ pub async fn find_matches(
         Some((feature_extraction_attempted, feature_extraction_successful, feature_extraction_failed))
     );
 
-    // Phase 2: Mark entities as complete for Phone matching
     logger.log_phase("Tracking completion status", Some("marking entities with no remaining phone comparisons"));
     update_progress!(progress_callback, "Completion tracking", "marking completed entities");
     
@@ -787,7 +786,6 @@ pub async fn find_matches(
         }
     }
 
-    // FINAL PROGRESS UPDATE: Completion
     update_progress!(progress_callback, "Completed", 
         format!("{} phone groups created, {} entities matched", 
                 final_groups_created_count, final_entities_in_new_pairs.len()));
@@ -798,8 +796,24 @@ pub async fn find_matches(
     }))
 }
 
-// Re-use `calculate_distance` from `url.rs` by making it `pub` in a shared `utils` module or by copying.
-// For now, let's copy it for simplicity within this module, assuming it's not made public yet.
+// Keep original function for backward compatibility
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator_option: Option<Arc<Mutex<RLOrchestrator>>>,
+    pipeline_run_id: &str,
+    feature_cache: Option<SharedFeatureCache>,
+    progress_callback: Option<ProgressCallback>,
+) -> Result<AnyMatchResult> {
+    find_matches_with_filter(
+        pool,
+        reinforcement_orchestrator_option,
+        pipeline_run_id,
+        feature_cache,
+        progress_callback,
+        None, // No filtering
+    ).await
+}
+
 fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const R: f64 = 6371000.0; // Earth radius in meters
     let (phi1, phi2) = (lat1.to_radians(), lat2.to_radians());

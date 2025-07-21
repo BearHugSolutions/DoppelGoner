@@ -3,7 +3,7 @@ name = "organization_matching"
 version = "0.1.0"
 edition = "2021"
 authors = ["David Botos"]
-description = "A deduplication system for HSDS"
+description = "A deduplication system for HSDS with contributor filtering"
 
 [dependencies]
 # Error handling
@@ -44,9 +44,9 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 
 # Machine Learning
-smartcore = { version = "0.3.2", features = ["serde"] }  # Replaces lightgbm
-ndarray = "0.15.6"   # Array manipulation
-linfa = "0.6.1"      # Potential utility functions
+smartcore = { version = "0.3.2", features = ["serde"] }
+ndarray = "0.15.6"
+linfa = "0.6.1"
 candle-core = { version = "0.9.1", features = ["accelerate"] }
 candle-nn = { version = "0.9.1", features = ["accelerate"] }
 once_cell = "1.19.0"
@@ -63,9 +63,9 @@ strsim = "0.10.0"
 # For regular expressions in name normalization
 regex = "1.7.0"
 
-lru = "0.9"  # For feature caching
-num_cpus = "1.15"  # For detecting available CPU cores
-sysinfo = "0.30"  # For memory monitoring
+lru = "0.9"
+num_cpus = "1.15"
+sysinfo = "0.30"
 indicatif = "0.17"
 
 # Hashing calculations
@@ -74,6 +74,9 @@ hex = "0.4"
 
 reqwest = { version = "0.11", features = ["json"] }
 clap = { version = "4.5.40", features = ["derive"] }
+
+# NEW: Environment variable support
+dotenv = "0.15"
 
 # Define binary targets
 [[bin]]
@@ -95,10 +98,6 @@ path = "src/bin/report_model_weights.rs"
 [[bin]]
 name = "run_clustering"
 path = "src/bin/run_clustering.rs"
-
-[[bin]]
-name = "name_threshold_tuner"
-path = "src/bin/name_threshold_tuner.rs"
 
 [[bin]]
 name = "url_distance_tuner"

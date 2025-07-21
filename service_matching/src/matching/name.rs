@@ -1,5 +1,5 @@
 // src/matching/name.rs
-// Enhanced service name matching strategies with advanced location handling and contextual rules
+// Enhanced service name matching strategies with advanced location handling, contextual rules, and conditional RL integration.
 
 use log::{debug, info, warn};
 use regex::Regex;
@@ -180,10 +180,10 @@ const NUMERIC_PATTERNS: [(&str, &str); 8] = [
     (r"\bfloor\s+(\d+)", "floor $1"),
 ];
 
-/// Entry point for service name matching with RL integration
-/// Now takes a pool instead of a connection to allow getting fresh connections per pair
+
+/// Entry point for service name matching with conditional RL integration
 pub async fn run_enhanced_name_matching(
-    pool: &PgPool, // Changed from connection to pool
+    pool: &PgPool,
     services: &[ServiceInfo],
     rl_orchestrator: Option<Arc<Mutex<ServiceRLOrchestrator>>>,
     feature_cache: Option<SharedServiceFeatureCache>,
@@ -193,12 +193,15 @@ pub async fn run_enhanced_name_matching(
     let mut stats = ServiceNameMatchingStats::default();
     let mut features_for_rl_logging: Vec<(String, String, Vec<f64>)> = Vec::new();
 
+    let rl_enabled = rl_orchestrator.is_some();
+    debug!("Starting service name matching with {} services (RL: {})", services.len(), if rl_enabled { "enabled" } else { "disabled" });
+
     if services.len() > LARGE_CLUSTER_THRESHOLD_NAME {
         stats.large_cluster_mode = true;
-        warn!("Running Service Name matching in LARGE CLUSTER (indexing) mode ({} services)", services.len());
+        warn!("Running Service Name matching in LARGE CLUSTER (indexing) mode ({} services, RL: {})", services.len(), if rl_enabled { "enabled" } else { "disabled" });
         if let Some(pb) = &method_pb {
             pb.set_length(2);
-            pb.set_message("Name Matching: Building index (large cluster)...");
+            pb.set_message(format!("Name Matching: Building index (large cluster, RL: {})...", if rl_enabled { "on" } else { "off" }));
             pb.set_position(0);
         }
         let (matches, rl_features, indexed_stats) = run_indexed_name_matching(pool, services, rl_orchestrator, feature_cache, method_pb.clone()).await;
@@ -220,7 +223,7 @@ pub async fn run_enhanced_name_matching(
     
     if let Some(pb) = &method_pb {
         pb.set_length(services.len() as u64 * services.len() as u64 / 2);
-        pb.set_message("Name Matching: Comparing all pairs...");
+        pb.set_message(format!("Name Matching: Comparing all pairs (RL: {})...", if rl_enabled { "on" } else { "off" }));
         pb.set_position(0);
     }
 
@@ -244,7 +247,7 @@ pub async fn run_enhanced_name_matching(
                 &services[j], 
                 &rl_orchestrator, 
                 &feature_cache, 
-                &*conn // Dereference the connection guard
+                &*conn
             ).await {
                 matches.push(name_match.clone());
                 confidence_scores.push(name_match.confidence_score);
@@ -289,10 +292,11 @@ pub async fn run_enhanced_name_matching(
     stats.processing_time = start_time.elapsed();
     
     info!(
-        "Service name matching completed: {} matches from {} pairs in {:.2?}",
+        "Service name matching completed: {} matches from {} pairs in {:.2?} (RL: {})",
         stats.matches_found,
         stats.pairs_compared,
-        stats.processing_time
+        stats.processing_time,
+        if rl_enabled { "enabled" } else { "disabled" }
     );
     
     if let Some(pb) = method_pb { pb.finish_and_clear(); }
@@ -300,8 +304,7 @@ pub async fn run_enhanced_name_matching(
     (matches, features_for_rl_logging, stats)
 }
 
-/// Runs indexed name matching for large clusters.
-/// Now takes a pool instead of a connection
+/// Runs indexed name matching for large clusters, now with conditional RL integration.
 async fn run_indexed_name_matching(
     pool: &PgPool,
     services: &[ServiceInfo],
@@ -360,7 +363,6 @@ async fn run_indexed_name_matching(
         let service1 = service_data_map[&idx1];
         let service2 = service_data_map[&idx2];
         
-        // Get a fresh connection for this pair
         let conn = match pool.get().await {
             Ok(conn) => conn,
             Err(e) => {
@@ -389,8 +391,6 @@ async fn run_indexed_name_matching(
             }
         }
         
-        // Connection is automatically dropped here
-        
         if let Some(pb) = &method_pb { pb.inc(1); }
     }
 
@@ -402,6 +402,156 @@ async fn run_indexed_name_matching(
     };
     
     (matches, features_for_rl_logging, stats)
+}
+
+/// Enhanced service name matching with comprehensive location and contextual analysis plus conditional RL integration
+pub async fn match_services_by_name_enhanced(
+    service1: &ServiceInfo, 
+    service2: &ServiceInfo,
+    rl_orchestrator: &Option<Arc<Mutex<ServiceRLOrchestrator>>>,
+    feature_cache: &Option<SharedServiceFeatureCache>,
+    conn: &tokio_postgres::Client,
+) -> Option<(ServiceMatch, Option<Vec<f64>>)> {
+    if let (Some(name1_orig), Some(name2_orig)) = (&service1.name, &service2.name) {
+        let (normalized_name1, service_type1) = normalize_service_name_advanced(name1_orig);
+        let (normalized_name2, service_type2) = normalize_service_name_advanced(name2_orig);
+
+        if normalized_name1.is_empty() || normalized_name2.is_empty() {
+            return None;
+        }
+
+        if let (Some(t1), Some(t2)) = (service_type1, service_type2) {
+            if t1 != t2 && is_incompatible_service_types(t1, t2) {
+                debug!("Rejecting service name match due to incompatible types: {} vs {}", t1, t2);
+                return None;
+            }
+        }
+
+        let location1 = extract_location_info(&normalized_name1);
+        let location2 = extract_location_info(&normalized_name2);
+        
+        if location1.has_conflicting_locations(&location2) {
+            debug!("Rejecting service name match due to conflicting locations");
+            return None;
+        }
+
+        let (tokens1, bigrams1) = tokenize_service_name(&normalized_name1, service_type1);
+        let (tokens2, bigrams2) = tokenize_service_name(&normalized_name2, service_type2);
+
+        let token_overlap = tokens1.intersection(&tokens2).count();
+        if token_overlap < MIN_TOKEN_OVERLAP && bigrams1.intersection(&bigrams2).count() == 0 {
+            return None;
+        }
+
+        let fuzzy_score = jaro_winkler(&normalized_name1, &normalized_name2);
+        let token_similarity_score = calculate_token_similarity(&tokens1, &tokens2, &bigrams1, &bigrams2);
+        let location_similarity = location1.calculate_similarity(&location2);
+        
+        let base_score = (fuzzy_score * FUZZY_WEIGHT) + (token_similarity_score * SEMANTIC_WEIGHT);
+        let location_adjusted_score = base_score + (location_similarity * LOCATION_WEIGHT);
+        
+        let pre_rl_confidence = apply_enhanced_service_domain_rules(
+            &normalized_name1, 
+            &normalized_name2, 
+            location_adjusted_score, 
+            service_type1, 
+            service_type2,
+            &location1,
+            &location2
+        );
+
+        if pre_rl_confidence < SERVICE_NAME_COMBINED_THRESHOLD {
+            return None;
+        }
+
+        let mut captured_features: Option<Vec<f64>> = None;
+        let rl_enabled = rl_orchestrator.is_some();
+
+        // MODIFIED: Conditional RL Integration
+        let final_confidence = if rl_enabled {
+            if let Some(rl_orch) = rl_orchestrator {
+                // Extract features (always useful for caching)
+                let context_features_res = if let Some(cache_arc) = feature_cache {
+                    let mut cache_guard = cache_arc.lock().await;
+                    cache_guard.get_pair_features(conn, &service1.service_id, &service2.service_id).await
+                } else {
+                    crate::rl::service_feature_extraction::extract_service_context_for_pair(
+                        conn, &service1.service_id, &service2.service_id
+                    ).await
+                };
+
+                if let Ok(features) = context_features_res {
+                    captured_features = Some(features.clone());
+                    let mut rl_guard = rl_orch.lock().await;
+                    match rl_guard.get_tuned_confidence(
+                        &MatchMethodType::ServiceNameSimilarity,
+                        pre_rl_confidence,
+                        &features,
+                    ) {
+                        Ok(tuned_conf) => {
+                            debug!(
+                                "Service name match RL tuning: {:.3} -> {:.3} for services {} <-> {}",
+                                pre_rl_confidence, tuned_conf, service1.service_id, service2.service_id
+                            );
+                            tuned_conf
+                        }
+                        Err(e) => {
+                            warn!("Failed to get RL tuned confidence for service name match: {}. Using pre-RL confidence.", e);
+                            pre_rl_confidence
+                        }
+                    }
+                } else {
+                    warn!("Failed to extract features for service pair ({}, {}): {}. Using pre-RL confidence.", 
+                            service1.service_id, service2.service_id, context_features_res.unwrap_err());
+                    pre_rl_confidence
+                }
+            } else {
+                // This shouldn't happen if rl_enabled is true, but handle gracefully
+                warn!("RL enabled but no orchestrator available, using pre-RL confidence");
+                pre_rl_confidence
+            }
+        } else {
+            // RL disabled - still extract features for caching if cache is available
+            if let Some(cache_arc) = feature_cache {
+                let context_features_res = {
+                    let mut cache_guard = cache_arc.lock().await;
+                    cache_guard.get_pair_features(conn, &service1.service_id, &service2.service_id).await
+                };
+                
+                if let Ok(features) = context_features_res {
+                    captured_features = Some(features);
+                    debug!("Extracted features for caching (RL disabled) for pair ({}, {})", 
+                           service1.service_id, service2.service_id);
+                }
+            }
+            pre_rl_confidence
+        };
+
+        if final_confidence >= SERVICE_NAME_COMBINED_THRESHOLD {
+            debug!(
+                "Service name match: {} <-> {} (pre-RL: {:.3}, final: {:.3}, RL: {})",
+                service1.service_id, service2.service_id, pre_rl_confidence, final_confidence,
+                if rl_enabled { "enabled" } else { "disabled" }
+            );
+            
+            Some((ServiceMatch {
+                service_id_1: service1.service_id.clone(),
+                service_id_2: service2.service_id.clone(),
+                match_method: MatchMethodType::ServiceNameSimilarity,
+                confidence_score: final_confidence.min(1.0),
+                match_values: MatchValues::ServiceName(ServiceNameMatchValue {
+                    original_name1: name1_orig.clone(),
+                    original_name2: name2_orig.clone(),
+                    normalized_name1,
+                    normalized_name2,
+                }),
+            }, captured_features))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 /// Enhanced service name normalization with comprehensive multi-phase processing
@@ -743,129 +893,6 @@ fn are_conflicting_directions(dir1: &str, dir2: &str) -> bool {
     conflicts.iter().any(|(d1, d2)| {
         (dir1 == *d1 && dir2 == *d2) || (dir1 == *d2 && dir2 == *d1)
     })
-}
-
-/// Enhanced service name matching with comprehensive location and contextual analysis plus RL integration
-pub async fn match_services_by_name_enhanced(
-    service1: &ServiceInfo, 
-    service2: &ServiceInfo,
-    rl_orchestrator: &Option<Arc<Mutex<ServiceRLOrchestrator>>>,
-    feature_cache: &Option<SharedServiceFeatureCache>,
-    conn: &tokio_postgres::Client,
-) -> Option<(ServiceMatch, Option<Vec<f64>>)> {
-    if let (Some(name1_orig), Some(name2_orig)) = (&service1.name, &service2.name) {
-        let (normalized_name1, service_type1) = normalize_service_name_advanced(name1_orig);
-        let (normalized_name2, service_type2) = normalize_service_name_advanced(name2_orig);
-
-        if normalized_name1.is_empty() || normalized_name2.is_empty() {
-            return None;
-        }
-
-        if let (Some(t1), Some(t2)) = (service_type1, service_type2) {
-            if t1 != t2 && is_incompatible_service_types(t1, t2) {
-                debug!("Rejecting service name match due to incompatible types: {} vs {}", t1, t2);
-                return None;
-            }
-        }
-
-        let location1 = extract_location_info(&normalized_name1);
-        let location2 = extract_location_info(&normalized_name2);
-        
-        if location1.has_conflicting_locations(&location2) {
-            debug!("Rejecting service name match due to conflicting locations");
-            return None;
-        }
-
-        let (tokens1, bigrams1) = tokenize_service_name(&normalized_name1, service_type1);
-        let (tokens2, bigrams2) = tokenize_service_name(&normalized_name2, service_type2);
-
-        let token_overlap = tokens1.intersection(&tokens2).count();
-        if token_overlap < MIN_TOKEN_OVERLAP && bigrams1.intersection(&bigrams2).count() == 0 {
-            return None;
-        }
-
-        let fuzzy_score = jaro_winkler(&normalized_name1, &normalized_name2);
-        let token_similarity_score = calculate_token_similarity(&tokens1, &tokens2, &bigrams1, &bigrams2);
-        let location_similarity = location1.calculate_similarity(&location2);
-        
-        let base_score = (fuzzy_score * FUZZY_WEIGHT) + (token_similarity_score * SEMANTIC_WEIGHT);
-        let location_adjusted_score = base_score + (location_similarity * LOCATION_WEIGHT);
-        
-        let pre_rl_confidence = apply_enhanced_service_domain_rules(
-            &normalized_name1, 
-            &normalized_name2, 
-            location_adjusted_score, 
-            service_type1, 
-            service_type2,
-            &location1,
-            &location2
-        );
-
-        if pre_rl_confidence < SERVICE_NAME_COMBINED_THRESHOLD {
-            return None;
-        }
-
-        let mut captured_features: Option<Vec<f64>> = None;
-
-        // RL Integration with connection-based feature extraction
-        let final_confidence = if let Some(rl_orch) = rl_orchestrator {
-            let context_features_res = if let Some(cache_arc) = feature_cache {
-                let mut cache_guard = cache_arc.lock().await;
-                cache_guard.get_pair_features(conn, &service1.service_id, &service2.service_id).await
-            } else {
-                crate::rl::service_feature_extraction::extract_service_context_for_pair(
-                    conn, &service1.service_id, &service2.service_id
-                ).await
-            };
-
-            if let Ok(features) = context_features_res {
-                captured_features = Some(features.clone());
-                let mut rl_guard = rl_orch.lock().await;
-                match rl_guard.get_tuned_confidence(
-                    &MatchMethodType::ServiceNameSimilarity,
-                    pre_rl_confidence,
-                    &features,
-                ) {
-                    Ok(tuned_conf) => {
-                        debug!(
-                            "Service name match RL tuning: {} -> {} for services {} <-> {}",
-                            pre_rl_confidence, tuned_conf, service1.service_id, service2.service_id
-                        );
-                        tuned_conf
-                    }
-                    Err(e) => {
-                        warn!("Failed to get RL tuned confidence for service name match: {}. Using pre-RL confidence.", e);
-                        pre_rl_confidence
-                    }
-                }
-            } else {
-                warn!("Failed to extract features for service pair ({}, {}): {}. Using pre-RL confidence.", 
-                        service1.service_id, service2.service_id, context_features_res.unwrap_err());
-                pre_rl_confidence
-            }
-        } else {
-            pre_rl_confidence
-        };
-
-        if final_confidence >= SERVICE_NAME_COMBINED_THRESHOLD {
-            Some((ServiceMatch {
-                service_id_1: service1.service_id.clone(),
-                service_id_2: service2.service_id.clone(),
-                match_method: MatchMethodType::ServiceNameSimilarity,
-                confidence_score: final_confidence.min(1.0),
-                match_values: MatchValues::ServiceName(ServiceNameMatchValue {
-                    original_name1: name1_orig.clone(),
-                    original_name2: name2_orig.clone(),
-                    normalized_name1,
-                    normalized_name2,
-                }),
-            }, captured_features))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
 }
 
 fn is_incompatible_service_types(type1: &str, type2: &str) -> bool {

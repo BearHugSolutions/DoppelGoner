@@ -7,23 +7,41 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::models::core::{Entity, EntityFeature};
+use crate::utils::contributor_filter::ContributorFilterConfig; // NEW: Import contributor filter
 use crate::utils::db_connect::PgPool;
 
-/// Main entry point for entity identification phase
+/// Main entry point for entity identification phase WITH CONTRIBUTOR FILTERING
 /// Extracts entities from organizations and links them to their features
 /// Returns the total number of entities identified
+pub async fn identify_entities_with_filter(
+    pool: &PgPool,
+    multi_progress: Option<MultiProgress>,
+    contributor_filter: Option<&ContributorFilterConfig>,
+) -> Result<usize> {
+    if let Some(filter) = contributor_filter {
+        if filter.is_active() {
+            info!("Starting entity identification phase with contributor filtering...");
+        } else {
+            info!("Starting entity identification phase (filter disabled)...");
+        }
+    } else {
+        info!("Starting entity identification phase (no filter)...");
+    }
+
+    let entities = extract_entities_with_filter(pool, multi_progress, contributor_filter)
+        .await
+        .context("Failed to extract entities from organizations with filter")?;
+
+    info!("Identified {} total entities", entities.len());
+    Ok(entities.len())
+}
+
+/// Original function for backward compatibility
 pub async fn identify_entities(
     pool: &PgPool,
     multi_progress: Option<MultiProgress>,
 ) -> Result<usize> {
-    info!("Starting entity identification phase...");
-
-    let entities = extract_entities(pool, multi_progress)
-        .await
-        .context("Failed to extract entities from organizations")?;
-
-    info!("Identified {} total entities", entities.len());
-    Ok(entities.len())
+    identify_entities_with_filter(pool, multi_progress, None).await
 }
 
 /// Main entry point for entity feature linking phase
@@ -121,14 +139,24 @@ async fn get_all_entities(pool: &PgPool) -> Result<Vec<Entity>> {
     Ok(entities)
 }
 
-/// Extracts entities from the organization table
+/// NEW: Extracts entities from the organization table WITH CONTRIBUTOR FILTERING
 /// Creates an entity record for each organization with its metadata
 /// Only creates entities that don't already exist
-pub async fn extract_entities(
+/// FIXED: Now uses organization.contributor as source_system and organization.contributor_id as source_id
+pub async fn extract_entities_with_filter(
     pool: &PgPool,
     multi_progress: Option<MultiProgress>,
+    contributor_filter: Option<&ContributorFilterConfig>,
 ) -> Result<Vec<Entity>> {
-    info!("Extracting entities from organizations...");
+    if let Some(filter) = contributor_filter {
+        if filter.is_active() {
+            info!("Extracting entities from organizations with contributor filtering...");
+        } else {
+            info!("Extracting entities from organizations (filter disabled)...");
+        }
+    } else {
+        info!("Extracting entities from organizations...");
+    }
 
     let conn = pool.get().await.context("Failed to get DB connection")?;
 
@@ -179,13 +207,41 @@ pub async fn extract_entities(
         pb.set_message("Loading organizations...");
     }
 
-    // Query the organization table to get all organizations
-    let org_rows = conn
-        .query("SELECT id, name FROM public.organization", &[])
-        .await
-        .context("Failed to query organization table")?;
+    // FIXED: Updated query to include contributor and contributor_id columns
+    let mut org_query = "SELECT id, name, contributor, contributor_id FROM public.organization".to_string();
+    let mut org_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
 
-    info!("Found {} total organizations", org_rows.len());
+    if let Some(filter) = contributor_filter {
+        // FIXED: Use build_simple_sql_filter() instead of build_sql_filter()
+        if let Some((where_clause, contributor_params)) = filter.build_simple_sql_filter() {
+            org_query.push_str(&format!(" WHERE {}", where_clause));
+            for param in contributor_params {
+                org_params.push(Box::new(param));
+            }
+            info!("🔍 Applying contributor filter to organization query");
+        }
+    }
+
+    // Execute the query with parameters
+    let params_slice: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = org_params
+        .iter()
+        .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+
+    let org_rows = conn
+        .query(&org_query, &params_slice)
+        .await
+        .context("Failed to query organization table with contributor filter")?;
+
+    if let Some(filter) = contributor_filter {
+        if filter.is_active() {
+            info!("Found {} organizations after contributor filtering", org_rows.len());
+        } else {
+            info!("Found {} total organizations", org_rows.len());
+        }
+    } else {
+        info!("Found {} total organizations", org_rows.len());
+    }
 
     // Create progress bar for processing organizations
     let processing_pb = if let Some(mp) = &multi_progress {
@@ -220,8 +276,16 @@ pub async fn extract_entities(
         }
 
         let name: Option<String> = row.try_get("name").ok();
-        let source_system = Some("Snowflake - feature not fully implemented in pipeline".into());
-        let source_id = Some("Feature not implemented in pipeline".into());
+        
+        // FIXED: Use contributor information from organization table
+        let contributor: Option<String> = row.try_get("contributor").ok();
+        let contributor_id: Option<String> = row.try_get("contributor_id").ok();
+        
+        // Set source_system to contributor (or fallback if null)
+        let source_system = contributor.or_else(|| Some("HSDS Entity Matching Pipeline".into()));
+        
+        // Set source_id to contributor_id (or fallback if null)
+        let source_id = contributor_id.or_else(|| Some(format!("Generated from organization: {}", org_id)));
 
         let entity = Entity {
             id: Uuid::new_v4().to_string(),
@@ -360,6 +424,14 @@ pub async fn extract_entities(
     all_entities.extend(new_entities);
 
     Ok(all_entities)
+}
+
+/// Original function for backward compatibility
+pub async fn extract_entities(
+    pool: &PgPool,
+    multi_progress: Option<MultiProgress>,
+) -> Result<Vec<Entity>> {
+    extract_entities_with_filter(pool, multi_progress, None).await
 }
 
 /// Links entities to their features
