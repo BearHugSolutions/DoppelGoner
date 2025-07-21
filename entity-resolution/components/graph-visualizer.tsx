@@ -16,6 +16,8 @@ import {
   RotateCcw,
   AlertCircle,
   AlertTriangle,
+  GitBranch,
+  Info,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -34,6 +36,7 @@ export default function GraphVisualizer() {
     selectedClusterId,
     selectedEdgeId,
     currentVisualizationData, // This is EntityVisualizationDataResponse | null
+    workflowFilter, // ✨ NEW: Get workflow filter state
     actions,
     queries,
   } = useEntityResolution();

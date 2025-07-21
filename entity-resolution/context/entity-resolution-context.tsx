@@ -9,6 +9,7 @@
 |   - Added guards to prevent API calls when no opinion is selected.
 |   - Integrated dependent service disconnection feature.
 |   - FIXED: Prevented unnecessary bulk-connections calls and UI flickering
+|   - ✨ NEW: Added Cross-Source System Connection Filter functionality
 |
 ================================================================================
 */
@@ -21,6 +22,7 @@ import {
   EntityConnectionDataResponse,
   GroupReviewDecision,
   BaseLink,
+  BaseNode,
   NodeDetailResponse,
   NodeIdentifier,
   BulkConnectionRequestItem,
@@ -28,6 +30,7 @@ import {
   ClusterReviewProgress,
   EdgeReviewApiPayload,
   ClusterFilterStatus,
+  WorkflowFilter, // ✨ NEW: Import WorkflowFilter type
   DisconnectDependentServicesRequest,
   DisconnectDependentServicesResponse,
 } from "@/types/entity-resolution";
@@ -117,6 +120,7 @@ export interface EntityResolutionContextType {
   isReviewToolsMaximized: boolean;
   clusterFilterStatus: ClusterFilterStatus;
   disconnectDependentServicesEnabled: boolean;
+  workflowFilter: WorkflowFilter; // ✨ NEW: Workflow filter state
 
   clusters: ClustersState;
   visualizationData: Record<string, VisualizationState>;
@@ -143,6 +147,7 @@ export interface EntityResolutionContextType {
     setIsReviewToolsMaximized: (isMaximized: boolean) => void;
     setClusterFilterStatus: (status: ClusterFilterStatus) => void;
     setDisconnectDependentServicesEnabled: (enabled: boolean) => void;
+    setWorkflowFilter: (filter: WorkflowFilter) => void; // ✨ NEW: Action to set workflow filter
     enableDisconnectDependentServices: () => Promise<void>;
     triggerRefresh: (
       target?:
@@ -256,6 +261,9 @@ export function EntityResolutionProvider({
     setDisconnectDependentServicesEnabledState,
   ] = useState<boolean>(false);
 
+  // ✨ NEW: Add workflow filter state
+  const [workflowFilter, setWorkflowFilter] = useState<WorkflowFilter>("all");
+
   // Data state
   const [clusters, setClusters] = useState<ClustersState>(initialClustersState);
   const [visualizationData, setVisualizationData] = useState<
@@ -280,6 +288,29 @@ export function EntityResolutionProvider({
   const [isLoadingPage, setIsLoadingPage] = useState<boolean>(false);
   const [pendingNodeFetches, setPendingNodeFetches] = useState<Set<string>>(
     new Set()
+  );
+
+  // ✨ NEW: Add cross-source connection detection utility function
+  const isCrossSourceConnection = useCallback(
+    (link: BaseLink, nodes: BaseNode[]): boolean => {
+      // Since link.source and link.target are string IDs, use them directly
+      const sourceNode = nodes.find((n) => n.id === link.source);
+      const targetNode = nodes.find((n) => n.id === link.target);
+
+      if (!sourceNode || !targetNode) return false;
+
+      const sourceSystem1 = sourceNode.sourceSystem;
+      const sourceSystem2 = targetNode.sourceSystem;
+
+      // Only show if both have source systems AND they're different
+      // Need explicit checks for truthy strings since sourceSystem can be string | null | undefined
+      return !!(
+        sourceSystem1 &&
+        sourceSystem2 &&
+        sourceSystem1 !== sourceSystem2
+      );
+    },
+    []
   );
 
   // Helper function to determine the three clusters to keep in memory
@@ -685,6 +716,7 @@ export function EntityResolutionProvider({
     setIsLoadingPage(false);
     setEdgeSubmissionStatus({});
     setDisconnectDependentServicesEnabledState(false);
+    setWorkflowFilter("all"); // ✨ NEW: Reset workflow filter
 
     // 🔧 FIX: Clear request tracking
     activeRequestsRef.current.clear();
@@ -1236,21 +1268,27 @@ export function EntityResolutionProvider({
   useEffect(() => {
     if (selectedOpinion && user?.id) {
       console.log(`Loading preferences for opinion: ${selectedOpinion}`);
-      
+
       getOpinionPreferences(selectedOpinion)
-        .then(response => {
-          console.log(`Loaded preferences for ${selectedOpinion}:`, response.preferences);
+        .then((response) => {
+          console.log(
+            `Loaded preferences for ${selectedOpinion}:`,
+            response.preferences
+          );
           setDisconnectDependentServicesEnabledState(
             response.preferences.disconnectDependentServices
           );
         })
-        .catch(error => {
-          console.error('Failed to load opinion preferences:', error);
+        .catch((error) => {
+          console.error("Failed to load opinion preferences:", error);
           // Fallback to default (false) on error
           setDisconnectDependentServicesEnabledState(false);
-          
+
           // Only show toast for non-404 errors (404 means no preferences saved yet)
-          if (!error.message?.includes('404') && !error.message?.includes('Not found')) {
+          if (
+            !error.message?.includes("404") &&
+            !error.message?.includes("Not found")
+          ) {
             toast({
               title: "Warning",
               description: "Could not load saved preferences. Using defaults.",
@@ -1722,7 +1760,7 @@ export function EntityResolutionProvider({
     ] // ✨ Added selectedOpinion dependency
   );
 
-  // Computed values
+  // ✨ NEW: Updated Computed visualization data with workflow filter support
   const currentVisualizationDataForSelection =
     useMemo((): EntityVisualizationDataResponse | null => {
       if (!selectedClusterId) return null;
@@ -1730,6 +1768,9 @@ export function EntityResolutionProvider({
       const vizState = visualizationData[selectedClusterId];
       if (!vizState?.data) return null;
 
+      let data = vizState.data;
+
+      // Apply paging if needed (existing logic)
       if (
         selectedClusterId === activelyPagingClusterId &&
         largeClusterConnectionsPage > 0
@@ -1739,14 +1780,25 @@ export function EntityResolutionProvider({
           (largeClusterConnectionsPage - 1) * CONNECTION_PAGE_SIZE;
         const endIndex = startIndex + CONNECTION_PAGE_SIZE;
         const pagedLinks = allLinks.slice(startIndex, endIndex);
-        return { ...vizState.data, links: pagedLinks };
+        data = { ...vizState.data, links: pagedLinks };
       }
-      return vizState.data;
+
+      // ✨ NEW: Apply workflow filter
+      if (workflowFilter === "cross-source-only") {
+        const filteredLinks = data.links.filter((link) =>
+          isCrossSourceConnection(link, data.nodes)
+        );
+        data = { ...data, links: filteredLinks };
+      }
+
+      return data;
     }, [
       selectedClusterId,
       visualizationData,
       activelyPagingClusterId,
       largeClusterConnectionsPage,
+      workflowFilter, // ✨ NEW: Add dependency
+      isCrossSourceConnection, // ✨ NEW: Add dependency
     ]);
 
   const currentConnectionData =
@@ -2673,6 +2725,7 @@ export function EntityResolutionProvider({
       setIsAutoAdvanceEnabled: setIsAutoAdvanceEnabledState,
       setDisconnectDependentServicesEnabled:
         setDisconnectDependentServicesEnabledState,
+      setWorkflowFilter, // ✨ NEW: Add workflow filter action
       enableDisconnectDependentServices,
       triggerRefresh,
       loadClusters,
@@ -2713,6 +2766,7 @@ export function EntityResolutionProvider({
       handleSetSelectedClusterId,
       setSelectedEdgeIdAction,
       setDisconnectDependentServicesEnabledState,
+      setWorkflowFilter, // ✨ NEW: Add workflow filter dependency
       enableDisconnectDependentServices,
       triggerRefresh,
       loadClusters,
@@ -2753,6 +2807,7 @@ export function EntityResolutionProvider({
     isReviewToolsMaximized,
     clusterFilterStatus,
     disconnectDependentServicesEnabled,
+    workflowFilter, // ✨ NEW: Add workflow filter state
     clusters,
     visualizationData,
     connectionData,

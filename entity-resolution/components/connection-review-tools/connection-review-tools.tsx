@@ -32,6 +32,8 @@ import {
   Maximize,
   Minimize,
   Link,
+  GitBranch,
+  Filter as FilterIcon,
 } from "lucide-react";
 import type {
   VisualizationEntityEdge,
@@ -53,7 +55,8 @@ export default function ConnectionReviewTools() {
     currentVisualizationData,
     selectedClusterDetails,
     isReviewToolsMaximized,
-    disconnectDependentServicesEnabled, // NEW: Use the setting
+    disconnectDependentServicesEnabled, // Use the setting
+    workflowFilter, // ✨ NEW: Get workflow filter state
     actions,
     queries,
     edgeSelectionInfo,
@@ -63,15 +66,100 @@ export default function ConnectionReviewTools() {
   } = useEntityResolution();
   const { toast } = useToast();
 
+  // ✨ MOVED: All useState hooks to the top
   const [isContinuing, setIsContinuing] = useState(false);
   const [isExpanded, setIsExpanded] = useState(true);
   const [isAttributesOpen, setIsAttributesOpen] = useState(false);
 
-  // Get submission status for the currently selected edge
-  const { isSubmitting, error: submissionError } = selectedEdgeId
-    ? queries.getEdgeSubmissionStatus(selectedEdgeId)
-    : { isSubmitting: false, error: null };
+  // ✨ MOVED: Extract data early and use in useMemo with proper fallbacks
+  const data = currentConnectionData;
+  const edgeDetails = data?.edge as VisualizationEntityEdge | undefined;
+  const node1 = data?.entity1;
+  const node2 = data?.entity2;
 
+  // ✨ MOVED: All useMemo hooks to the top with proper null checks
+  const node1Details = useMemo(() => {
+    return node1 ? queries.getNodeDetail(node1.id) : null;
+  }, [node1, queries]);
+
+  const node2Details = useMemo(() => {
+    return node2 ? queries.getNodeDetail(node2.id) : null;
+  }, [node2, queries]);
+
+  // ✨ MOVED: Check if current connection is cross-source (moved to top with null safety)
+  const isCrossSourceConnection = useMemo(() => {
+    if (!node1 || !node2) return false;
+    const sourceSystem1 = node1.sourceSystem;
+    const sourceSystem2 = node2.sourceSystem;
+    return sourceSystem1 && sourceSystem2 && sourceSystem1 !== sourceSystem2;
+  }, [node1, node2]);
+
+  // ✨ MOVED: All other computations that don't cause early returns
+  const { isSubmitting, error: submissionError } = useMemo(() => {
+    return selectedEdgeId
+      ? queries.getEdgeSubmissionStatus(selectedEdgeId)
+      : { isSubmitting: false, error: null };
+  }, [selectedEdgeId, queries]);
+
+  const isLoadingUI = useMemo(() => {
+    return selectedEdgeId ? queries.isConnectionDataLoading(selectedEdgeId) : false;
+  }, [selectedEdgeId, queries]);
+
+  const isAnyGeneralOperationPending = useMemo(() => {
+    const isPagingActiveForSelectedCluster =
+      selectedClusterId === activelyPagingClusterId &&
+      largeClusterConnectionsPage > 0;
+    return (
+      isSubmitting ||
+      isLoadingUI ||
+      (isLoadingConnectionPageData && isPagingActiveForSelectedCluster)
+    );
+  }, [
+    isSubmitting,
+    isLoadingUI,
+    isLoadingConnectionPageData,
+    selectedClusterId,
+    activelyPagingClusterId,
+    largeClusterConnectionsPage,
+  ]);
+
+  const connectionCount = useMemo(() => {
+    return selectedClusterDetails?.groupCount || 0;
+  }, [selectedClusterDetails?.groupCount]);
+
+  const isSelectedClusterLarge = useMemo(() => {
+    return connectionCount > LARGE_CLUSTER_THRESHOLD;
+  }, [connectionCount]);
+
+  const isPagingActiveForSelectedCluster = useMemo(() => {
+    return (
+      selectedClusterId === activelyPagingClusterId &&
+      largeClusterConnectionsPage > 0
+    );
+  }, [selectedClusterId, activelyPagingClusterId, largeClusterConnectionsPage]);
+
+  // ✨ MOVED: Computed values that depend on data
+  const isEdgeReviewed = useMemo(() => {
+    return selectedEdgeId ? queries.isEdgeReviewed(selectedEdgeId) : false;
+  }, [selectedEdgeId, queries]);
+
+  const isClusterFinalized = useMemo(() => {
+    return selectedClusterDetails?.wasReviewed || false;
+  }, [selectedClusterDetails?.wasReviewed]);
+
+  const showReviewButtons = useMemo(() => {
+    return !isEdgeReviewed && !isClusterFinalized;
+  }, [isEdgeReviewed, isClusterFinalized]);
+
+  const edgeStatus = useMemo(() => {
+    return selectedEdgeId ? queries.getEdgeStatus(selectedEdgeId) : null;
+  }, [selectedEdgeId, queries]);
+
+  const nodeLabel = useMemo(() => {
+    return resolutionMode === 'entity' ? 'Entity' : 'Service';
+  }, [resolutionMode]);
+
+  // ✨ MOVED: All useEffect hooks after useMemo hooks
   useEffect(() => {
     if (
       selectedEdgeId &&
@@ -89,6 +177,7 @@ export default function ConnectionReviewTools() {
     isLoadingConnectionPageData,
   ]);
 
+  // ✨ MOVED: All useCallback hooks after useEffect hooks
   const handleReviewDecision = useCallback(
     async (decision: GroupReviewDecision) => {
       if (!selectedEdgeId || !selectedClusterId) {
@@ -174,7 +263,6 @@ export default function ConnectionReviewTools() {
     }
   }, [selectedClusterId, selectedEdgeId, actions, queries, toast]);
 
-
   const handleInitializeLargeClusterPaging = useCallback(async () => {
     if (selectedClusterId) {
       await actions.initializeLargeClusterConnectionPaging(selectedClusterId);
@@ -195,28 +283,7 @@ export default function ConnectionReviewTools() {
     actions.selectNextUnreviewedInCluster();
   }, [actions]);
 
-  const isLoadingUI = selectedEdgeId
-    ? queries.isConnectionDataLoading(selectedEdgeId)
-    : false;
-
-  const isAnyGeneralOperationPending = useMemo(() => {
-    const isPagingActiveForSelectedCluster =
-      selectedClusterId === activelyPagingClusterId &&
-      largeClusterConnectionsPage > 0;
-    return (
-      isSubmitting ||
-      isLoadingUI ||
-      (isLoadingConnectionPageData && isPagingActiveForSelectedCluster)
-    );
-  }, [
-    isSubmitting,
-    isLoadingUI,
-    isLoadingConnectionPageData,
-    selectedClusterId,
-    activelyPagingClusterId,
-    largeClusterConnectionsPage,
-  ]);
-
+  // ✨ NOW: All early returns happen after all hooks are called
   if (!selectedClusterId) {
     return (
       <div className="flex justify-center items-center h-full text-muted-foreground p-4 border rounded-md bg-card shadow">
@@ -225,12 +292,6 @@ export default function ConnectionReviewTools() {
     );
   }
   
-  const connectionCount = selectedClusterDetails?.groupCount || 0;
-  const isSelectedClusterLarge = connectionCount > LARGE_CLUSTER_THRESHOLD;
-  const isPagingActiveForSelectedCluster =
-    selectedClusterId === activelyPagingClusterId &&
-    largeClusterConnectionsPage > 0;
-
   if (isSelectedClusterLarge && !isPagingActiveForSelectedCluster) {
      return (
       <Card className="h-full flex flex-col items-center justify-center p-4">
@@ -283,11 +344,6 @@ export default function ConnectionReviewTools() {
       </div>
     );
   }
-  
-  const data = currentConnectionData;
-  const edgeDetails = data?.edge as VisualizationEntityEdge | undefined;
-  const node1 = data?.entity1;
-  const node2 = data?.entity2;
 
   if (!node1 || !node2 || !edgeDetails) {
      return (
@@ -296,16 +352,6 @@ export default function ConnectionReviewTools() {
       </div>
     );
   }
-  
-  const node1Details = queries.getNodeDetail(node1.id);
-  const node2Details = queries.getNodeDetail(node2.id);
-
-  // UPDATED: Simplified status checks
-  const isEdgeReviewed = selectedEdgeId ? queries.isEdgeReviewed(selectedEdgeId) : false;
-  const isClusterFinalized = selectedClusterDetails?.wasReviewed || false;
-  const showReviewButtons = !isEdgeReviewed && !isClusterFinalized;
-  const edgeStatus = selectedEdgeId ? queries.getEdgeStatus(selectedEdgeId) : null;
-  const nodeLabel = resolutionMode === 'entity' ? 'Entity' : 'Service';
 
   console.log("🙏 currentConnectionData", currentConnectionData);
 
@@ -315,20 +361,34 @@ export default function ConnectionReviewTools() {
       onOpenChange={setIsExpanded}
       className="h-full flex flex-col"
     >
-      <div className="flex justify-between items-center flex-shrink-0 pb-2 border-b mb-3">
+      <div className="flex justify-between items-center flex-shrink-0 pb-2 border-b">
         <div className="flex items-center gap-2 flex-wrap">
           <h3 className="text-lg font-medium">{nodeLabel} Connection Review</h3>
           {isSubmitting && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
           
-          {/* NEW: Show dependent services indicator when enabled */}
+          {/* ✨ NEW: Cross-source connection indicator */}
+          {isCrossSourceConnection && (
+            <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200">
+              <GitBranch className="h-3 w-3 mr-1" />
+              Cross-Source
+            </Badge>
+          )}
+          
+          {/* ✨ NEW: Workflow filter indicator when active */}
+          {workflowFilter === "cross-source-only" && (
+            <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
+              <FilterIcon className="h-3 w-3 mr-1" />
+              Filtered View
+            </Badge>
+          )}
+          
+          {/* Show dependent services indicator when enabled */}
           {disconnectDependentServicesEnabled && resolutionMode === 'entity' && (
             <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
               <Link className="h-3 w-3 mr-1" />
               Auto-disconnect Services
             </Badge>
           )}
-          
-          {/* REMOVED: All queue-related badges ('Processing', 'Queued', 'Failed') */}
           
           {/* UPDATED: Badge logic based on new flags */}
           {isClusterFinalized && (
@@ -371,28 +431,13 @@ export default function ConnectionReviewTools() {
       </div>
 
       <CollapsibleContent className="flex-1 min-h-0">
-        <div className="h-full overflow-y-auto space-y-3 pr-2 custom-scrollbar">
+        <div className="h-full overflow-y-auto flex flex-col gap-2 pr-2 custom-scrollbar">
           {showReviewButtons ? (
-            <div className="space-y-3 p-1">
-              <div className="flex flex-col space-y-2">
-                <p className="text-sm text-muted-foreground">
-                  Do these records represent the same real-world {resolutionMode}?
-                </p>
-                
-                {/* NEW: Show dependent services warning for entity reviews */}
-                {disconnectDependentServicesEnabled && resolutionMode === 'entity' && (
-                  <div className="bg-blue-50 border border-blue-200 rounded-md p-2">
-                    <div className="flex items-start space-x-2">
-                      <Info className="h-4 w-4 text-blue-600 mt-0.5 flex-shrink-0" />
-                      <p className="text-xs text-blue-800">
-                        If you mark these entities as <strong>Not a Match</strong>, any service matches between them will also be automatically disconnected.
-                      </p>
-                    </div>
-                  </div>
-                )}
+            <div className="flex flex-col gap-2 p-1">
+              <div className="flex flex-col">
+                {/* Place for future useful notes if necessary */}
               </div>
-              
-              <div className="flex justify-center items-center gap-2 mb-3">
+              <div className="flex justify-center items-center gap-2">
                  <Button variant="outline" size="icon" onClick={handlePreviousUnreviewed} disabled={isSubmitting || isContinuing}>
                     <ChevronLeft className="h-4 w-4" />
                 </Button>
@@ -423,7 +468,6 @@ export default function ConnectionReviewTools() {
                   <Check className="h-4 w-4 mr-1" /> Confirm Match
                 </Button>
               </div>
-              {/* REMOVED: Retry submission button for failed batches */}
             </div>
           ) : (
              <div className="space-y-3 p-1">

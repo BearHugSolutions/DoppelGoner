@@ -24,6 +24,8 @@ import {
   HelpCircle,
   Filter,
   AlertTriangle,
+  GitBranch,
+  Layers,
 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -31,6 +33,7 @@ import type {
   EntityCluster,
   ClusterReviewProgress,
   ClusterFilterStatus,
+  WorkflowFilter,
 } from "@/types/entity-resolution";
 import ResolutionModeSwitcher from "./resolution-mode-switcher";
 import { useToast } from "@/hooks/use-toast";
@@ -412,15 +415,15 @@ const PostProcessingFiltersDialog = () => {
   return (
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
-        <Button variant="outline" size="sm" className="w-full mb-2">
+        <Button variant="outline" size="sm" className="w-full my-2">
           <Filter className="h-4 w-4 mr-2" />
           Post Processing Filters
-          {disconnectDependentServicesEnabled && (
+          {/* {disconnectDependentServicesEnabled && (
             <span
-              className="ml-2 h-2 w-2 bg-green-500 rounded-full"
+              className="ml-1 h-2 w-2 bg-green-500 rounded-full"
               title="Filters active"
             />
-          )}
+          )} */}
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-[600px]">
@@ -571,6 +574,48 @@ const PostProcessingFiltersDialog = () => {
   );
 };
 
+// ✨ NEW: Workflow Filter Component
+const WorkflowFilterSelector = () => {
+  const { workflowFilter, actions } = useEntityResolution();
+
+  return (
+    <div className="space-y-2">
+      {/* <h4 className="text-sm font-medium text-card-foreground flex items-center gap-2">
+        <GitBranch className="h-4 w-4" />
+        Workflow Filter
+      </h4> */}
+      <div className="grid grid-cols-2 gap-2">
+        <Button
+          variant={workflowFilter === "all" ? "default" : "outline"}
+          onClick={() => actions.setWorkflowFilter("all")}
+          size="sm"
+          className="justify-start text-xs text-wrap"
+        >
+          <Layers className="h-3 w-3 mr-1" />
+          All
+        </Button>
+        <Button
+          variant={workflowFilter === "cross-source-only" ? "default" : "outline"}
+          onClick={() => actions.setWorkflowFilter("cross-source-only")}
+          size="sm"
+          className="justify-start text-xs text-wrap"
+        >
+          <GitBranch className="h-3 w-3 mr-1" />
+          Cross-Source
+        </Button>
+      </div>
+      {/* {workflowFilter === "cross-source-only" && (
+        <div className="bg-blue-50 border border-blue-200 rounded-md p-2">
+          <p className="text-xs text-blue-800">
+            <strong>Active:</strong> Only showing connections between entities from different source systems. 
+            This helps prioritize reviewing cross-system matches.
+          </p>
+        </div>
+      )} */}
+    </div>
+  );
+};
+
 export default function ClusterSelector() {
   const { resolutionMode, actions, clusterFilterStatus, clusters } =
     useEntityResolution();
@@ -626,12 +671,14 @@ export default function ClusterSelector() {
   return (
     <div className="space-y-4 h-full flex flex-col bg-card p-3 rounded-lg shadow">
       <h3 className="text-lg font-semibold text-card-foreground border-b pb-2">
-        {resolutionMode === "entity" ? "Entity Clusters" : "Service Clusters"}{" "}
-        for Review
+        {resolutionMode === "entity" ? "Entity Clusters" : "Service Clusters"}
       </h3>
       <ResolutionModeSwitcher />
 
-      {/* NEW: Post Processing Filters Button */}
+      {/* ✨ NEW: Workflow Filter Selector */}
+      <WorkflowFilterSelector />
+
+      {/* Post Processing Filters Button */}
       <PostProcessingFiltersDialog />
 
       {/* This is the key change: apply flex-grow only to this div */}

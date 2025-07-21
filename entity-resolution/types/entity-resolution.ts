@@ -5,6 +5,7 @@
 |
 |   Description: Centralized TypeScript types for the application.
 |   - This file integrates new user/opinion types with the existing application types.
+|   - UPDATED: Added WorkflowFilter type for cross-source system filtering
 |
 ================================================================================
 */
@@ -106,6 +107,9 @@ export interface GraphLink {
 
 export type ResolutionMode = "entity" | "service";
 export type ClusterFilterStatus = "all" | "reviewed" | "unreviewed";
+
+// ✨ NEW: Workflow filter type for cross-source system filtering
+export type WorkflowFilter = "all" | "cross-source-only";
 
 // --- Structs for Bulk API Requests ---
 export interface NodeIdentifier {
@@ -532,4 +536,103 @@ export interface EdgeSelectionInfo {
   totalUnreviewedEdgesInCluster: number;
   currentUnreviewedEdgeIndexInCluster: number;
   totalEdgesInEntireCluster: number;
+}
+
+// ✨ UPDATED: Entity Resolution Context Type with workflow filter support
+export interface EntityResolutionContextType {
+  resolutionMode: ResolutionMode;
+  selectedClusterId: string | null;
+  selectedEdgeId: string | null;
+  reviewerId: string;
+  lastReviewedEdgeId: string | null;
+  refreshTrigger: number;
+  isAutoAdvanceEnabled: boolean;
+  isReviewToolsMaximized: boolean;
+  clusterFilterStatus: ClusterFilterStatus;
+  disconnectDependentServicesEnabled: boolean;
+  workflowFilter: WorkflowFilter; // ✨ NEW: Workflow filter state
+
+  clusters: ClustersState;
+  visualizationData: Record<string, VisualizationState>;
+  connectionData: Record<string, ConnectionState>;
+  nodeDetails: Record<string, NodeDetailResponse | null | "loading" | "error">;
+
+  clusterProgress: Record<string, ClusterReviewProgress>;
+  edgeSelectionInfo: EdgeSelectionInfo;
+
+  currentVisualizationData: EntityVisualizationDataResponse | null;
+  currentConnectionData: EntityConnectionDataResponse | null;
+  selectedClusterDetails: EntityCluster | null;
+
+  activelyPagingClusterId: string | null;
+  largeClusterConnectionsPage: number;
+  isLoadingConnectionPageData: boolean;
+
+  actions: {
+    setResolutionMode: (mode: ResolutionMode) => void;
+    setSelectedClusterId: (id: string | null) => void;
+    setSelectedEdgeId: (id: string | null) => void;
+    setReviewerId: (id: string) => void;
+    setLastReviewedEdgeId: (id: string | null) => void;
+    setIsReviewToolsMaximized: (isMaximized: boolean) => void;
+    setClusterFilterStatus: (status: ClusterFilterStatus) => void;
+    setDisconnectDependentServicesEnabled: (enabled: boolean) => void;
+    setWorkflowFilter: (filter: WorkflowFilter) => void; // ✨ NEW: Action to set workflow filter
+    enableDisconnectDependentServices: () => Promise<void>;
+    triggerRefresh: (
+      target?:
+        | "all"
+        | "clusters"
+        | "current_visualization"
+        | "current_connection"
+    ) => void;
+    loadClusters: (page: number, limit?: number) => Promise<void>;
+    loadBulkNodeDetails: (nodesToFetch: NodeIdentifier[]) => Promise<void>;
+    loadSingleConnectionData: (
+      edgeId: string
+    ) => Promise<EntityConnectionDataResponse | null>;
+    invalidateVisualizationData: (clusterId: string) => Promise<void>;
+    invalidateConnectionData: (edgeId: string) => Promise<void>;
+    clearAllData: () => void;
+    selectNextUnreviewedEdge: (afterEdgeId?: string | null) => void;
+    advanceToNextCluster: () => Promise<void>;
+    checkAndAdvanceIfComplete: (clusterIdToCheck?: string) => Promise<void>;
+    submitEdgeReview: (
+      edgeId: string,
+      decision: GroupReviewDecision,
+      notes?: string
+    ) => Promise<void>;
+    setIsAutoAdvanceEnabled: (enabled: boolean) => void;
+    selectPreviousUnreviewedInCluster: () => void;
+    selectNextUnreviewedInCluster: () => void;
+    initializeLargeClusterConnectionPaging: (
+      clusterId: string
+    ) => Promise<void>;
+    viewNextConnectionPage: (clusterId: string) => Promise<void>;
+    getActivelyPagingClusterId: () => string | null;
+    getLargeClusterConnectionsPage: () => number;
+    performThreeClusterCleanup: () => void;
+    getCacheStats: () => any;
+  };
+
+  queries: {
+    isVisualizationDataLoaded: (clusterId: string) => boolean;
+    isVisualizationDataLoading: (clusterId: string) => boolean;
+    isConnectionDataLoaded: (edgeId: string) => boolean;
+    isConnectionDataLoading: (edgeId: string) => boolean;
+    getVisualizationError: (clusterId: string) => string | null;
+    getConnectionError: (edgeId: string) => string | null;
+    getClusterProgress: (clusterId: string) => ClusterReviewProgress;
+    canAdvanceToNextCluster: () => boolean;
+    isEdgeReviewed: (edgeId: string) => boolean;
+    getEdgeStatus: (edgeId: string) => BaseLink["status"] | null;
+    getEdgeSubmissionStatus: (edgeId: string) => {
+      isSubmitting: boolean;
+      error: string | null;
+    };
+    getClusterById: (clusterId: string) => EntityCluster | undefined;
+    getNodeDetail: (
+      nodeId: string
+    ) => NodeDetailResponse | null | "loading" | "error";
+  };
 }

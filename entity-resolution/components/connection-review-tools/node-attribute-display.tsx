@@ -9,6 +9,7 @@ import {
   MapPin,
   AlertTriangle,
   Link,
+  Database,
 } from "lucide-react";
 
 // REFACTORED: Updated type imports for the unified location/address structure
@@ -22,6 +23,8 @@ import type {
   Organization,
   Service,
 } from "@/types/entity-resolution";
+
+import { useEntityResolution } from "@/context/entity-resolution-context";
 
 import {
   Collapsible,
@@ -78,6 +81,8 @@ const NodeAttributesDisplay: React.FC<NodeAttributesDisplayProps> = ({
   isAttributesOpen,
   setIsAttributesOpen,
 }) => {
+  const { workflowFilter } = useEntityResolution();
+
   if (nodeDetails === "loading") {
     return (
       <div className="text-xs text-muted-foreground flex items-center">
