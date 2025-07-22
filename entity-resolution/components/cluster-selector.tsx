@@ -1,4 +1,4 @@
-// components/cluster-selector.tsx
+// components/cluster-selector.tsx - UPDATED with Enhanced Progress Display
 "use client";
 
 import { useCallback, useState, useEffect, Fragment } from "react";
@@ -26,9 +26,17 @@ import {
   AlertTriangle,
   GitBranch,
   Layers,
+  Info,
 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Badge } from "@/components/ui/badge";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type {
   EntityCluster,
   ClusterReviewProgress,
@@ -45,11 +53,10 @@ import {
 
 const LARGE_CLUSTER_THRESHOLD = 200;
 
-// To avoid duplicating the list rendering logic, it's extracted into its own component.
-// This component will be rendered inside each Tab's content.
+// Enhanced cluster list content component with progress context display
 const ClusterListContent = ({
-  page, // Receive page as prop
-  loading, // Receive loading as prop
+  page,
+  loading,
 }: {
   page: number;
   loading: boolean;
@@ -59,17 +66,13 @@ const ClusterListContent = ({
     selectedClusterId,
     clusters,
     clusterProgress,
+    workflowFilter, // ✨ Get workflow filter state
     actions,
     queries,
     visualizationData,
   } = useEntityResolution();
 
-  const { data: clustersData, error } = clusters; // Only use data and error from clusters here
-
-  useEffect(() => {
-    // This useEffect is no longer needed here as pageInput state is managed higher up
-    // setPageInput(page.toString());
-  }, [page]); // Keep dependency for completeness if it were used, but it's not anymore
+  const { data: clustersData, error } = clusters;
 
   const handleClusterSelection = useCallback(
     async (clusterId: string) => {
@@ -96,6 +99,79 @@ const ClusterListContent = ({
     return "bg-green-500";
   };
 
+  // ✨ NEW: Enhanced progress rendering with context information
+  const renderClusterProgress = (cluster: EntityCluster) => {
+    const currentProgress = queries.getClusterProgress(cluster.id);
+    const totalProgress = queries.getClusterProgressUnfiltered(cluster.id);
+    const crossSourceProgress = queries.getClusterProgressCrossSource(cluster.id);
+    
+    const isFiltered = workflowFilter === "cross-source-only";
+    const hasServerData = currentProgress.totalEdges !== -1;
+    
+    return (
+      <div className="mt-1">
+        <div className="flex justify-between text-xs mb-0.5 text-muted-foreground">
+          <div className="flex items-center gap-1">
+            <span>Review Progress</span>
+          </div>
+          <span className="font-medium text-card-foreground">
+            {hasServerData
+              ? `${currentProgress.reviewedEdges} / ${currentProgress.totalEdges}`
+              : `${currentProgress.reviewedEdges} / ?`}
+          </span>
+        </div>
+        
+        <Progress
+          value={
+            currentProgress.progressPercentage === -1
+              ? 0
+              : currentProgress.progressPercentage
+          }
+          className={`h-1.5 ${
+            currentProgress.progressPercentage === -1
+              ? "bg-gray-200 [&>div]:bg-gray-400"
+              : ""
+          }`}
+        />
+        
+        {/* ✨ NEW: Context information when filter is applied or server data is available */}
+        {hasServerData && (
+          <div className="mt-1 space-y-0.5">
+            {/* Current view summary */}
+            <div className="flex justify-between text-xs text-muted-foreground">
+              <span>
+                {isFiltered ? "Cross-source decisions" : "All decisions"}
+              </span>
+              <span>
+                {currentProgress.confirmedMatches}M / {currentProgress.confirmedNonMatches}NM
+              </span>
+            </div>
+            
+            {/* Context information when filter is applied */}
+            {isFiltered && totalProgress.totalEdges > currentProgress.totalEdges && (
+              <div className="flex justify-between text-xs text-muted-foreground/70">
+                <span>Total (all connections):</span>
+                <span>
+                  {totalProgress.reviewedEdges} / {totalProgress.totalEdges}
+                </span>
+              </div>
+            )}
+            
+            {/* Show cross-source availability when filter is not applied */}
+            {!isFiltered && crossSourceProgress.totalEdges > 0 && (
+              <div className="flex justify-between text-xs text-muted-foreground/70">
+                <span>Cross-source available:</span>
+                <span>
+                  {crossSourceProgress.reviewedEdges} / {crossSourceProgress.totalEdges}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const entityLabel = resolutionMode === "entity" ? "Entities" : "Services";
   const groupLabel = "Potential Connections";
 
@@ -109,9 +185,7 @@ const ClusterListContent = ({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Parent container for flex column behavior*/}
       <div className="space-y-3 flex-grow overflow-y-auto pr-1 custom-scrollbar">
-        {/* Scrollable content area*/}
         {error && (
           <div className="text-red-600 text-sm p-2 bg-red-50 rounded border">
             Error: {error}
@@ -232,29 +306,8 @@ const ClusterListContent = ({
                   </div>
                 </div>
 
-                <div className="mt-1">
-                  <div className="flex justify-between text-xs mb-0.5 text-muted-foreground">
-                    <span>Review Progress</span>
-                    <span className="font-medium text-card-foreground">
-                      {progress.totalEdges === -1 ||
-                      progress.progressPercentage === -1
-                        ? `${progress.reviewedEdges} / ?`
-                        : `${progress.reviewedEdges} / ${progress.totalEdges}`}
-                    </span>
-                  </div>
-                  <Progress
-                    value={
-                      progress.progressPercentage === -1
-                        ? 0
-                        : progress.progressPercentage
-                    }
-                    className={`h-1.5 ${
-                      progress.progressPercentage === -1
-                        ? "bg-gray-200 [&>div]:bg-gray-400"
-                        : ""
-                    }`}
-                  />
-                </div>
+                {/* ✨ UPDATED: Enhanced progress display */}
+                {renderClusterProgress(cluster)}
 
                 {progress.isComplete && progress.totalEdges !== -1 && (
                   <div className="flex items-center mt-1.5 text-green-600 text-xs font-medium">
@@ -271,7 +324,7 @@ const ClusterListContent = ({
   );
 };
 
-// NEW: Post Processing Filters Dialog Component
+// Post Processing Filters Dialog Component (unchanged)
 const PostProcessingFiltersDialog = () => {
   const { disconnectDependentServicesEnabled, actions } = useEntityResolution();
   const { selectedOpinion } = useAuth();
@@ -294,7 +347,6 @@ const PostProcessingFiltersDialog = () => {
         })
         .catch((error) => {
           console.error("Failed to load preferences:", error);
-          // Fallback to current state from context
           setTempEnabled(disconnectDependentServicesEnabled);
           toast({
             title: "Warning",
@@ -307,7 +359,6 @@ const PostProcessingFiltersDialog = () => {
           setIsLoadingPreferences(false);
         });
     } else if (isOpen) {
-      // No opinion selected, use current context state
       setTempEnabled(disconnectDependentServicesEnabled);
     }
   }, [isOpen, selectedOpinion, disconnectDependentServicesEnabled, toast]);
@@ -323,7 +374,6 @@ const PostProcessingFiltersDialog = () => {
       return;
     }
 
-    // Check if there's actually a change to make
     if (tempEnabled === disconnectDependentServicesEnabled) {
       setIsOpen(false);
       return;
@@ -335,7 +385,6 @@ const PostProcessingFiltersDialog = () => {
         `Saving preference: disconnectDependentServices = ${tempEnabled} for opinion: ${selectedOpinion}`
       );
 
-      // Step 1: Save preference via API
       await updateOpinionPreferences(
         {
           disconnectDependentServices: tempEnabled,
@@ -343,10 +392,8 @@ const PostProcessingFiltersDialog = () => {
         selectedOpinion
       );
 
-      // Step 2: Update local state immediately
       actions.setDisconnectDependentServicesEnabled(tempEnabled);
 
-      // Step 3: If enabling and it wasn't enabled before, trigger bulk processing
       if (tempEnabled && !disconnectDependentServicesEnabled) {
         console.log(
           "Enabling dependent service disconnection - triggering bulk processing"
@@ -354,7 +401,6 @@ const PostProcessingFiltersDialog = () => {
 
         try {
           await actions.enableDisconnectDependentServices();
-          // The success message will be shown by the enableDisconnectDependentServices function
         } catch (bulkError) {
           console.error(
             "Bulk processing failed, but preference was saved:",
@@ -368,7 +414,6 @@ const PostProcessingFiltersDialog = () => {
           });
         }
       } else {
-        // Just saving preference without bulk processing
         toast({
           title: "Preferences Saved",
           description: `Post-processing filters have been updated for opinion: ${selectedOpinion}`,
@@ -384,7 +429,6 @@ const PostProcessingFiltersDialog = () => {
         variant: "destructive",
       });
 
-      // Revert temp state on error
       setTempEnabled(disconnectDependentServicesEnabled);
     } finally {
       setIsSubmitting(false);
@@ -392,7 +436,6 @@ const PostProcessingFiltersDialog = () => {
   };
 
   const handleCancel = () => {
-    // Revert to current saved state
     setTempEnabled(disconnectDependentServicesEnabled);
     setIsOpen(false);
   };
@@ -405,7 +448,6 @@ const PostProcessingFiltersDialog = () => {
     }
   };
 
-  // Determine if the confirm button should be disabled
   const isConfirmDisabled =
     isSubmitting ||
     isLoadingPreferences ||
@@ -418,12 +460,6 @@ const PostProcessingFiltersDialog = () => {
         <Button variant="outline" size="sm" className="w-full my-2">
           <Filter className="h-4 w-4 mr-2" />
           Post Processing Filters
-          {/* {disconnectDependentServicesEnabled && (
-            <span
-              className="ml-1 h-2 w-2 bg-green-500 rounded-full"
-              title="Filters active"
-            />
-          )} */}
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-[600px]">
@@ -574,44 +610,42 @@ const PostProcessingFiltersDialog = () => {
   );
 };
 
-// ✨ NEW: Workflow Filter Component
+// ✨ UPDATED: Workflow Filter Component with enhanced descriptions
 const WorkflowFilterSelector = () => {
   const { workflowFilter, actions } = useEntityResolution();
 
   return (
     <div className="space-y-2">
-      {/* <h4 className="text-sm font-medium text-card-foreground flex items-center gap-2">
-        <GitBranch className="h-4 w-4" />
-        Workflow Filter
-      </h4> */}
       <div className="grid grid-cols-2 gap-2">
         <Button
           variant={workflowFilter === "all" ? "default" : "outline"}
           onClick={() => actions.setWorkflowFilter("all")}
           size="sm"
-          className="justify-start text-xs text-wrap"
+          className="justify-start text-xs h-auto py-2 px-3"
         >
-          <Layers className="h-3 w-3 mr-1" />
-          All
+          <Layers className="h-3 w-3 mr-2" />
+          <div className="text-left">
+            <div>All Connections</div>
+            <div className="text-xs opacity-70 font-normal">
+              Show all potential matches
+            </div>
+          </div>
         </Button>
         <Button
           variant={workflowFilter === "cross-source-only" ? "default" : "outline"}
           onClick={() => actions.setWorkflowFilter("cross-source-only")}
           size="sm"
-          className="justify-start text-xs text-wrap"
+          className="justify-start text-xs h-auto py-2 px-3"
         >
-          <GitBranch className="h-3 w-3 mr-1" />
-          Cross-Source
+          <GitBranch className="h-3 w-3 mr-2" />
+          <div className="text-left">
+            <div>Cross-Source Only</div>
+            <div className="text-xs opacity-70 font-normal">
+              Different data sources only
+            </div>
+          </div>
         </Button>
       </div>
-      {/* {workflowFilter === "cross-source-only" && (
-        <div className="bg-blue-50 border border-blue-200 rounded-md p-2">
-          <p className="text-xs text-blue-800">
-            <strong>Active:</strong> Only showing connections between entities from different source systems. 
-            This helps prioritize reviewing cross-system matches.
-          </p>
-        </div>
-      )} */}
     </div>
   );
 };
@@ -624,26 +658,23 @@ export default function ClusterSelector() {
   const [pageInput, setPageInput] = useState(page.toString());
   const totalPages = Math.ceil(total / limit);
 
-  // Update pageInput when the actual page changes (e.g., after loading new clusters)
   useEffect(() => {
     setPageInput(page.toString());
   }, [page]);
 
-  // This effect triggers a reload of clusters whenever the filter status changes.
+  // ✨ UPDATED: Effect now uses loadClusterProgress instead of loadClusters
   useEffect(() => {
-    // When a new tab is selected, fetch the clusters for that tab, resetting to page 1.
-    actions.loadClusters(1);
-  }, [clusterFilterStatus, actions.loadClusters]);
+    actions.loadClusterProgress(1);
+  }, [clusterFilterStatus, actions.loadClusterProgress]);
 
   const handleValueChange = (value: string) => {
-    // This updates the filter status in the global context.
     actions.setClusterFilterStatus(value as ClusterFilterStatus);
   };
 
   const handlePageChange = useCallback(
     (newPage: number) => {
       if (newPage >= 1 && newPage <= totalPages) {
-        actions.loadClusters(newPage, limit);
+        actions.loadClusterProgress(newPage, limit); // ✨ UPDATED: Use loadClusterProgress
       }
     },
     [actions, totalPages, limit]
@@ -655,7 +686,7 @@ export default function ClusterSelector() {
       if (!isNaN(newPage) && newPage >= 1 && newPage <= totalPages) {
         handlePageChange(newPage);
       } else {
-        setPageInput(page.toString()); // Revert to current page if invalid input
+        setPageInput(page.toString());
       }
       e.currentTarget.blur();
     }
@@ -664,7 +695,7 @@ export default function ClusterSelector() {
   const handleInputBlur = () => {
     const newPage = parseInt(pageInput, 10);
     if (isNaN(newPage) || newPage < 1 || newPage > totalPages) {
-      setPageInput(page.toString()); // Revert to current page if invalid input on blur
+      setPageInput(page.toString());
     }
   };
 
@@ -673,15 +704,10 @@ export default function ClusterSelector() {
       <h3 className="text-lg font-semibold text-card-foreground border-b pb-2">
         {resolutionMode === "entity" ? "Entity Clusters" : "Service Clusters"}
       </h3>
-      <ResolutionModeSwitcher />
-
-      {/* ✨ NEW: Workflow Filter Selector */}
       <WorkflowFilterSelector />
-
-      {/* Post Processing Filters Button */}
+      <ResolutionModeSwitcher />
       <PostProcessingFiltersDialog />
 
-      {/* This is the key change: apply flex-grow only to this div */}
       <div className="flex flex-col flex-grow min-h-0">
         <Tabs
           value={clusterFilterStatus}
@@ -692,8 +718,6 @@ export default function ClusterSelector() {
             <TabsTrigger value="unreviewed">Unreviewed</TabsTrigger>
             <TabsTrigger value="reviewed">Reviewed</TabsTrigger>
           </TabsList>
-          {/* The two TabsContent components will mount/unmount based on the selected tab.
-              The list content itself is now a separate component to avoid code duplication. */}
           <TabsContent
             value="unreviewed"
             className="flex-grow flex flex-col mt-2 min-h-0"

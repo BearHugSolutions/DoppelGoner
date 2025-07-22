@@ -3,6 +3,7 @@
 
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import { Button } from "@/components/ui/button";
+import { Building, User } from "lucide-react";
 
 export type ResolutionMode = "entity" | "service";
 
@@ -21,6 +22,7 @@ export default function ResolutionModeSwitcher() {
         className="flex items-center justify-center flex-1"
         size="sm"
       >
+        <Building className="h-3 w-3 mr-2" />
         <span className="text-xs sm:text-sm truncate text-center flex">
           Organization
         </span>
@@ -31,6 +33,7 @@ export default function ResolutionModeSwitcher() {
         className="flex items-center justify-center flex-1"
         size="sm"
       >
+        <User className="h-3 w-3 mr-2" />
         <span className="text-xs sm:text-sm truncate text-center flex">
           Service
         </span>

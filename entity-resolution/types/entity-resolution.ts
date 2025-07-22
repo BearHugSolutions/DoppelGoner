@@ -92,7 +92,7 @@ export interface BaseNodeData {
 export type GraphNode = Node<BaseNodeData>;
 
 export interface GraphLink {
-  id:string;
+  id: string;
   source: string;
   target: string;
   weight: number;
@@ -377,7 +377,6 @@ export interface VisualizationData {
 export type EntityVisualizationDataResponse = VisualizationData;
 export type BulkVisualizationsResponse = VisualizationData[];
 
-
 export interface EntityConnectionDataResponse {
   edge: VisualizationEntityEdge;
   entity1: Organization | Service;
@@ -396,7 +395,6 @@ export function isEntityConnectionData(
 ): data is EntityConnectionDataResponse {
   return "entity1" in data && "entityGroups" in data;
 }
-
 
 // --- Review and Action Types ---
 export type EdgeDecision = "ACCEPTED" | "REJECTED";
@@ -420,7 +418,6 @@ export interface EdgeReviewApiResponse {
 }
 
 export type GroupReviewDecision = "ACCEPTED" | "REJECTED" | string;
-
 
 export interface SuggestedAction {
   id: string;
@@ -492,6 +489,78 @@ export interface ClusterReviewProgress {
   confirmedNonMatches: number;
 }
 
+export interface ProgressData {
+  totalEdges: number;
+  reviewedEdges: number;
+  pendingEdges: number;
+  confirmedMatches: number;
+  confirmedNonMatches: number;
+  progressPercentage: number;
+  isComplete: boolean;
+}
+
+export interface CurrentViewProgress extends ProgressData {
+  filterApplied: WorkflowFilter;
+}
+
+export interface ClusterProgress {
+  // Unfiltered progress (all edges in cluster)
+  allEdges: ProgressData;
+
+  // Cross-source filtered progress (only cross-source edges)
+  crossSourceEdges: ProgressData;
+
+  // Current view progress (based on workflow_filter parameter)
+  currentView: CurrentViewProgress;
+}
+
+export interface ClusterWithProgress {
+  // Cluster basic information (flattened) - matching EntityCluster/BaseCluster pattern
+  id: string;
+  name?: string | null;
+  description?: string | null;
+  entityCount?: number | null;
+  groupCount?: number | null;
+  averageCoherenceScore: number | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  wasReviewed?: boolean | null;
+
+  // Progress information
+  progress: ClusterProgress;
+}
+
+export interface OverallProgressData {
+  totalPendingDecisions: number;
+  totalCompletedDecisions: number;
+  overallProgressPercentage: number;
+  clustersComplete: number;
+  totalClusters: number;
+}
+
+export interface CurrentViewOverallProgress extends OverallProgressData {
+  filterApplied: WorkflowFilter;
+}
+
+export interface OverallProgress {
+  // Unfiltered totals across all clusters
+  all: OverallProgressData;
+
+  // Cross-source filtered totals across all clusters
+  crossSourceOnly: OverallProgressData;
+
+  // Current view (based on workflow_filter parameter)
+  currentView: CurrentViewOverallProgress;
+}
+
+export interface ClusterProgressResponse {
+  clusters: ClusterWithProgress[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+  overallProgress: OverallProgress;
+}
 export interface NodeDetailResponse {
   id: string;
   nodeType: "entity" | "service";

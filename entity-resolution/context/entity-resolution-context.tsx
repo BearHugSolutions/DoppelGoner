@@ -1,15 +1,14 @@
 /*
 ================================================================================
 |
-|   File: /context/entity-resolution-context.tsx
+|   File: /context/entity-resolution-context.tsx - COMPLETE with Server-Side Progress
 |
-|   Description: Manages state for the core entity resolution UI.
-|   - Updated to consume `selectedOpinion` from `AuthContext`.
-|   - All data-fetching operations now pass the `selectedOpinion` to API functions.
-|   - Added guards to prevent API calls when no opinion is selected.
-|   - Integrated dependent service disconnection feature.
-|   - FIXED: Prevented unnecessary bulk-connections calls and UI flickering
-|   - ✨ NEW: Added Cross-Source System Connection Filter functionality
+|   Description: Enhanced to use server-side cluster progress from the new API
+|   - Added server-side progress state management
+|   - Created loadClusterProgress function to replace loadClusters
+|   - Updated queries to prefer server-side progress data
+|   - Enhanced overall progress calculation with server-side data
+|   - Maintains full backward compatibility with existing functionality
 |
 ================================================================================
 */
@@ -30,7 +29,10 @@ import {
   ClusterReviewProgress,
   EdgeReviewApiPayload,
   ClusterFilterStatus,
-  WorkflowFilter, // ✨ NEW: Import WorkflowFilter type
+  WorkflowFilter,
+  ClusterProgress, // ✨ NEW: Import server-side progress types
+  OverallProgress, // ✨ NEW: Import server-side progress types
+  ClusterProgressResponse, // ✨ NEW: Import server-side progress types
   DisconnectDependentServicesRequest,
   DisconnectDependentServicesResponse,
 } from "@/types/entity-resolution";
@@ -46,6 +48,7 @@ import {
   postDisconnectDependentServices,
   getOpinionPreferences,
   updateOpinionPreferences,
+  getClusterProgress, // ✨ NEW: Import the new cluster progress API function
 } from "@/utils/api-client";
 import {
   createContext,
@@ -109,6 +112,14 @@ interface EdgeSelectionInfo {
   totalEdgesInEntireCluster: number;
 }
 
+export interface OverallWorkflowProgress {
+  totalPendingDecisions: number;
+  totalCompletedDecisions: number;
+  overallProgressPercentage: number;
+  clustersComplete: number;
+  totalClusters: number;
+}
+
 export interface EntityResolutionContextType {
   resolutionMode: ResolutionMode;
   selectedClusterId: string | null;
@@ -120,7 +131,7 @@ export interface EntityResolutionContextType {
   isReviewToolsMaximized: boolean;
   clusterFilterStatus: ClusterFilterStatus;
   disconnectDependentServicesEnabled: boolean;
-  workflowFilter: WorkflowFilter; // ✨ NEW: Workflow filter state
+  workflowFilter: WorkflowFilter;
 
   clusters: ClustersState;
   visualizationData: Record<string, VisualizationState>;
@@ -128,6 +139,7 @@ export interface EntityResolutionContextType {
   nodeDetails: Record<string, NodeDetailResponse | null | "loading" | "error">;
 
   clusterProgress: Record<string, ClusterReviewProgress>;
+  overallProgress: OverallWorkflowProgress;
   edgeSelectionInfo: EdgeSelectionInfo;
 
   currentVisualizationData: EntityVisualizationDataResponse | null;
@@ -147,7 +159,7 @@ export interface EntityResolutionContextType {
     setIsReviewToolsMaximized: (isMaximized: boolean) => void;
     setClusterFilterStatus: (status: ClusterFilterStatus) => void;
     setDisconnectDependentServicesEnabled: (enabled: boolean) => void;
-    setWorkflowFilter: (filter: WorkflowFilter) => void; // ✨ NEW: Action to set workflow filter
+    setWorkflowFilter: (filter: WorkflowFilter) => void;
     enableDisconnectDependentServices: () => Promise<void>;
     triggerRefresh: (
       target?:
@@ -157,6 +169,7 @@ export interface EntityResolutionContextType {
         | "current_connection"
     ) => void;
     loadClusters: (page: number, limit?: number) => Promise<void>;
+    loadClusterProgress: (page: number, limit?: number) => Promise<void>; // ✨ NEW: Server-side progress loader
     loadBulkNodeDetails: (nodesToFetch: NodeIdentifier[]) => Promise<void>;
     loadSingleConnectionData: (
       edgeId: string
@@ -193,6 +206,8 @@ export interface EntityResolutionContextType {
     getVisualizationError: (clusterId: string) => string | null;
     getConnectionError: (edgeId: string) => string | null;
     getClusterProgress: (clusterId: string) => ClusterReviewProgress;
+    getClusterProgressUnfiltered: (clusterId: string) => ClusterReviewProgress; // ✨ NEW: Unfiltered progress
+    getClusterProgressCrossSource: (clusterId: string) => ClusterReviewProgress; // ✨ NEW: Cross-source only progress
     canAdvanceToNextCluster: () => boolean;
     isEdgeReviewed: (edgeId: string) => boolean;
     getEdgeStatus: (edgeId: string) => BaseLink["status"] | null;
@@ -225,14 +240,14 @@ export function EntityResolutionProvider({
 }: {
   children: ReactNode;
 }) {
-  const { user, selectedOpinion } = useAuth(); // ✨ Get selectedOpinion from Auth
+  const { user, selectedOpinion } = useAuth();
   const { toast } = useToast();
 
   // Debouncing and guards for cleanup
   const cleanupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastCleanupStateRef = useRef<string>("");
 
-  // 🔧 FIX: Add request deduplication tracking
+  // Request deduplication tracking
   const activeRequestsRef = useRef<Set<string>>(new Set());
   const lastRequestTimeRef = useRef<number>(0);
 
@@ -260,9 +275,14 @@ export function EntityResolutionProvider({
     disconnectDependentServicesEnabled,
     setDisconnectDependentServicesEnabledState,
   ] = useState<boolean>(false);
-
-  // ✨ NEW: Add workflow filter state
   const [workflowFilter, setWorkflowFilter] = useState<WorkflowFilter>("all");
+
+  // ✨ NEW: Server-side progress state
+  const [serverProgress, setServerProgress] = useState<
+    Record<string, ClusterProgress>
+  >({});
+  const [overallServerProgress, setOverallServerProgress] =
+    useState<OverallProgress | null>(null);
 
   // Data state
   const [clusters, setClusters] = useState<ClustersState>(initialClustersState);
@@ -290,10 +310,9 @@ export function EntityResolutionProvider({
     new Set()
   );
 
-  // ✨ NEW: Add cross-source connection detection utility function
+  // Cross-source connection detection utility function
   const isCrossSourceConnection = useCallback(
     (link: BaseLink, nodes: BaseNode[]): boolean => {
-      // Since link.source and link.target are string IDs, use them directly
       const sourceNode = nodes.find((n) => n.id === link.source);
       const targetNode = nodes.find((n) => n.id === link.target);
 
@@ -302,8 +321,6 @@ export function EntityResolutionProvider({
       const sourceSystem1 = sourceNode.sourceSystem;
       const sourceSystem2 = targetNode.sourceSystem;
 
-      // Only show if both have source systems AND they're different
-      // Need explicit checks for truthy strings since sourceSystem can be string | null | undefined
       return !!(
         sourceSystem1 &&
         sourceSystem2 &&
@@ -358,13 +375,12 @@ export function EntityResolutionProvider({
     []
   );
 
-  // 🔧 FIX: Three-cluster cleanup with better debouncing and guards
+  // Three-cluster cleanup with better debouncing and guards
   const performThreeClusterCleanup = useCallback(
     (
       targetClusterId: string | null = selectedClusterId,
       force: boolean = false
     ) => {
-      // Generate state signature to prevent redundant cleanups
       const currentState = JSON.stringify({
         targetClusterId,
         clustersData: clusters.data.map((c) => c.id),
@@ -372,13 +388,11 @@ export function EntityResolutionProvider({
         activelyPaging: activelyPagingClusterId,
       });
 
-      // Skip if we just ran cleanup with the same state (unless forced)
       if (!force && currentState === lastCleanupStateRef.current) {
         console.log("🚫 Skipping redundant cleanup - same state");
         return;
       }
 
-      // Clear any pending cleanup
       if (cleanupTimeoutRef.current) {
         clearTimeout(cleanupTimeoutRef.current);
         cleanupTimeoutRef.current = null;
@@ -433,6 +447,16 @@ export function EntityResolutionProvider({
 
       // Clean visualization data
       setVisualizationData((prev) => {
+        const cleaned = Object.fromEntries(
+          Object.entries(prev).filter(([clusterId]) =>
+            clustersToKeep.has(clusterId)
+          )
+        );
+        return cleaned;
+      });
+
+      // ✨ NEW: Clean server progress data
+      setServerProgress((prev) => {
         const cleaned = Object.fromEntries(
           Object.entries(prev).filter(([clusterId]) =>
             clustersToKeep.has(clusterId)
@@ -524,7 +548,7 @@ export function EntityResolutionProvider({
     ]
   );
 
-  // ✨ Function to enable dependent service disconnection
+  // Function to enable dependent service disconnection
   const enableDisconnectDependentServices = useCallback(async () => {
     if (!user?.id || !selectedOpinion) {
       toast({
@@ -536,7 +560,6 @@ export function EntityResolutionProvider({
     }
 
     try {
-      // First save the preference
       await updateOpinionPreferences(
         {
           disconnectDependentServices: true,
@@ -544,10 +567,8 @@ export function EntityResolutionProvider({
         selectedOpinion
       );
 
-      // Then update local state
       setDisconnectDependentServicesEnabledState(true);
 
-      // Then call bulk processing
       const bulkRequest: DisconnectDependentServicesRequest = {
         reviewerId: user.id,
         notes: "Bulk enable dependent service disconnection",
@@ -572,40 +593,52 @@ export function EntityResolutionProvider({
       });
     }
   }, [user?.id, selectedOpinion, toast]);
-  // Queries object
-  const queries = useMemo(() => {
-    const getClusterById = (clusterId: string): EntityCluster | undefined => {
-      return clusters.data.find((c) => c.id === clusterId);
-    };
 
-    const getClusterProgress = (
-      clusterIdToQuery: string
+  // Client-side progress calculation (fallback)
+  const getClusterProgressInternal = useCallback(
+    (
+      clusterIdToQuery: string,
+      filter: WorkflowFilter
     ): ClusterReviewProgress => {
       const vizState = visualizationData[clusterIdToQuery];
-      const clusterDetails = getClusterById(clusterIdToQuery);
+      const clusterDetails = clusters.data.find(
+        (c) => c.id === clusterIdToQuery
+      );
 
-      if (vizState?.data?.links) {
-        const totalEdges = vizState.data.links.length;
-        const reviewedEdges = vizState.data.links.filter(
-          (l) => l.wasReviewed
-        ).length;
+      const currentVizData = vizState?.data;
+
+      if (currentVizData?.links && currentVizData?.nodes) {
+        let relevantLinks = currentVizData.links;
+
+        if (filter === "cross-source-only") {
+          relevantLinks = currentVizData.links.filter((link) =>
+            isCrossSourceConnection(link, currentVizData.nodes)
+          );
+        }
+
+        const totalEdges = relevantLinks.length;
+        const reviewedEdges = relevantLinks.filter((l) => l.wasReviewed).length;
+        const pendingReviewLinks = relevantLinks.filter((l) => !l.wasReviewed);
+
         const progressPercentage =
           totalEdges > 0 ? Math.round((reviewedEdges / totalEdges) * 100) : 100;
+
         return {
           totalEdges,
           reviewedEdges,
-          pendingEdges: totalEdges - reviewedEdges,
-          confirmedMatches: vizState.data.links.filter(
+          pendingEdges: pendingReviewLinks.length,
+          confirmedMatches: relevantLinks.filter(
             (l) => l.status === "CONFIRMED_MATCH"
           ).length,
-          confirmedNonMatches: vizState.data.links.filter(
+          confirmedNonMatches: relevantLinks.filter(
             (l) => l.status === "CONFIRMED_NON_MATCH"
           ).length,
           progressPercentage,
-          isComplete: reviewedEdges === totalEdges,
+          isComplete: pendingReviewLinks.length === 0,
         };
       }
 
+      // Fallback logic for when visualization data isn't loaded
       if (clusterDetails) {
         if (clusterDetails.wasReviewed) {
           const total = clusterDetails.groupCount ?? 0;
@@ -642,63 +675,9 @@ export function EntityResolutionProvider({
         progressPercentage: -1,
         isComplete: false,
       };
-    };
-
-    return {
-      isVisualizationDataLoaded: (clusterId: string) =>
-        !!visualizationData[clusterId]?.data &&
-        !visualizationData[clusterId]?.loading &&
-        !visualizationData[clusterId]?.error,
-      isVisualizationDataLoading: (clusterId: string) =>
-        !!visualizationData[clusterId]?.loading,
-      isConnectionDataLoaded: (edgeId: string) =>
-        !!connectionData[edgeId]?.data &&
-        !connectionData[edgeId]?.loading &&
-        !connectionData[edgeId]?.error,
-      isConnectionDataLoading: (edgeId: string) =>
-        !!connectionData[edgeId]?.loading,
-      getVisualizationError: (clusterId: string) =>
-        visualizationData[clusterId]?.error || null,
-      getConnectionError: (edgeId: string) =>
-        connectionData[edgeId]?.error || null,
-      getClusterProgress,
-      canAdvanceToNextCluster: () => {
-        if (!selectedClusterId) return false;
-        const progress = getClusterProgress(selectedClusterId);
-        return progress?.isComplete || false;
-      },
-      isEdgeReviewed: (edgeId: string) => {
-        const currentViz = selectedClusterId
-          ? visualizationData[selectedClusterId]?.data
-          : null;
-        if (!currentViz?.links) return false;
-        const edge = currentViz.links.find((l) => l.id === edgeId);
-        return edge ? edge.wasReviewed === true : false;
-      },
-      getEdgeStatus: (edgeId: string) => {
-        const currentViz = selectedClusterId
-          ? visualizationData[selectedClusterId]?.data
-          : null;
-        if (!currentViz?.links) return null;
-        const edge = currentViz.links.find((l) => l.id === edgeId);
-        return edge?.status ?? null;
-      },
-      getEdgeSubmissionStatus: (edgeId: string) => {
-        return (
-          edgeSubmissionStatus[edgeId] || { isSubmitting: false, error: null }
-        );
-      },
-      getClusterById,
-      getNodeDetail: (nodeId: string) => nodeDetails[nodeId] || null,
-    };
-  }, [
-    visualizationData,
-    connectionData,
-    selectedClusterId,
-    edgeSubmissionStatus,
-    clusters.data,
-    nodeDetails,
-  ]);
+    },
+    [visualizationData, clusters.data, isCrossSourceConnection]
+  );
 
   const clearAllData = useCallback(() => {
     console.log("Clearing all data.");
@@ -716,9 +695,12 @@ export function EntityResolutionProvider({
     setIsLoadingPage(false);
     setEdgeSubmissionStatus({});
     setDisconnectDependentServicesEnabledState(false);
-    setWorkflowFilter("all"); // ✨ NEW: Reset workflow filter
+    setWorkflowFilter("all");
 
-    // 🔧 FIX: Clear request tracking
+    // ✨ NEW: Clear server progress
+    setServerProgress({});
+    setOverallServerProgress(null);
+
     activeRequestsRef.current.clear();
     lastRequestTimeRef.current = 0;
   }, []);
@@ -738,7 +720,6 @@ export function EntityResolutionProvider({
   const loadBulkNodeDetails = useCallback(
     async (nodesToFetch: NodeIdentifier[]) => {
       if (!selectedOpinion) {
-        // ✨ Guard for opinion
         console.log("🚫 No opinion selected, skipping node details fetch");
         return;
       }
@@ -815,7 +796,7 @@ export function EntityResolutionProvider({
             const response = await getBulkNodeDetails(
               { items: chunk },
               selectedOpinion
-            ); // ✨ Pass opinion
+            );
 
             setNodeDetails((prev) => {
               const newState = { ...prev };
@@ -847,30 +828,28 @@ export function EntityResolutionProvider({
         cleanupPendingState();
       }
     },
-    [nodeDetails, pendingNodeFetches, selectedOpinion] // ✨ Added selectedOpinion dependency
+    [nodeDetails, pendingNodeFetches, selectedOpinion]
   );
 
-  // 🔧 FIX: loadBulkConnections with improved request deduplication and caching
+  // loadBulkConnections with improved request deduplication and caching
   const loadBulkConnections = useCallback(
     async (items: BulkConnectionRequestItem[]) => {
       if (!selectedOpinion) {
-        // ✨ Guard for opinion
         console.log("🚫 No opinion selected, skipping connections fetch");
         return;
       }
 
       if (items.length === 0) return;
 
-      // 🔧 FIX: Add request throttling
+      // Add request throttling
       const now = Date.now();
       if (now - lastRequestTimeRef.current < 500) {
-        // 500ms throttle
         console.log("🚫 Request throttled - too soon after last request");
         return;
       }
       lastRequestTimeRef.current = now;
 
-      // 🔧 FIX: Add request deduplication
+      // Add request deduplication
       const requestKey = items
         .map((i) => i.edgeId)
         .sort()
@@ -886,7 +865,7 @@ export function EntityResolutionProvider({
         (item) => `${item.edgeId}-${item.itemType}`
       );
 
-      // 🔧 FIX: Better filtering with cache validation
+      // Better filtering with cache validation
       const trulyNeedsFetching = uniqueItems.filter((item) => {
         const existing = connectionData[item.edgeId];
         const isLoading = existing?.loading;
@@ -958,7 +937,7 @@ export function EntityResolutionProvider({
             const response = await getBulkConnections(
               { items: firstChunk },
               selectedOpinion
-            ); // ✨ Pass opinion
+            );
             setConnectionData(
               produce((draft) => {
                 response.forEach((connData) => {
@@ -1001,7 +980,7 @@ export function EntityResolutionProvider({
         // Background chunks
         if (chunks.length > 0) {
           chunks.forEach((chunk) => {
-            getBulkConnections({ items: chunk }, selectedOpinion) // ✨ Pass opinion
+            getBulkConnections({ items: chunk }, selectedOpinion)
               .then((response) => {
                 setConnectionData(
                   produce((draft) => {
@@ -1050,10 +1029,10 @@ export function EntityResolutionProvider({
         activeRequestsRef.current.delete(requestKey);
       }
     },
-    [connectionData, selectedOpinion] // ✨ Added selectedOpinion dependency
+    [connectionData, selectedOpinion]
   );
 
-  // 🔧 FIX: Debounced version of loadBulkConnections
+  // Debounced version of loadBulkConnections
   const debouncedLoadBulkConnections = useCallback(
     _.debounce(async (items: BulkConnectionRequestItem[]) => {
       if (items.length === 0) return;
@@ -1073,15 +1052,148 @@ export function EntityResolutionProvider({
         );
         await loadBulkConnections(filtered);
       }
-    }, 300), // 300ms debounce
+    }, 300),
     [loadBulkConnections, connectionData]
   );
+
+  // Enhanced queries object with server-side progress support
+  const queries = useMemo(() => {
+    const getClusterById = (clusterId: string): EntityCluster | undefined => {
+      return clusters.data.find((c) => c.id === clusterId);
+    };
+
+    // ✨ NEW: Get cluster progress (current filter view) - prefers server data
+    const getClusterProgress = (
+      clusterIdToQuery: string
+    ): ClusterReviewProgress => {
+      // Prefer server-side progress if available
+      const serverProg = serverProgress[clusterIdToQuery];
+      if (serverProg) {
+        const currentProgress = serverProg.currentView;
+        return {
+          totalEdges: currentProgress.totalEdges,
+          reviewedEdges: currentProgress.reviewedEdges,
+          pendingEdges: currentProgress.pendingEdges,
+          confirmedMatches: currentProgress.confirmedMatches,
+          confirmedNonMatches: currentProgress.confirmedNonMatches,
+          progressPercentage: currentProgress.progressPercentage,
+          isComplete: currentProgress.isComplete,
+        };
+      }
+
+      // Fallback to existing client-side calculation
+      return getClusterProgressInternal(clusterIdToQuery, workflowFilter);
+    };
+
+    // ✨ NEW: Get unfiltered cluster progress (all edges)
+    const getClusterProgressUnfiltered = (
+      clusterIdToQuery: string
+    ): ClusterReviewProgress => {
+      const serverProg = serverProgress[clusterIdToQuery];
+      if (serverProg) {
+        const allProgress = serverProg.allEdges;
+        return {
+          totalEdges: allProgress.totalEdges,
+          reviewedEdges: allProgress.reviewedEdges,
+          pendingEdges: allProgress.pendingEdges,
+          confirmedMatches: allProgress.confirmedMatches,
+          confirmedNonMatches: allProgress.confirmedNonMatches,
+          progressPercentage: allProgress.progressPercentage,
+          isComplete: allProgress.isComplete,
+        };
+      }
+
+      // Fallback to existing client-side calculation without filter
+      return getClusterProgressInternal(clusterIdToQuery, "all");
+    };
+
+    // ✨ NEW: Get cross-source only cluster progress
+    const getClusterProgressCrossSource = (
+      clusterIdToQuery: string
+    ): ClusterReviewProgress => {
+      const serverProg = serverProgress[clusterIdToQuery];
+      if (serverProg) {
+        const crossSourceProgress = serverProg.crossSourceEdges;
+        return {
+          totalEdges: crossSourceProgress.totalEdges,
+          reviewedEdges: crossSourceProgress.reviewedEdges,
+          pendingEdges: crossSourceProgress.pendingEdges,
+          confirmedMatches: crossSourceProgress.confirmedMatches,
+          confirmedNonMatches: crossSourceProgress.confirmedNonMatches,
+          progressPercentage: crossSourceProgress.progressPercentage,
+          isComplete: crossSourceProgress.isComplete,
+        };
+      }
+
+      // Fallback to existing client-side calculation with cross-source filter
+      return getClusterProgressInternal(clusterIdToQuery, "cross-source-only");
+    };
+
+    return {
+      isVisualizationDataLoaded: (clusterId: string) =>
+        !!visualizationData[clusterId]?.data &&
+        !visualizationData[clusterId]?.loading &&
+        !visualizationData[clusterId]?.error,
+      isVisualizationDataLoading: (clusterId: string) =>
+        !!visualizationData[clusterId]?.loading,
+      isConnectionDataLoaded: (edgeId: string) =>
+        !!connectionData[edgeId]?.data &&
+        !connectionData[edgeId]?.loading &&
+        !connectionData[edgeId]?.error,
+      isConnectionDataLoading: (edgeId: string) =>
+        !!connectionData[edgeId]?.loading,
+      getVisualizationError: (clusterId: string) =>
+        visualizationData[clusterId]?.error || null,
+      getConnectionError: (edgeId: string) =>
+        connectionData[edgeId]?.error || null,
+      getClusterProgress,
+      getClusterProgressUnfiltered, // ✨ NEW
+      getClusterProgressCrossSource, // ✨ NEW
+      canAdvanceToNextCluster: () => {
+        if (!selectedClusterId) return false;
+        const progress = getClusterProgress(selectedClusterId);
+        return progress?.isComplete || false;
+      },
+      isEdgeReviewed: (edgeId: string) => {
+        const currentViz = selectedClusterId
+          ? visualizationData[selectedClusterId]?.data
+          : null;
+        if (!currentViz?.links) return false;
+        const edge = currentViz.links.find((l) => l.id === edgeId);
+        return edge ? edge.wasReviewed === true : false;
+      },
+      getEdgeStatus: (edgeId: string) => {
+        const currentViz = selectedClusterId
+          ? visualizationData[selectedClusterId]?.data
+          : null;
+        if (!currentViz?.links) return null;
+        const edge = currentViz.links.find((l) => l.id === edgeId);
+        return edge?.status ?? null;
+      },
+      getEdgeSubmissionStatus: (edgeId: string) => {
+        return (
+          edgeSubmissionStatus[edgeId] || { isSubmitting: false, error: null }
+        );
+      },
+      getClusterById,
+      getNodeDetail: (nodeId: string) => nodeDetails[nodeId] || null,
+    };
+  }, [
+    visualizationData,
+    connectionData,
+    selectedClusterId,
+    edgeSubmissionStatus,
+    clusters.data,
+    nodeDetails,
+    serverProgress, // ✨ NEW: Server progress dependency
+    getClusterProgressInternal,
+    workflowFilter,
+  ]);
 
   // loadVisualizationDataForClusters with opinion support
   const loadVisualizationDataForClusters = useCallback(
     async (items: BulkVisualizationRequestItem[]) => {
       if (!selectedOpinion) {
-        // ✨ Guard for opinion
         console.log("🚫 No opinion selected, skipping visualization fetch");
         return;
       }
@@ -1126,7 +1238,7 @@ export function EntityResolutionProvider({
           const response = await getBulkVisualizations(
             { items: chunk },
             selectedOpinion
-          ); // ✨ Pass opinion
+          );
           allFetchedVisualizations.push(...response);
 
           setVisualizationData((prev) => {
@@ -1248,7 +1360,6 @@ export function EntityResolutionProvider({
 
       const allLinksToLoad = [...priorityLinks, ...backgroundLinks];
       if (allLinksToLoad.length > 0) {
-        // 🔧 FIX: Use debounced version
         debouncedLoadBulkConnections(allLinksToLoad);
       }
     },
@@ -1258,7 +1369,7 @@ export function EntityResolutionProvider({
       queries,
       debouncedLoadBulkConnections,
       selectedOpinion,
-    ] // ✨ Added selectedOpinion dependency
+    ]
   );
 
   const loadVisualizationDataForClustersRef = useRef(
@@ -1266,52 +1377,125 @@ export function EntityResolutionProvider({
   );
 
   useEffect(() => {
-    if (selectedOpinion && user?.id) {
-      console.log(`Loading preferences for opinion: ${selectedOpinion}`);
-
-      getOpinionPreferences(selectedOpinion)
-        .then((response) => {
-          console.log(
-            `Loaded preferences for ${selectedOpinion}:`,
-            response.preferences
-          );
-          setDisconnectDependentServicesEnabledState(
-            response.preferences.disconnectDependentServices
-          );
-        })
-        .catch((error) => {
-          console.error("Failed to load opinion preferences:", error);
-          // Fallback to default (false) on error
-          setDisconnectDependentServicesEnabledState(false);
-
-          // Only show toast for non-404 errors (404 means no preferences saved yet)
-          if (
-            !error.message?.includes("404") &&
-            !error.message?.includes("Not found")
-          ) {
-            toast({
-              title: "Warning",
-              description: "Could not load saved preferences. Using defaults.",
-              variant: "destructive",
-            });
-          }
-        });
-    } else if (!selectedOpinion) {
-      // No opinion selected, reset to default
-      setDisconnectDependentServicesEnabledState(false);
-    }
-  }, [selectedOpinion, user?.id, toast]);
-
-  useEffect(() => {
     loadVisualizationDataForClustersRef.current =
       loadVisualizationDataForClusters;
   }, [loadVisualizationDataForClusters]);
 
-  // loadClusters with opinion support
+  // ✨ NEW: Load cluster progress from server
+  const loadClusterProgress = useCallback(
+    async (page: number, limit: number = 10) => {
+      if (!selectedOpinion) {
+        console.log("🚫 No opinion selected, skipping cluster progress fetch");
+        return;
+      }
+
+      console.log(
+        `🔄 Loading cluster progress: page=${page}, limit=${limit}, filter=${clusterFilterStatus}, workflow=${workflowFilter}, mode=${resolutionMode}, opinion=${selectedOpinion}`
+      );
+
+      setClusters((prev) => ({
+        ...prev,
+        loading: true,
+        error: null,
+        page,
+        limit,
+      }));
+
+      try {
+        const response = await getClusterProgress(
+          page,
+          limit,
+          clusterFilterStatus,
+          workflowFilter,
+          resolutionMode,
+          selectedOpinion
+        );
+
+        console.log(
+          `✅ Cluster progress loaded: ${response.clusters.length} clusters, overall progress: ${response.overallProgress.currentView.overallProgressPercentage}%`
+        );
+
+        // Handle empty page
+        if (response.clusters.length === 0 && response.page > 1) {
+          console.warn(
+            `No clusters on page ${response.page}. Attempting to load page 1.`
+          );
+          setClusters((prev) => ({ ...prev, loading: false, error: null }));
+          loadClusterProgress(1, limit);
+          return;
+        }
+
+        // Update server progress state
+        const progressMap: Record<string, ClusterProgress> = {};
+        response.clusters.forEach((cluster) => {
+          progressMap[cluster.id] = cluster.progress;
+        });
+
+        setServerProgress(progressMap);
+        setOverallServerProgress(response.overallProgress);
+
+        // Update clusters data for compatibility
+        setClusters({
+          data: response.clusters.map((c) => ({
+            ...c,
+            // Map progress data to existing cluster structure for compatibility
+            wasReviewed: c.progress.currentView.isComplete,
+          })),
+          total: response.total,
+          page: response.page,
+          limit: response.limit,
+          loading: false,
+          error: null,
+        });
+
+        if (response.clusters.length === 0) {
+          setSelectedClusterIdState(null);
+        }
+
+        // Load visualization data for small clusters
+        const vizRequestItemsNormal: BulkVisualizationRequestItem[] = [];
+        response.clusters.forEach((c) => {
+          const connectionCount = c.groupCount;
+          if (
+            connectionCount !== undefined &&
+            connectionCount !== null &&
+            connectionCount <= LARGE_CLUSTER_THRESHOLD
+          ) {
+            vizRequestItemsNormal.push({
+              clusterId: c.id,
+              itemType: resolutionMode,
+            });
+          }
+        });
+
+        if (vizRequestItemsNormal.length > 0) {
+          await loadVisualizationDataForClustersRef.current(
+            vizRequestItemsNormal
+          );
+        }
+      } catch (error) {
+        console.error("❌ Failed to load cluster progress:", error);
+        setClusters((prev) => ({
+          ...prev,
+          loading: false,
+          error: (error as Error).message,
+          data: [],
+          total: 0,
+        }));
+        setSelectedClusterIdState(null);
+
+        // Clear server progress on error
+        setServerProgress({});
+        setOverallServerProgress(null);
+      }
+    },
+    [resolutionMode, clusterFilterStatus, workflowFilter, selectedOpinion]
+  );
+
+  // Original loadClusters for backward compatibility
   const loadClusters = useCallback(
     async (page: number, limit: number = 10) => {
       if (!selectedOpinion) {
-        // ✨ Guard for opinion
         console.log("🚫 No opinion selected, skipping clusters fetch");
         return;
       }
@@ -1335,7 +1519,7 @@ export function EntityResolutionProvider({
           limit,
           clusterFilterStatus,
           selectedOpinion
-        ); // ✨ Pass opinion
+        );
 
         if (response.clusters.length === 0 && response.page > 1) {
           console.warn(
@@ -1390,14 +1574,79 @@ export function EntityResolutionProvider({
         setSelectedClusterIdState(null);
       }
     },
-    [
-      resolutionMode,
-      clusterFilterStatus,
-      selectedOpinion, // ✨ Added selectedOpinion dependency
-    ]
+    [resolutionMode, clusterFilterStatus, selectedOpinion]
   );
 
-  // 🔧 FIX: handleSetSelectedClusterId with better connection loading logic
+  // ✨ UPDATED: Cluster progress now uses server-side data when available
+  const clusterProgress = useMemo(() => {
+    const reconstructed: Record<string, ClusterReviewProgress> = {};
+
+    clusters.data.forEach((cluster) => {
+      reconstructed[cluster.id] = queries.getClusterProgress(cluster.id);
+    });
+
+    if (selectedClusterId && !reconstructed[selectedClusterId]) {
+      const hasVisualizationData =
+        visualizationData[selectedClusterId]?.data?.links;
+      const hasClusterDetails = queries.getClusterById(selectedClusterId);
+      const hasServerProgress = serverProgress[selectedClusterId];
+
+      if (hasVisualizationData || hasClusterDetails || hasServerProgress) {
+        reconstructed[selectedClusterId] =
+          queries.getClusterProgress(selectedClusterId);
+      }
+    }
+
+    return reconstructed;
+  }, [
+    clusters.data,
+    selectedClusterId,
+    selectedClusterId
+      ? visualizationData[selectedClusterId]?.data?.links
+      : undefined,
+    serverProgress, // ✨ NEW: Server progress dependency
+    queries,
+  ]);
+
+  // ✨ UPDATED: Overall progress uses server-side data when available
+  const overallProgress = useMemo(() => {
+    if (overallServerProgress) {
+      // Return the current view progress (respects current workflow filter)
+      return overallServerProgress.currentView;
+    }
+
+    // Fallback to existing client-side calculation
+    let totalPending = 0;
+    let totalCompleted = 0;
+    let clustersComplete = 0;
+
+    clusters.data.forEach((cluster) => {
+      const progress = clusterProgress[cluster.id];
+      if (progress) {
+        totalPending += progress.pendingEdges;
+        totalCompleted += progress.reviewedEdges;
+        if (progress.isComplete) {
+          clustersComplete++;
+        }
+      }
+    });
+
+    const totalDecisions = totalPending + totalCompleted;
+    const overallProgressPercentage =
+      totalDecisions > 0
+        ? Math.round((totalCompleted / totalDecisions) * 100)
+        : 100;
+
+    return {
+      totalPendingDecisions: totalPending,
+      totalCompletedDecisions: totalCompleted,
+      overallProgressPercentage,
+      clustersComplete,
+      totalClusters: clusters.data.length,
+    };
+  }, [overallServerProgress, clusters.data, clusterProgress]);
+
+  // handleSetSelectedClusterId with better connection loading logic
   const handleSetSelectedClusterId = useCallback(
     async (id: string | null) => {
       if (id === selectedClusterId) return;
@@ -1412,7 +1661,6 @@ export function EntityResolutionProvider({
       }
 
       if (id && selectedOpinion) {
-        // ✨ Check for opinion
         const clusterDetail = queries.getClusterById(id);
         const connectionCount = clusterDetail
           ? clusterDetail.groupCount
@@ -1440,7 +1688,6 @@ export function EntityResolutionProvider({
               { clusterId: id, itemType: resolutionMode },
             ]);
           } else if (vizState?.data?.links) {
-            // 🔧 FIX: Better filtering and use debounced loading
             const unloadedConnectionItems = vizState.data.links
               .filter((link) => {
                 const connState = connectionData[link.id];
@@ -1472,7 +1719,7 @@ export function EntityResolutionProvider({
     },
     [
       selectedClusterId,
-      selectedOpinion, // ✨ Added selectedOpinion dependency
+      selectedOpinion,
       activelyPagingClusterId,
       largeClusterConnectionsPage,
       queries,
@@ -1511,14 +1758,13 @@ export function EntityResolutionProvider({
   const loadSingleConnectionData = useCallback(
     async (edgeId: string): Promise<EntityConnectionDataResponse | null> => {
       if (!selectedOpinion) {
-        // ✨ Guard for opinion
         console.log("🚫 No opinion selected, skipping single connection fetch");
         return null;
       }
 
       const cached = connectionData[edgeId];
 
-      // 🔧 FIX: Better cache validation
+      // Better cache validation
       if (
         cached?.data &&
         !cached.loading &&
@@ -1547,7 +1793,7 @@ export function EntityResolutionProvider({
         return cached.data;
       }
 
-      // 🔧 FIX: Prevent duplicate requests
+      // Prevent duplicate requests
       if (cached?.loading) {
         console.log(`⏳ Connection data already loading for edge ${edgeId}`);
         return null;
@@ -1569,7 +1815,7 @@ export function EntityResolutionProvider({
           resolutionMode === "entity"
             ? getOrganizationConnectionData
             : getServiceConnectionData;
-        const response = await fetcher(edgeId, selectedOpinion); // ✨ Pass opinion
+        const response = await fetcher(edgeId, selectedOpinion);
 
         setConnectionData((prev) => ({
           ...prev,
@@ -1616,7 +1862,7 @@ export function EntityResolutionProvider({
         return null;
       }
     },
-    [connectionData, resolutionMode, loadBulkNodeDetails, selectedOpinion] // ✨ Added selectedOpinion dependency
+    [connectionData, resolutionMode, loadBulkNodeDetails, selectedOpinion]
   );
 
   // triggerRefresh function
@@ -1632,18 +1878,17 @@ export function EntityResolutionProvider({
       if (target === "all" || target === "clusters") {
         setActivelyPagingClusterId(null);
         setLargeClusterConnectionsPage(0);
-        loadClusters(clusters.page, clusters.limit);
+        loadClusterProgress(clusters.page, clusters.limit); // ✨ Use loadClusterProgress
       }
       setRefreshTrigger((prev) => prev + 1);
     },
-    [clusters.page, clusters.limit, loadClusters]
+    [clusters.page, clusters.limit, loadClusterProgress]
   );
 
   // submitEdgeReview with opinion support and disconnectDependentServices flag
   const submitEdgeReview = useCallback(
     async (edgeId: string, decision: GroupReviewDecision, notes?: string) => {
       if (!user?.id || !selectedOpinion) {
-        // ✨ Check for user and opinion
         toast({
           title: "Auth Error",
           description: "Login required and opinion must be selected.",
@@ -1693,7 +1938,7 @@ export function EntityResolutionProvider({
           type: resolutionMode,
           disconnectDependentServices: disconnectDependentServicesEnabled,
         };
-        const response = await postEdgeReview(edgeId, payload, selectedOpinion); // ✨ Pass opinion
+        const response = await postEdgeReview(edgeId, payload, selectedOpinion);
 
         setEdgeSubmissionStatus((prev) => ({
           ...prev,
@@ -1757,10 +2002,10 @@ export function EntityResolutionProvider({
       resolutionMode,
       toast,
       disconnectDependentServicesEnabled,
-    ] // ✨ Added selectedOpinion dependency
+    ]
   );
 
-  // ✨ NEW: Updated Computed visualization data with workflow filter support
+  // Computed visualization data with workflow filter support
   const currentVisualizationDataForSelection =
     useMemo((): EntityVisualizationDataResponse | null => {
       if (!selectedClusterId) return null;
@@ -1783,7 +2028,7 @@ export function EntityResolutionProvider({
         data = { ...vizState.data, links: pagedLinks };
       }
 
-      // ✨ NEW: Apply workflow filter
+      // Apply workflow filter
       if (workflowFilter === "cross-source-only") {
         const filteredLinks = data.links.filter((link) =>
           isCrossSourceConnection(link, data.nodes)
@@ -1797,8 +2042,8 @@ export function EntityResolutionProvider({
       visualizationData,
       activelyPagingClusterId,
       largeClusterConnectionsPage,
-      workflowFilter, // ✨ NEW: Add dependency
-      isCrossSourceConnection, // ✨ NEW: Add dependency
+      workflowFilter,
+      isCrossSourceConnection,
     ]);
 
   const currentConnectionData =
@@ -1887,34 +2132,6 @@ export function EntityResolutionProvider({
     visualizationData,
   ]);
 
-  const clusterProgress = useMemo(() => {
-    const reconstructed: Record<string, ClusterReviewProgress> = {};
-
-    clusters.data.forEach((cluster) => {
-      reconstructed[cluster.id] = queries.getClusterProgress(cluster.id);
-    });
-
-    if (selectedClusterId && !reconstructed[selectedClusterId]) {
-      const hasVisualizationData =
-        visualizationData[selectedClusterId]?.data?.links;
-      const hasClusterDetails = queries.getClusterById(selectedClusterId);
-
-      if (hasVisualizationData || hasClusterDetails) {
-        reconstructed[selectedClusterId] =
-          queries.getClusterProgress(selectedClusterId);
-      }
-    }
-
-    return reconstructed;
-  }, [
-    clusters.data,
-    selectedClusterId,
-    selectedClusterId
-      ? visualizationData[selectedClusterId]?.data?.links
-      : undefined,
-    queries,
-  ]);
-
   const isLoadingConnectionPageData = useMemo(() => {
     if (!isLoadingPage) return false;
     if (selectedEdgeId) return !queries.isConnectionDataLoaded(selectedEdgeId);
@@ -1937,7 +2154,7 @@ export function EntityResolutionProvider({
       console.warn(
         "Current cluster not found in cluster list. Reloading clusters."
       );
-      loadClusters(clusters.page, clusters.limit);
+      loadClusterProgress(clusters.page, clusters.limit);
       return;
     }
 
@@ -1970,7 +2187,7 @@ export function EntityResolutionProvider({
         const nextPageToLoad = clusters.page + 1;
         console.log(`Loading next page (${nextPageToLoad}) of clusters.`);
 
-        await loadClusters(nextPageToLoad, clusters.limit);
+        await loadClusterProgress(nextPageToLoad, clusters.limit);
 
         // After loading new page, the useEffect for auto-selecting will handle
         // selecting the first unreviewed cluster on the new page
@@ -1990,7 +2207,7 @@ export function EntityResolutionProvider({
   }, [
     selectedClusterId,
     clusters,
-    loadClusters,
+    loadClusterProgress,
     toast,
     handleSetSelectedClusterId,
     setActivelyPagingClusterId,
@@ -2294,7 +2511,6 @@ export function EntityResolutionProvider({
 
       if (connectionItemsToFetch.length > 0) {
         try {
-          // 🔧 FIX: Use debounced version for consistency
           if (isPrefetch) {
             debouncedLoadBulkConnections(connectionItemsToFetch);
           } else {
@@ -2525,7 +2741,45 @@ export function EntityResolutionProvider({
     [resolutionMode, loadBulkConnections]
   );
 
-  // 🔧 FIX: Effect to auto-select edge when visualization data loads (simplified dependencies)
+  // Load opinion preferences on opinion change
+  useEffect(() => {
+    if (selectedOpinion && user?.id) {
+      console.log(`Loading preferences for opinion: ${selectedOpinion}`);
+
+      getOpinionPreferences(selectedOpinion)
+        .then((response) => {
+          console.log(
+            `Loaded preferences for ${selectedOpinion}:`,
+            response.preferences
+          );
+          setDisconnectDependentServicesEnabledState(
+            response.preferences.disconnectDependentServices
+          );
+        })
+        .catch((error) => {
+          console.error("Failed to load opinion preferences:", error);
+          // Fallback to default (false) on error
+          setDisconnectDependentServicesEnabledState(false);
+
+          // Only show toast for non-404 errors (404 means no preferences saved yet)
+          if (
+            !error.message?.includes("404") &&
+            !error.message?.includes("Not found")
+          ) {
+            toast({
+              title: "Warning",
+              description: "Could not load saved preferences. Using defaults.",
+              variant: "destructive",
+            });
+          }
+        });
+    } else if (!selectedOpinion) {
+      // No opinion selected, reset to default
+      setDisconnectDependentServicesEnabledState(false);
+    }
+  }, [selectedOpinion, user?.id, toast]);
+
+  // Effect to auto-select edge when visualization data loads
   useEffect(() => {
     if (
       selectedClusterId &&
@@ -2550,11 +2804,11 @@ export function EntityResolutionProvider({
     }
   }, [
     selectedClusterId,
-    currentVisualizationDataForSelection?.links?.length, // 🔧 FIX: Only the length, not the entire links array
+    currentVisualizationDataForSelection?.links?.length,
     selectedEdgeId,
-  ]); // 🔧 FIX: Minimal dependencies
+  ]);
 
-  // 🔧 FIX: Effect to auto-load connection data when edge is selected (simplified)
+  // Effect to auto-load connection data when edge is selected
   useEffect(() => {
     if (!selectedEdgeId) return;
 
@@ -2570,24 +2824,22 @@ export function EntityResolutionProvider({
       );
       loadSingleConnectionData(selectedEdgeId);
     }
-  }, [selectedEdgeId]); // 🔧 FIX: Only selectedEdgeId dependency
+  }, [selectedEdgeId]);
 
-  // 🔧 FIX: Memory monitoring useEffect with reduced frequency and better guards
+  // Memory monitoring useEffect with reduced frequency and better guards
   useEffect(() => {
     const monitorMemoryUsage = () => {
       const clusterCount = Object.keys(visualizationData).length;
       const connectionCount = Object.keys(connectionData).length;
       const nodeCount = Object.keys(nodeDetails).length;
 
-      // 🔧 FIX: Increased thresholds to reduce cleanup frequency
+      // Increased thresholds to reduce cleanup frequency
       if (clusterCount > 8) {
-        // Increased from 6
         console.warn(
           `🚨 Too many clusters in memory (${clusterCount}), forcing cleanup`
         );
         performThreeClusterCleanup(selectedClusterId, true);
       } else if (connectionCount > 600) {
-        // Increased from 800
         console.warn(
           `🚨 Too many connections in memory (${connectionCount}), forcing cleanup`
         );
@@ -2595,12 +2847,12 @@ export function EntityResolutionProvider({
       }
     };
 
-    // 🔧 FIX: Increased interval to reduce frequency
+    // Increased interval to reduce frequency
     const interval = setInterval(monitorMemoryUsage, 120000); // 2 minutes instead of 30 seconds
     return () => clearInterval(interval);
-  }, []); // 🔧 FIX: Remove dependencies to prevent frequent setup/teardown
+  }, []);
 
-  // 🔧 FIX: Debounced cleanup useEffect with better guards
+  // Debounced cleanup useEffect with better guards
   useEffect(() => {
     if (!selectedClusterId || clusters.data.length === 0) return;
 
@@ -2609,7 +2861,7 @@ export function EntityResolutionProvider({
       clearTimeout(cleanupTimeoutRef.current);
     }
 
-    // 🔧 FIX: Longer debounce to prevent rapid cleanup
+    // Longer debounce to prevent rapid cleanup
     cleanupTimeoutRef.current = setTimeout(() => {
       const currentState = JSON.stringify({
         selectedClusterId,
@@ -2624,7 +2876,7 @@ export function EntityResolutionProvider({
         lastCleanupStateRef.current = currentState;
       }
       cleanupTimeoutRef.current = null;
-    }, 3000); // 🔧 FIX: Increased from 1000ms to 3000ms
+    }, 3000); // Increased from 1000ms to 3000ms
 
     return () => {
       if (cleanupTimeoutRef.current) {
@@ -2632,20 +2884,20 @@ export function EntityResolutionProvider({
         cleanupTimeoutRef.current = null;
       }
     };
-  }, [selectedClusterId]); // 🔧 FIX: Only selectedClusterId dependency
+  }, [selectedClusterId]);
 
-  // ✨ Effect to reload clusters when itemType, selectedOpinion, or filter status changes
+  // ✨ UPDATED: Effect to reload clusters when filter changes - now uses loadClusterProgress
   useEffect(() => {
     if (
       (clusters.data.length === 0 || clusters.error) &&
       !clusters.loading &&
       (clusters.total > 0 || clusterFilterStatus === "unreviewed") &&
-      selectedOpinion // ✨ Only load if opinion is selected
+      selectedOpinion
     ) {
       console.log(
-        `[useEffect] Initial cluster load/reload triggered for filter: ${clusterFilterStatus}`
+        `[useEffect] Initial cluster progress load triggered for filter: ${clusterFilterStatus}, workflow: ${workflowFilter}`
       );
-      loadClusters(1, clusters.limit);
+      loadClusterProgress(1, clusters.limit);
     } else if (
       clusters.total === 0 &&
       !clusters.loading &&
@@ -2659,10 +2911,11 @@ export function EntityResolutionProvider({
   }, [
     resolutionMode,
     clusterFilterStatus,
-    selectedOpinion, // ✨ Added selectedOpinion dependency
+    workflowFilter, // ✨ NEW: Workflow filter dependency
+    selectedOpinion,
     clusters.data.length,
     clusters.loading,
-    loadClusters,
+    loadClusterProgress, // ✨ NEW: Use loadClusterProgress instead of loadClusters
     clusters.limit,
     clusters.error,
     clusters.total,
@@ -2725,10 +2978,11 @@ export function EntityResolutionProvider({
       setIsAutoAdvanceEnabled: setIsAutoAdvanceEnabledState,
       setDisconnectDependentServicesEnabled:
         setDisconnectDependentServicesEnabledState,
-      setWorkflowFilter, // ✨ NEW: Add workflow filter action
+      setWorkflowFilter,
       enableDisconnectDependentServices,
       triggerRefresh,
       loadClusters,
+      loadClusterProgress, // ✨ NEW: Primary cluster loading function
       loadBulkNodeDetails,
       loadSingleConnectionData,
       invalidateVisualizationData,
@@ -2766,10 +3020,11 @@ export function EntityResolutionProvider({
       handleSetSelectedClusterId,
       setSelectedEdgeIdAction,
       setDisconnectDependentServicesEnabledState,
-      setWorkflowFilter, // ✨ NEW: Add workflow filter dependency
+      setWorkflowFilter,
       enableDisconnectDependentServices,
       triggerRefresh,
       loadClusters,
+      loadClusterProgress, // ✨ NEW: Add loadClusterProgress dependency
       loadBulkNodeDetails,
       loadSingleConnectionData,
       invalidateVisualizationData,
@@ -2807,7 +3062,7 @@ export function EntityResolutionProvider({
     isReviewToolsMaximized,
     clusterFilterStatus,
     disconnectDependentServicesEnabled,
-    workflowFilter, // ✨ NEW: Add workflow filter state
+    workflowFilter,
     clusters,
     visualizationData,
     connectionData,
@@ -2816,6 +3071,7 @@ export function EntityResolutionProvider({
     largeClusterConnectionsPage,
     isLoadingConnectionPageData,
     clusterProgress,
+    overallProgress,
     edgeSelectionInfo,
     currentVisualizationData: currentVisualizationDataForSelection,
     currentConnectionData,

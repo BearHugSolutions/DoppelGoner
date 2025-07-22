@@ -1,4 +1,5 @@
-// utils/api-client.ts - COMPREHENSIVE UPDATE with Opinion Support
+// utils/api-client.ts - ADD Cluster Progress Function
+
 import type {
   EntityConnectionDataResponse,
   EntityVisualizationDataResponse,
@@ -15,6 +16,8 @@ import type {
   PaginatedClustersResponse,
   EntityCluster,
   ClusterFilterStatus,
+  WorkflowFilter, // ✨ ADD: Import WorkflowFilter
+  ClusterProgressResponse, // ✨ ADD: Import ClusterProgressResponse
   OpinionPreferences,
   GetOpinionPreferencesResponse,
   UpdateOpinionPreferencesRequest,
@@ -23,9 +26,7 @@ import type {
 
 const API_BASE_URL = "/api";
 
-/**
- * ✨ NEW: Helper function to create headers with opinion support
- */
+// Helper function to create headers with opinion support
 function getApiHeaders(opinionName?: string): HeadersInit {
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
@@ -38,12 +39,7 @@ function getApiHeaders(opinionName?: string): HeadersInit {
   return headers;
 }
 
-/**
- * Handles API errors by logging them and throwing a new error.
- * @param error - The error object.
- * @param context - Optional context for the error message.
- * @throws Error with a descriptive message.
- */
+// Handles API errors by logging them and throwing a new error
 function handleApiError(error: unknown, context?: string): never {
   const contextMsg = context ? ` (${context})` : "";
   let errorMessage = "An unknown error occurred";
@@ -52,18 +48,11 @@ function handleApiError(error: unknown, context?: string): never {
   } else if (typeof error === "string") {
     errorMessage = error;
   }
-  // Centralized logging for all API errors
   console.error(`[API_CLIENT] API Error${contextMsg}:`, errorMessage, error);
   throw new Error(errorMessage);
 }
 
-/**
- * Validates the HTTP response and parses it as JSON.
- * @param response - The fetch Response object.
- * @param context - Optional context for error messages.
- * @returns Promise resolving to the parsed JSON data.
- * @throws Error if the response is not ok.
- */
+// Validates the HTTP response and parses it as JSON
 async function validateResponse<T>(
   response: Response,
   context?: string
@@ -98,22 +87,51 @@ async function validateResponse<T>(
   return responseData as T;
 }
 
-// --- Entity Specific Functions ---
+// ✨ NEW: Cluster Progress API Function
+export async function getClusterProgress(
+  page: number = 1,
+  limit: number = 10,
+  reviewStatus: ClusterFilterStatus = "unreviewed",
+  workflowFilter: WorkflowFilter = "all",
+  type: "entity" | "service" = "entity",
+  opinionName?: string
+): Promise<ClusterProgressResponse> {
+  const context = `getClusterProgress (page: ${page}, limit: ${limit}, reviewStatus: ${reviewStatus}, workflowFilter: ${workflowFilter}, type: ${type}, opinion: ${opinionName || 'none'})`;
+  
+  const searchParams = new URLSearchParams({
+    page: page.toString(),
+    limit: limit.toString(),
+    review_status: reviewStatus,
+    workflow_filter: workflowFilter,
+    type: type,
+  });
+  
+  const url = `${API_BASE_URL}/cluster-progress?${searchParams}`;
+  
+  try {
+    const response = await fetch(url, {
+      headers: getApiHeaders(opinionName),
+    });
+    
+    return await validateResponse<ClusterProgressResponse>(response, context);
+  } catch (error) {
+    return handleApiError(error, context);
+  }
+}
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
+// --- Existing Entity Specific Functions ---
+
 export async function getOrganizationClusters(
   page: number = 1,
   limit: number = 10,
   reviewStatus: ClusterFilterStatus = "unreviewed",
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<PaginatedClustersResponse<EntityCluster>> {
   const url = `${API_BASE_URL}/clusters?type=entity&page=${page}&limit=${limit}&review_status=${reviewStatus}`;
   const context = `getEntityClusters (url: ${url}, opinion: ${opinionName || 'none'})`;
   try {
     const response = await fetch(url, {
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
     });
     return await validateResponse<PaginatedClustersResponse<EntityCluster>>(
       response,
@@ -124,18 +142,15 @@ export async function getOrganizationClusters(
   }
 }
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function getOrganizationConnectionData(
   edgeId: string,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<EntityConnectionDataResponse> {
   const context = `getEntityConnectionData for edge ${edgeId}, opinion: ${opinionName || 'none'}`;
   const url = `${API_BASE_URL}/connections/${edgeId}?type=entity`;
   try {
     const response = await fetch(url, {
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
     });
     return await validateResponse<EntityConnectionDataResponse>(
       response,
@@ -146,18 +161,15 @@ export async function getOrganizationConnectionData(
   }
 }
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function getServiceConnectionData(
   edgeId: string,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<EntityConnectionDataResponse> {
   const context = `getServiceConnectionData for edge ${edgeId}, opinion: ${opinionName || 'none'}`;
   const url = `${API_BASE_URL}/connections/${edgeId}?type=service`;
   try {
     const response = await fetch(url, {
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
     });
     return await validateResponse<EntityConnectionDataResponse>(
       response,
@@ -168,18 +180,15 @@ export async function getServiceConnectionData(
   }
 }
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function getEntityVisualizationData(
   clusterId: string,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<EntityVisualizationDataResponse> {
   const context = `getEntityVisualizationData for cluster ${clusterId}, opinion: ${opinionName || 'none'}`;
   const url = `${API_BASE_URL}/visualization/${clusterId}?type=entity`;
   try {
     const response = await fetch(url, {
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
     });
     return await validateResponse<EntityVisualizationDataResponse>(
       response,
@@ -190,18 +199,15 @@ export async function getEntityVisualizationData(
   }
 }
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function getServiceVisualizationData(
   clusterId: string,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<EntityVisualizationDataResponse> {
   const context = `getServiceVisualizationData for cluster ${clusterId}, opinion: ${opinionName || 'none'}`;
   const url = `${API_BASE_URL}/visualization/${clusterId}?type=service`;
   try {
     const response = await fetch(url, {
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
     });
     return await validateResponse<EntityVisualizationDataResponse>(
       response,
@@ -212,20 +218,17 @@ export async function getServiceVisualizationData(
   }
 }
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function postEdgeReview(
   edgeId: string,
   payload: EdgeReviewApiPayload,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<EdgeReviewApiResponse> {
   const context = `postEdgeReview for edge ${edgeId}, opinion: ${opinionName || 'none'}`;
   const url = `${API_BASE_URL}/edge-visualizations/${edgeId}/review`;
   try {
     const response = await fetch(url, {
       method: "POST",
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
     });
     console.log("[API_CLIENT] Response for postEdgeReview:", response);
@@ -235,12 +238,9 @@ export async function postEdgeReview(
   }
 }
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function postDisconnectDependentServices(
   payload: DisconnectDependentServicesRequest,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<DisconnectDependentServicesResponse> {
   const context = `postDisconnectDependentServices, opinion: ${opinionName || 'none'}`;
   const url = `${API_BASE_URL}/disconnect-dependent-service-matches`;
@@ -248,7 +248,7 @@ export async function postDisconnectDependentServices(
     console.log("[API_CLIENT] Requesting bulk disconnect of dependent services:", payload);
     const response = await fetch(url, {
       method: "POST",
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
     });
     return await validateResponse<DisconnectDependentServicesResponse>(response, context);
@@ -259,20 +259,17 @@ export async function postDisconnectDependentServices(
 
 // --- Service Specific Functions ---
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function getServiceClusters(
   page: number = 1,
   limit: number = 10,
   reviewStatus: ClusterFilterStatus = "unreviewed",
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<PaginatedClustersResponse<EntityCluster>> {
   const context = `getServiceClusters (page: ${page}, limit: ${limit}, reviewStatus: ${reviewStatus}, opinion: ${opinionName || 'none'})`;
   const url = `${API_BASE_URL}/clusters?type=service&page=${page}&limit=${limit}&review_status=${reviewStatus}`;
   try {
     const response = await fetch(url, {
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
     });
     return await validateResponse<PaginatedClustersResponse<EntityCluster>>(
       response,
@@ -285,12 +282,9 @@ export async function getServiceClusters(
 
 // --- Generic Node Detail Functions ---
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function getBulkNodeDetails(
   payload: BulkNodeDetailsRequest,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<NodeDetailResponse[]> {
   const context = `getBulkNodeDetails, opinion: ${opinionName || 'none'}`;
   const url = `${API_BASE_URL}/bulk-node-details`;
@@ -298,7 +292,7 @@ export async function getBulkNodeDetails(
     console.log(`[API_CLIENT] Requesting bulk node details:`, payload);
     const response = await fetch(url, {
       method: "POST",
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
     });
     return await validateResponse<NodeDetailResponse[]>(
@@ -312,12 +306,9 @@ export async function getBulkNodeDetails(
 
 // --- Bulk Data Fetching Functions ---
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function getBulkConnections(
   payload: BulkConnectionsRequest,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<BulkConnectionsResponse> {
   const context = `getBulkConnections, opinion: ${opinionName || 'none'}`;
   const url = `${API_BASE_URL}/bulk-connections`;
@@ -325,7 +316,7 @@ export async function getBulkConnections(
     console.log(`[API_CLIENT] Requesting bulk connections:`, payload);
     const response = await fetch(url, {
       method: "POST",
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
     });
     return await validateResponse<BulkConnectionsResponse>(
@@ -337,12 +328,9 @@ export async function getBulkConnections(
   }
 }
 
-/**
- * ✨ UPDATED: Now accepts opinionName parameter
- */
 export async function getBulkVisualizations(
   payload: BulkVisualizationsRequest,
-  opinionName?: string // ✨ NEW PARAMETER
+  opinionName?: string
 ): Promise<BulkVisualizationsResponse> {
   const context = `getBulkVisualizations, opinion: ${opinionName || 'none'}`;
   console.log("[API_CLIENT] Requesting bulk visualizations:", payload);
@@ -350,7 +338,7 @@ export async function getBulkVisualizations(
   try {
     const response = await fetch(url, {
       method: "POST",
-      headers: getApiHeaders(opinionName), // ✨ ADD OPINION HEADER
+      headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
     });
     return await validateResponse<BulkVisualizationsResponse>(
@@ -364,9 +352,6 @@ export async function getBulkVisualizations(
 
 // --- Opinion Preferences Functions ---
 
-/**
- * ✨ NEW: Get opinion preferences for the current user
- */
 export async function getOpinionPreferences(
   opinionName?: string
 ): Promise<GetOpinionPreferencesResponse> {
@@ -385,9 +370,6 @@ export async function getOpinionPreferences(
   }
 }
 
-/**
- * ✨ NEW: Update opinion preferences for the current user
- */
 export async function updateOpinionPreferences(
   payload: UpdateOpinionPreferencesRequest,
   opinionName?: string
