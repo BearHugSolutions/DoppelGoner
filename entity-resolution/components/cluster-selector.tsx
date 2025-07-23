@@ -457,8 +457,8 @@ const PostProcessingFiltersDialog = () => {
   return (
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
-        <Button variant="outline" size="sm" className="w-full my-2">
-          <Filter className="h-4 w-4 mr-2" />
+        <Button variant="outline" size="sm" className="w-full flex py-2">
+          <Filter className="h-4 w-4 mr-0.5" />
           Post Processing Filters
         </Button>
       </DialogTrigger>
@@ -621,28 +621,22 @@ const WorkflowFilterSelector = () => {
           variant={workflowFilter === "all" ? "default" : "outline"}
           onClick={() => actions.setWorkflowFilter("all")}
           size="sm"
-          className="justify-start text-xs h-auto py-2 px-3"
+          className="justify-center text-xs h-auto py-2 px-2"
         >
-          <Layers className="h-3 w-3 mr-2" />
-          <div className="text-left">
-            <div>All Connections</div>
-            <div className="text-xs opacity-70 font-normal">
-              Show all potential matches
-            </div>
+          <Layers className="h-3 w-2 mr-1" />
+          <div className="text-left truncate">
+          All Connections
           </div>
         </Button>
         <Button
           variant={workflowFilter === "cross-source-only" ? "default" : "outline"}
           onClick={() => actions.setWorkflowFilter("cross-source-only")}
           size="sm"
-          className="justify-start text-xs h-auto py-2 px-3"
+          className="justify-center text-xs h-auto py-2 px-2 gap-0"
         >
-          <GitBranch className="h-3 w-3 mr-2" />
-          <div className="text-left">
-            <div>Cross-Source Only</div>
-            <div className="text-xs opacity-70 font-normal">
-              Different data sources only
-            </div>
+          <GitBranch className="h-3 w-2 mr-1" />
+          <div className="text-left truncate">
+            Cross-Source
           </div>
         </Button>
       </div>

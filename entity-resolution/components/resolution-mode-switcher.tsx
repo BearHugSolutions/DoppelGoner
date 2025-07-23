@@ -3,7 +3,7 @@
 
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import { Button } from "@/components/ui/button";
-import { Building, User } from "lucide-react";
+import { Building, Users2 } from "lucide-react";
 
 export type ResolutionMode = "entity" | "service";
 
@@ -15,29 +15,33 @@ export default function ResolutionModeSwitcher() {
   };
 
   return (
-    <div className="flex flex-col sm:flex-row gap-2">
-      <Button
-        variant={resolutionMode === "entity" ? "default" : "outline"}
-        onClick={() => handleModeChange("entity")}
-        className="flex items-center justify-center flex-1"
-        size="sm"
-      >
-        <Building className="h-3 w-3 mr-2" />
-        <span className="text-xs sm:text-sm truncate text-center flex">
-          Organization
-        </span>
-      </Button>
-      <Button
-        variant={resolutionMode === "service" ? "default" : "outline"}
-        onClick={() => handleModeChange("service")}
-        className="flex items-center justify-center flex-1"
-        size="sm"
-      >
-        <User className="h-3 w-3 mr-2" />
-        <span className="text-xs sm:text-sm truncate text-center flex">
-          Service
-        </span>
-      </Button>
+    <div className="flex flex-col sm:flex-row gap-2 w-full">
+      <div className="w-1/2">
+        <Button
+          variant={resolutionMode === "entity" ? "default" : "outline"}
+          onClick={() => handleModeChange("entity")}
+          className="w-full flex items-center justify-center"
+          size="sm"
+        >
+          <Building className="h-3 w-3 mr-0.5 flex-shrink-0" />
+          <span className="text-xs sm:text-sm truncate">
+            Organization
+          </span>
+        </Button>
+      </div>
+      <div className="w-1/2">
+        <Button
+          variant={resolutionMode === "service" ? "default" : "outline"}
+          onClick={() => handleModeChange("service")}
+          className="w-full flex items-center justify-center"
+          size="sm"
+        >
+          <Users2 className="h-3 w-3 mr-0.5 flex-shrink-0" />
+          <span className="text-xs sm:text-sm truncate">
+            Service
+          </span>
+        </Button>
+      </div>
     </div>
   );
 }
