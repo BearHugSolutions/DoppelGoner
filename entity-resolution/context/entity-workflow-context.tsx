@@ -123,7 +123,10 @@ export interface EntityWorkflowContextType {
   ) => Promise<void>;
 
   // Enhanced selection actions
-  handleSetSelectedClusterId: (id: string | null, isManualSelection?: boolean) => Promise<void>;
+  handleSetSelectedClusterId: (
+    id: string | null,
+    isManualSelection?: boolean
+  ) => Promise<void>;
   setSelectedEdgeIdAction: (id: string | null) => void;
 
   // Progress queries
@@ -253,22 +256,6 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       const clusterDetails = clusters.data.find(
         (c) => c.id === clusterIdToQuery
       );
-
-      // 💡 FIX: Prioritize the definitive 'wasReviewed' flag from the cluster list.
-      // This is the source of truth for whether a cluster is fully finalized.
-      if (clusterDetails?.wasReviewed) {
-        const total = clusterDetails.groupCount ?? 0;
-        return {
-          totalEdges: total,
-          reviewedEdges: total,
-          pendingEdges: 0,
-          confirmedMatches: 0, // Note: We might not have detailed counts here, but completion is key.
-          confirmedNonMatches: 0,
-          progressPercentage: 100,
-          isComplete: true,
-        };
-      }
-
       const vizState = visualizationData[clusterIdToQuery];
       const currentVizData = vizState?.data;
 
@@ -288,34 +275,53 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         const progressPercentage =
           totalEdges > 0 ? Math.round((reviewedEdges / totalEdges) * 100) : 100;
 
+        const confirmedMatches = relevantLinks.filter(
+          (l) => l.status === "CONFIRMED_MATCH"
+        ).length;
+        const confirmedNonMatches = relevantLinks.filter(
+          (l) => l.status === "CONFIRMED_NON_MATCH"
+        ).length;
+
         return {
           totalEdges,
           reviewedEdges,
           pendingEdges: pendingReviewLinks.length,
-          confirmedMatches: relevantLinks.filter(
-            (l) => l.status === "CONFIRMED_MATCH"
-          ).length,
-          confirmedNonMatches: relevantLinks.filter(
-            (l) => l.status === "CONFIRMED_NON_MATCH"
-          ).length,
+          confirmedMatches,
+          confirmedNonMatches,
           progressPercentage,
           isComplete: pendingReviewLinks.length === 0,
         };
       }
 
-      // Fallback logic for when visualization data isn't loaded
+      // Fallback logic when visualization data isn't loaded
+      // Note: For finalized clusters without viz data, we can't show accurate progress
       if (clusterDetails) {
         if (typeof clusterDetails.groupCount === "number") {
           const total = clusterDetails.groupCount;
-          return {
-            totalEdges: total,
-            reviewedEdges: 0,
-            pendingEdges: total,
-            confirmedMatches: 0,
-            confirmedNonMatches: 0,
-            progressPercentage: 0,
-            isComplete: total === 0,
-          };
+
+          // If cluster is marked as reviewed but we don't have viz data,
+          // assume it's complete but acknowledge we don't have detailed counts
+          if (clusterDetails.wasReviewed) {
+            return {
+              totalEdges: total,
+              reviewedEdges: total,
+              pendingEdges: 0,
+              confirmedMatches: 0, // Unknown without viz data
+              confirmedNonMatches: 0, // Unknown without viz data
+              progressPercentage: 100,
+              isComplete: true,
+            };
+          } else {
+            return {
+              totalEdges: total,
+              reviewedEdges: 0,
+              pendingEdges: total,
+              confirmedMatches: 0,
+              confirmedNonMatches: 0,
+              progressPercentage: 0,
+              isComplete: total === 0,
+            };
+          }
         }
       }
 
@@ -736,15 +742,15 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   const handleSetSelectedClusterId = useCallback(
     async (id: string | null, isManualSelection: boolean = true) => {
       if (id === selectedClusterId) return;
-  
+
       // 🔧 NEW: Track manual cluster selections
       if (isManualSelection && id) {
         setManualClusterSelection({ clusterId: id, timestamp: Date.now() });
         console.log(`📍 [EntityWorkflow] Manual cluster selection: ${id}`);
       }
-  
+
       stateActions.setSelectedClusterId(id);
-  
+
       if (id && selectedOpinion) {
         const clusterDetail = getClusterById(id);
         const connectionCount = clusterDetail
@@ -754,7 +760,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           connectionCount !== undefined &&
           connectionCount !== null &&
           connectionCount > LARGE_CLUSTER_THRESHOLD;
-  
+
         if (
           clusterDetail?.wasReviewed ||
           (!isLarge && getClusterProgress(id).isComplete)
@@ -765,7 +771,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
             stateActions.setIsAutoAdvanceEnabled(true);
           }
         }
-  
+
         if (!isLarge) {
           const vizState = visualizationData[id];
           if ((!vizState?.data || vizState?.error) && !vizState?.loading) {
@@ -783,7 +789,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
                 return needsLoad;
               })
               .map((link) => ({ edgeId: link.id, itemType: resolutionMode }));
-  
+
             if (unloadedConnectionItems.length > 0) {
               console.log(
                 `🔄 [EntityWorkflow] Loading ${unloadedConnectionItems.length} missing connections for cluster ${id}`
@@ -1177,14 +1183,16 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       }
       if (!selectedClusterId) {
         toast({
-          title: "Selection Error", 
+          title: "Selection Error",
           description: "Cluster must be selected.",
           variant: "destructive",
         });
         return;
       }
 
-      console.log(`🚀 [EntityWorkflow] Submitting edge review: ${edgeId} -> ${decision}`);
+      console.log(
+        `🚀 [EntityWorkflow] Submitting edge review: ${edgeId} -> ${decision}`
+      );
 
       // Set submission status
       setEdgeSubmissionStatus((prev) => ({
@@ -1195,7 +1203,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       // 🔧 PHASE 1: Apply enhanced optimistic update with progress calculation
       const newStatus: BaseLink["status"] =
         decision === "ACCEPTED" ? "CONFIRMED_MATCH" : "CONFIRMED_NON_MATCH";
-      
+
       const revertOptimisticUpdate = updateEdgeStatusOptimistically(
         selectedClusterId,
         edgeId,
@@ -1214,7 +1222,9 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
         const response = await postEdgeReview(edgeId, payload, selectedOpinion);
 
-        console.log(`✅ [EntityWorkflow] Edge review submitted successfully: ${edgeId}`);
+        console.log(
+          `✅ [EntityWorkflow] Edge review submitted successfully: ${edgeId}`
+        );
 
         // Clear submission status on success
         setEdgeSubmissionStatus((prev) => ({
@@ -1237,11 +1247,15 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
         // 🔧 PHASE 1: Handle cluster finalization with optimistic update
         if (response.clusterFinalized && selectedClusterId) {
-          console.log(`🎉 [EntityWorkflow] Cluster ${selectedClusterId} finalized`);
+          console.log(
+            `🎉 [EntityWorkflow] Cluster ${selectedClusterId} finalized`
+          );
           updateClusterCompletionOptimistically(selectedClusterId, true);
 
           if (isAutoAdvanceEnabled) {
-            console.log(`🚀 [EntityWorkflow] Auto-advancing to next cluster after finalization`);
+            console.log(
+              `🚀 [EntityWorkflow] Auto-advancing to next cluster after finalization`
+            );
             setTimeout(() => {
               advanceToNextCluster();
             }, 100);
@@ -1815,31 +1829,48 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   ]);
 
   useEffect(() => {
-    if (selectedClusterId && currentVisualizationData?.links && !selectedEdgeId) {
-      console.log(`🔄 [EntityWorkflow] Cluster ${selectedClusterId} selected, viz data loaded, no edge selected.`);
-      
+    if (
+      selectedClusterId &&
+      currentVisualizationData?.links &&
+      !selectedEdgeId
+    ) {
+      console.log(
+        `🔄 [EntityWorkflow] Cluster ${selectedClusterId} selected, viz data loaded, no edge selected.`
+      );
+
       const justLoadedNewPageForLargeCluster =
         selectedClusterId === activelyPagingClusterId &&
         largeClusterConnectionsPage > 0 &&
         !lastReviewedEdgeId;
-  
-      const isRecentManualSelection = manualClusterSelection.clusterId === selectedClusterId && 
-        (Date.now() - manualClusterSelection.timestamp) < 5000;
-  
+
+      const isRecentManualSelection =
+        manualClusterSelection.clusterId === selectedClusterId &&
+        Date.now() - manualClusterSelection.timestamp < 5000;
+
       // 🔧 ENHANCED: More intelligent auto-advance logic
-      if (isAutoAdvanceEnabled || !lastReviewedEdgeId || justLoadedNewPageForLargeCluster) {
+      if (
+        isAutoAdvanceEnabled ||
+        !lastReviewedEdgeId ||
+        justLoadedNewPageForLargeCluster
+      ) {
         // Check if there are any unreviewed edges in the current filter view
-        const hasUnreviewedInCurrentView = currentVisualizationData.links.some(link => !isEdgeReviewed(link.id));
-        
+        const hasUnreviewedInCurrentView = currentVisualizationData.links.some(
+          (link) => !isEdgeReviewed(link.id)
+        );
+
         if (hasUnreviewedInCurrentView || isRecentManualSelection) {
           selectNextUnreviewedEdge();
         } else if (!isRecentManualSelection) {
           // No unreviewed edges in current view and not a manual selection - advance
-          console.log(`🚀 [EntityWorkflow] No unreviewed edges in current filter view for cluster ${selectedClusterId}. Auto-advancing.`);
+          console.log(
+            `🚀 [EntityWorkflow] No unreviewed edges in current filter view for cluster ${selectedClusterId}. Auto-advancing.`
+          );
           selectNextUnreviewedEdge();
         } else {
           // Recent manual selection with no unreviewed edges - don't advance
-          console.log(`🚫 [EntityWorkflow] Recent manual selection of cluster ${selectedClusterId} with no unreviewed edges. Not auto-advancing.`);
+          console.log(
+            `🚫 [EntityWorkflow] Recent manual selection of cluster ${selectedClusterId} with no unreviewed edges. Not auto-advancing.`
+          );
         }
       }
     }
