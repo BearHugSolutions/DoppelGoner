@@ -1,7 +1,7 @@
-// components/cluster-selector.tsx - UPDATED with Enhanced Progress Display
+// components/cluster-selector.tsx - ENHANCED: Optimistic Progress Updates
 "use client";
 
-import { useCallback, useState, useEffect, Fragment } from "react";
+import { useCallback, useState, useEffect, Fragment, useRef } from "react";
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -27,6 +27,7 @@ import {
   GitBranch,
   Layers,
   Info,
+  Clock,
 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -53,7 +54,7 @@ import {
 
 const LARGE_CLUSTER_THRESHOLD = 200;
 
-// Enhanced cluster list content component with progress context display
+// Enhanced cluster list content component with optimistic progress display
 const ClusterListContent = ({
   page,
   loading,
@@ -66,7 +67,7 @@ const ClusterListContent = ({
     selectedClusterId,
     clusters,
     clusterProgress,
-    workflowFilter, // ✨ Get workflow filter state
+    workflowFilter,
     actions,
     queries,
     visualizationData,
@@ -77,19 +78,19 @@ const ClusterListContent = ({
   const handleClusterSelection = useCallback(
     async (clusterId: string) => {
       if (selectedClusterId !== clusterId) {
-        actions.setSelectedClusterId(clusterId);
+        // Mark this as a manual selection
+        actions.setSelectedClusterId(clusterId, true);
       } else if (!queries.isVisualizationDataLoaded(clusterId)) {
         const clusterDetail = queries.getClusterById(clusterId);
         const connectionCount = clusterDetail ? clusterDetail.groupCount : 0;
-        const isLarge =
-          connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD;
-
+        const isLarge = connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD;
+  
         if (!isLarge) {
           actions.invalidateVisualizationData(clusterId);
         }
       }
     },
-    [selectedClusterId, actions, queries, resolutionMode]
+    [selectedClusterId, actions, queries]
   );
 
   const getCoherenceColor = (score: number | null) => {
@@ -99,28 +100,41 @@ const ClusterListContent = ({
     return "bg-green-500";
   };
 
-  // ✨ NEW: Enhanced progress rendering with context information
-  const renderClusterProgress = (cluster: EntityCluster) => {
+  const renderClusterProgressWithFilterInfo = (cluster: EntityCluster) => {
     const currentProgress = queries.getClusterProgress(cluster.id);
     const totalProgress = queries.getClusterProgressUnfiltered(cluster.id);
     const crossSourceProgress = queries.getClusterProgressCrossSource(cluster.id);
-    
+  
     const isFiltered = workflowFilter === "cross-source-only";
     const hasServerData = currentProgress.totalEdges !== -1;
-    
+  
     return (
       <div className="mt-1">
         <div className="flex justify-between text-xs mb-0.5 text-muted-foreground">
           <div className="flex items-center gap-1">
             <span>Review Progress</span>
+            {/* 🔧 NEW: Filter indicator */}
+            {isFiltered && crossSourceProgress.totalEdges === 0 && (
+              <Tooltip>
+                <TooltipTrigger>
+                  <Info className="h-3 w-3 text-amber-500" />
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>No cross-source connections in this cluster</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
           </div>
           <span className="font-medium text-card-foreground">
             {hasServerData
               ? `${currentProgress.reviewedEdges} / ${currentProgress.totalEdges}`
               : `${currentProgress.reviewedEdges} / ?`}
+            {isFiltered && crossSourceProgress.totalEdges === 0 && (
+              <span className="ml-1 text-amber-600">(filtered)</span>
+            )}
           </span>
         </div>
-        
+  
         <Progress
           value={
             currentProgress.progressPercentage === -1
@@ -130,24 +144,31 @@ const ClusterListContent = ({
           className={`h-1.5 ${
             currentProgress.progressPercentage === -1
               ? "bg-gray-200 [&>div]:bg-gray-400"
+              : isFiltered && crossSourceProgress.totalEdges === 0
+              ? "bg-amber-100 [&>div]:bg-amber-400" // Different color for filtered out
               : ""
           }`}
         />
-        
-        {/* ✨ NEW: Context information when filter is applied or server data is available */}
+  
+        {/* Rest of existing progress rendering logic */}
         {hasServerData && (
           <div className="mt-1 space-y-0.5">
-            {/* Current view summary */}
             <div className="flex justify-between text-xs text-muted-foreground">
               <span>
                 {isFiltered ? "Cross-source decisions" : "All decisions"}
               </span>
               <span>
-                {currentProgress.confirmedMatches}M / {currentProgress.confirmedNonMatches}NM
+                {currentProgress.confirmedMatches} ✓ /{" "}
+                {currentProgress.confirmedNonMatches} X
               </span>
             </div>
-            
-            {/* Context information when filter is applied */}
+  
+            {isFiltered && crossSourceProgress.totalEdges === 0 && (
+              <div className="text-xs text-amber-600 bg-amber-50 px-2 py-1 rounded">
+                No cross-source connections to review
+              </div>
+            )}
+  
             {isFiltered && totalProgress.totalEdges > currentProgress.totalEdges && (
               <div className="flex justify-between text-xs text-muted-foreground/70">
                 <span>Total (all connections):</span>
@@ -156,13 +177,13 @@ const ClusterListContent = ({
                 </span>
               </div>
             )}
-            
-            {/* Show cross-source availability when filter is not applied */}
+  
             {!isFiltered && crossSourceProgress.totalEdges > 0 && (
               <div className="flex justify-between text-xs text-muted-foreground/70">
                 <span>Cross-source available:</span>
                 <span>
-                  {crossSourceProgress.reviewedEdges} / {crossSourceProgress.totalEdges}
+                  {crossSourceProgress.reviewedEdges} /{" "}
+                  {crossSourceProgress.totalEdges}
                 </span>
               </div>
             )}
@@ -220,12 +241,17 @@ const ClusterListContent = ({
           const entityCount = cluster.entityCount;
           const groupCount = cluster.groupCount;
 
+          // 🔧 NEW: Determine processing state for enhanced styling
+          const isProcessing = progress.isComplete && !cluster.wasReviewed;
+
           return (
             <Card
               key={cluster.id}
               className={`cursor-pointer transition-all hover:shadow-lg border-l-4 ${
                 isSelected
                   ? "ring-2 ring-primary border-primary shadow-md"
+                  : isProcessing
+                  ? "border-blue-300 bg-blue-50" // Processing state styling
                   : "border-transparent hover:border-muted-foreground/30"
               }`}
               onClick={() => handleClusterSelection(cluster.id)}
@@ -306,13 +332,21 @@ const ClusterListContent = ({
                   </div>
                 </div>
 
-                {/* ✨ UPDATED: Enhanced progress display */}
-                {renderClusterProgress(cluster)}
+                {renderClusterProgressWithFilterInfo(cluster)}
 
-                {progress.isComplete && progress.totalEdges !== -1 && (
+                {/* 🔧 ENHANCED: Completion status with processing state */}
+                {cluster.wasReviewed && (
                   <div className="flex items-center mt-1.5 text-green-600 text-xs font-medium">
                     <CheckCircle className="h-3.5 w-3.5 mr-1" />
                     Review Complete
+                  </div>
+                )}
+
+                {/* 🔧 NEW: Processing indicator */}
+                {isProcessing && (
+                  <div className="flex items-center mt-1.5 text-blue-600 text-xs font-medium">
+                    <Clock className="h-3.5 w-3.5 mr-1 animate-pulse" />
+                    Finalizing Review...
                   </div>
                 )}
               </CardContent>
@@ -610,7 +644,7 @@ const PostProcessingFiltersDialog = () => {
   );
 };
 
-// ✨ UPDATED: Workflow Filter Component with enhanced descriptions
+// Workflow Filter Component with enhanced descriptions
 const WorkflowFilterSelector = () => {
   const { workflowFilter, actions } = useEntityResolution();
 
@@ -624,42 +658,82 @@ const WorkflowFilterSelector = () => {
           className="justify-center text-xs h-auto py-2 px-2"
         >
           <Layers className="h-3 w-2 mr-1" />
-          <div className="text-left truncate">
-          All Connections
-          </div>
+          <div className="text-left truncate">All Connections</div>
         </Button>
         <Button
-          variant={workflowFilter === "cross-source-only" ? "default" : "outline"}
+          variant={
+            workflowFilter === "cross-source-only" ? "default" : "outline"
+          }
           onClick={() => actions.setWorkflowFilter("cross-source-only")}
           size="sm"
           className="justify-center text-xs h-auto py-2 px-2 gap-0"
         >
           <GitBranch className="h-3 w-2 mr-1" />
-          <div className="text-left truncate">
-            Cross-Source
-          </div>
+          <div className="text-left truncate">Cross-Source</div>
         </Button>
       </div>
     </div>
   );
 };
 
+// Main ClusterSelector component with stable effects (unchanged from previous fix)
 export default function ClusterSelector() {
-  const { resolutionMode, actions, clusterFilterStatus, clusters } =
+  const { resolutionMode, clusterFilterStatus, clusters } =
     useEntityResolution();
+  const { actions } = useEntityResolution();
 
   const { page, total, limit, loading } = clusters;
   const [pageInput, setPageInput] = useState(page.toString());
   const totalPages = Math.ceil(total / limit);
 
+  const clusterFilterStatusRef = useRef(clusterFilterStatus);
+  clusterFilterStatusRef.current = clusterFilterStatus;
+
+  const actionsRef = useRef(actions);
+  actionsRef.current = actions;
+
+  const loadingRef = useRef<{
+    isInitialLoadDone: boolean;
+    lastFilterParams: string;
+  }>({
+    isInitialLoadDone: false,
+    lastFilterParams: "",
+  });
+
   useEffect(() => {
     setPageInput(page.toString());
   }, [page]);
 
-  // ✨ UPDATED: Effect now uses loadClusterProgress instead of loadClusters
+  // Stable effect that doesn't cause cascading loads
   useEffect(() => {
-    actions.loadClusterProgress(1);
-  }, [clusterFilterStatus, actions.loadClusterProgress]);
+    const currentFilter = clusterFilterStatusRef.current;
+    const filterParams = `${resolutionMode}-${currentFilter}`;
+
+    if (
+      loadingRef.current.isInitialLoadDone &&
+      loadingRef.current.lastFilterParams === filterParams
+    ) {
+      console.log(
+        "🚫 [ClusterSelector] Skipping duplicate load for same filter params:",
+        filterParams
+      );
+      return;
+    }
+
+    console.log(
+      "🔄 [ClusterSelector] Loading clusters for filter change:",
+      filterParams
+    );
+
+    loadingRef.current = {
+      isInitialLoadDone: true,
+      lastFilterParams: filterParams,
+    };
+
+    setTimeout(() => {
+      actionsRef.current.loadClusterProgress(1);
+    }, 50);
+  }, [clusterFilterStatus, resolutionMode]);
 
   const handleValueChange = (value: string) => {
     actions.setClusterFilterStatus(value as ClusterFilterStatus);
@@ -668,10 +742,10 @@ export default function ClusterSelector() {
   const handlePageChange = useCallback(
     (newPage: number) => {
       if (newPage >= 1 && newPage <= totalPages) {
-        actions.loadClusterProgress(newPage, limit); // ✨ UPDATED: Use loadClusterProgress
+        actions.loadClusterProgress(newPage, limit);
       }
     },
-    [actions, totalPages, limit]
+    [actions.loadClusterProgress, totalPages, limit]
   );
 
   const handlePageInputSubmit = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -694,77 +768,79 @@ export default function ClusterSelector() {
   };
 
   return (
-    <div className="space-y-4 h-full flex flex-col bg-card p-3 rounded-lg shadow">
-      <h3 className="text-lg font-semibold text-card-foreground border-b pb-2">
-        {resolutionMode === "entity" ? "Entity Clusters" : "Service Clusters"}
-      </h3>
-      <WorkflowFilterSelector />
-      <ResolutionModeSwitcher />
-      <PostProcessingFiltersDialog />
+    <TooltipProvider>
+      <div className="space-y-4 h-full flex flex-col bg-card p-3 rounded-lg shadow">
+        <h3 className="text-lg font-semibold text-card-foreground border-b pb-2">
+          {resolutionMode === "entity" ? "Entity Clusters" : "Service Clusters"}
+        </h3>
+        <WorkflowFilterSelector />
+        <ResolutionModeSwitcher />
+        <PostProcessingFiltersDialog />
 
-      <div className="flex flex-col flex-grow min-h-0">
-        <Tabs
-          value={clusterFilterStatus}
-          onValueChange={handleValueChange}
-          className="flex flex-col flex-grow min-h-0"
-        >
-          <TabsList className="grid w-full grid-cols-2 flex-shrink-0">
-            <TabsTrigger value="unreviewed">Unreviewed</TabsTrigger>
-            <TabsTrigger value="reviewed">Reviewed</TabsTrigger>
-          </TabsList>
-          <TabsContent
-            value="unreviewed"
-            className="flex-grow flex flex-col mt-2 min-h-0"
+        <div className="flex flex-col flex-grow min-h-0">
+          <Tabs
+            value={clusterFilterStatus}
+            onValueChange={handleValueChange}
+            className="flex flex-col flex-grow min-h-0"
           >
-            <ClusterListContent page={page} loading={loading} />
-          </TabsContent>
-          <TabsContent
-            value="reviewed"
-            className="flex-grow flex flex-col mt-2 min-h-0"
-          >
-            <ClusterListContent page={page} loading={loading} />
-          </TabsContent>
-        </Tabs>
-        {totalPages > 1 && (
-          <div className="flex justify-between items-center pt-3 border-t flex-shrink-0 min-h-0">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => handlePageChange(page - 1)}
-              disabled={page === 1 || loading}
-              className="text-xs"
+            <TabsList className="grid w-full grid-cols-2 flex-shrink-0">
+              <TabsTrigger value="unreviewed">Unreviewed</TabsTrigger>
+              <TabsTrigger value="reviewed">Reviewed</TabsTrigger>
+            </TabsList>
+            <TabsContent
+              value="unreviewed"
+              className="flex-grow flex flex-col mt-2 min-h-0"
             >
-              <ChevronLeft className="h-2 w-2 mr-0.5" />
-              Prev
-            </Button>
-            <div className="text-xs text-muted-foreground flex items-center gap-2">
-              Page
-              <Input
-                type="number"
-                value={pageInput}
-                onChange={(e) => setPageInput(e.target.value)}
-                onKeyDown={handlePageInputSubmit}
-                onBlur={handleInputBlur}
-                className="h-8 w-12 text-center"
-                min="1"
-                max={totalPages}
-                disabled={loading}
-              />
-              of {totalPages}
+              <ClusterListContent page={page} loading={loading} />
+            </TabsContent>
+            <TabsContent
+              value="reviewed"
+              className="flex-grow flex flex-col mt-2 min-h-0"
+            >
+              <ClusterListContent page={page} loading={loading} />
+            </TabsContent>
+          </Tabs>
+          {totalPages > 1 && (
+            <div className="flex justify-between items-center pt-3 border-t flex-shrink-0 min-h-0">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => handlePageChange(page - 1)}
+                disabled={page === 1 || loading}
+                className="text-xs"
+              >
+                <ChevronLeft className="h-2 w-2 mr-0.5" />
+                Prev
+              </Button>
+              <div className="text-xs text-muted-foreground flex items-center gap-2">
+                Page
+                <Input
+                  type="number"
+                  value={pageInput}
+                  onChange={(e) => setPageInput(e.target.value)}
+                  onKeyDown={handlePageInputSubmit}
+                  onBlur={handleInputBlur}
+                  className="h-8 w-12 text-center"
+                  min="1"
+                  max={totalPages}
+                  disabled={loading}
+                />
+                of {totalPages}
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => handlePageChange(page + 1)}
+                disabled={page >= totalPages || loading}
+                className="text-xs"
+              >
+                Next
+                <ChevronRight className="h-2 w-2 ml-0.5" />
+              </Button>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => handlePageChange(page + 1)}
-              disabled={page >= totalPages || loading}
-              className="text-xs"
-            >
-              Next
-              <ChevronRight className="h-2 w-2 ml-0.5" />
-            </Button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
-    </div>
+    </TooltipProvider>
   );
 }

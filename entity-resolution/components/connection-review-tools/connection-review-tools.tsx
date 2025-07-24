@@ -1,4 +1,4 @@
-// components/connection-review-tools.tsx
+// components/connection-review-tools.tsx - ENHANCED: Optimistic Continue & Smart Navigation
 "use client";
 
 import { useEffect, useState, useCallback, useMemo } from "react";
@@ -34,6 +34,7 @@ import {
   Link,
   GitBranch,
   Filter as FilterIcon,
+  Clock,
 } from "lucide-react";
 import type {
   VisualizationEntityEdge,
@@ -55,8 +56,9 @@ export default function ConnectionReviewTools() {
     currentVisualizationData,
     selectedClusterDetails,
     isReviewToolsMaximized,
-    disconnectDependentServicesEnabled, // Use the setting
-    workflowFilter, // ✨ NEW: Get workflow filter state
+    disconnectDependentServicesEnabled,
+    workflowFilter,
+    clusters,
     actions,
     queries,
     edgeSelectionInfo,
@@ -66,18 +68,19 @@ export default function ConnectionReviewTools() {
   } = useEntityResolution();
   const { toast } = useToast();
 
-  // ✨ MOVED: All useState hooks to the top
+  // Local state for optimistic UI
   const [isContinuing, setIsContinuing] = useState(false);
   const [isExpanded, setIsExpanded] = useState(true);
   const [isAttributesOpen, setIsAttributesOpen] = useState(false);
+  const [showOptimisticContinue, setShowOptimisticContinue] = useState(false); // 🔧 NEW: Optimistic continue state
 
-  // ✨ MOVED: Extract data early and use in useMemo with proper fallbacks
+  // Extract data early and use in useMemo with proper fallbacks
   const data = currentConnectionData;
   const edgeDetails = data?.edge as VisualizationEntityEdge | undefined;
   const node1 = data?.entity1;
   const node2 = data?.entity2;
 
-  // ✨ MOVED: All useMemo hooks to the top with proper null checks
+  // All useMemo hooks at the top with proper null checks
   const node1Details = useMemo(() => {
     return node1 ? queries.getNodeDetail(node1.id) : null;
   }, [node1, queries]);
@@ -86,7 +89,7 @@ export default function ConnectionReviewTools() {
     return node2 ? queries.getNodeDetail(node2.id) : null;
   }, [node2, queries]);
 
-  // ✨ MOVED: Check if current connection is cross-source (moved to top with null safety)
+  // Check if current connection is cross-source
   const isCrossSourceConnection = useMemo(() => {
     if (!node1 || !node2) return false;
     const sourceSystem1 = node1.sourceSystem;
@@ -94,7 +97,6 @@ export default function ConnectionReviewTools() {
     return sourceSystem1 && sourceSystem2 && sourceSystem1 !== sourceSystem2;
   }, [node1, node2]);
 
-  // ✨ MOVED: All other computations that don't cause early returns
   const { isSubmitting, error: submissionError } = useMemo(() => {
     return selectedEdgeId
       ? queries.getEdgeSubmissionStatus(selectedEdgeId)
@@ -138,7 +140,7 @@ export default function ConnectionReviewTools() {
     );
   }, [selectedClusterId, activelyPagingClusterId, largeClusterConnectionsPage]);
 
-  // ✨ MOVED: Computed values that depend on data
+  // Computed values that depend on data
   const isEdgeReviewed = useMemo(() => {
     return selectedEdgeId ? queries.isEdgeReviewed(selectedEdgeId) : false;
   }, [selectedEdgeId, queries]);
@@ -146,6 +148,12 @@ export default function ConnectionReviewTools() {
   const isClusterFinalized = useMemo(() => {
     return selectedClusterDetails?.wasReviewed || false;
   }, [selectedClusterDetails?.wasReviewed]);
+
+  // 🔧 ENHANCED: Determine if current cluster is complete for current filter
+  const isCurrentClusterCompleteForFilter = useMemo(() => {
+    if (!selectedClusterId) return false;
+    return queries.isClusterCompleteForCurrentFilter(selectedClusterId);
+  }, [selectedClusterId, queries]);
 
   const showReviewButtons = useMemo(() => {
     return !isEdgeReviewed && !isClusterFinalized;
@@ -159,7 +167,12 @@ export default function ConnectionReviewTools() {
     return resolutionMode === 'entity' ? 'Entity' : 'Service';
   }, [resolutionMode]);
 
-  // ✨ MOVED: All useEffect hooks after useMemo hooks
+  // 🔧 NEW: Smart cluster navigation that respects workflow filter
+  const findNextUnreviewedCluster = useCallback(() => {
+    return queries.findNextViableCluster(selectedClusterId || undefined);
+  }, [selectedClusterId, queries]);
+
+  // All useEffect hooks after useMemo hooks
   useEffect(() => {
     if (
       selectedEdgeId &&
@@ -177,7 +190,12 @@ export default function ConnectionReviewTools() {
     isLoadingConnectionPageData,
   ]);
 
-  // ✨ MOVED: All useCallback hooks after useEffect hooks
+  // 🔧 NEW: Reset optimistic continue state when edge changes
+  useEffect(() => {
+    setShowOptimisticContinue(false);
+  }, [selectedEdgeId]);
+
+  // All useCallback hooks after useEffect hooks
   const handleReviewDecision = useCallback(
     async (decision: GroupReviewDecision) => {
       if (!selectedEdgeId || !selectedClusterId) {
@@ -207,17 +225,17 @@ export default function ConnectionReviewTools() {
         return;
       }
 
+      // 🔧 NEW: Show optimistic continue button immediately
+      setShowOptimisticContinue(true);
+
       try {
-        // ACTION UPDATED: Call the new, simplified submitEdgeReview
         await actions.submitEdgeReview(selectedEdgeId, decision);
+        // The optimistic update happens inside submitEdgeReview
+        // Continue button is already shown optimistically
       } catch (error) {
-        // Error is now handled inside the context, which shows a toast.
-        // This catch block is for any unexpected errors bubbling up.
-        toast({
-          title: "Submission Error",
-          description: (error as Error).message,
-          variant: "destructive",
-        });
+        // Error handling is done inside submitEdgeReview
+        // Revert optimistic continue state on error
+        setShowOptimisticContinue(false);
       }
     },
     [
@@ -237,31 +255,63 @@ export default function ConnectionReviewTools() {
     }
   }, [selectedEdgeId, actions]);
 
+  // 🔧 ENHANCED: Smart continue logic with filter awareness
   const handleContinueToNext = useCallback(async () => {
     if (!selectedClusterId) {
       return;
     }
+    
     setIsContinuing(true);
+    setShowOptimisticContinue(false); // Hide the optimistic button
+    
     try {
-      // Check if the current cluster is fully reviewed
-      if (queries.getClusterProgress(selectedClusterId).isComplete) {
-         await actions.advanceToNextCluster();
+      // Check if current cluster is complete for the current filter
+      if (isCurrentClusterCompleteForFilter) {
+        console.log(`🚀 [ConnectionReview] Current cluster ${selectedClusterId} is complete for filter ${workflowFilter}. Finding next cluster.`);
+        
+        const nextCluster = findNextUnreviewedCluster();
+        
+        if (nextCluster === "next_page") {
+          // Load next page
+          const nextPageToLoad = clusters.page + 1;
+          console.log(`📄 [ConnectionReview] Loading next page (${nextPageToLoad}) for unreviewed clusters.`);
+          await actions.loadClusterProgress(nextPageToLoad, clusters.limit);
+        } else if (nextCluster) {
+          // Move to next cluster
+          console.log(`➡️ [ConnectionReview] Advancing to next unreviewed cluster: ${nextCluster.id}`);
+          await actions.setSelectedClusterId(nextCluster.id);
+        } else {
+          // No more clusters
+          toast({
+            title: "Workflow Complete",
+            description: `All clusters have been reviewed for the current filter (${workflowFilter}).`,
+          });
+          console.log("✅ [ConnectionReview] All clusters reviewed for current filter.");
+        }
       } else {
-        // If not, find the next unreviewed edge
+        // Current cluster still has unreviewed edges, find next edge
+        console.log(`🔍 [ConnectionReview] Current cluster ${selectedClusterId} still has unreviewed edges. Finding next edge.`);
         actions.selectNextUnreviewedEdge(selectedEdgeId);
       }
     } catch (error) {
-        console.error("Error in handleContinueToNext:", error);
-        toast({
-            title: "Error",
-            description: "Could not proceed with navigation.",
-            variant: "destructive",
-        });
-    }
-    finally {
+      console.error("❌ [ConnectionReview] Error in handleContinueToNext:", error);
+      toast({
+        title: "Error",
+        description: "Could not proceed with navigation.",
+        variant: "destructive",
+      });
+    } finally {
       setTimeout(() => setIsContinuing(false), 300);
     }
-  }, [selectedClusterId, selectedEdgeId, actions, queries, toast]);
+  }, [
+    selectedClusterId,
+    selectedEdgeId,
+    isCurrentClusterCompleteForFilter,
+    workflowFilter,
+    findNextUnreviewedCluster,
+    actions,
+    toast,
+  ]);
 
   const handleInitializeLargeClusterPaging = useCallback(async () => {
     if (selectedClusterId) {
@@ -283,7 +333,7 @@ export default function ConnectionReviewTools() {
     actions.selectNextUnreviewedInCluster();
   }, [actions]);
 
-  // ✨ NOW: All early returns happen after all hooks are called
+  // All early returns happen after all hooks are called
   if (!selectedClusterId) {
     return (
       <div className="flex justify-center items-center h-full text-muted-foreground p-4 border rounded-md bg-card shadow">
@@ -355,6 +405,9 @@ export default function ConnectionReviewTools() {
 
   console.log("🙏 currentConnectionData", currentConnectionData);
 
+  // 🔧 ENHANCED: Determine if we should show continue button (optimistic or confirmed)
+  const shouldShowContinue = showOptimisticContinue || (!showReviewButtons && !isSubmitting);
+
   return (
     <Collapsible
       open={isExpanded}
@@ -366,7 +419,7 @@ export default function ConnectionReviewTools() {
           <h3 className="text-lg font-medium">{nodeLabel} Connection Review</h3>
           {isSubmitting && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
           
-          {/* ✨ NEW: Cross-source connection indicator */}
+          {/* Cross-source connection indicator */}
           {isCrossSourceConnection && (
             <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200">
               <GitBranch className="h-3 w-3 mr-1" />
@@ -374,7 +427,7 @@ export default function ConnectionReviewTools() {
             </Badge>
           )}
           
-          {/* ✨ NEW: Workflow filter indicator when active */}
+          {/* Workflow filter indicator when active */}
           {workflowFilter === "cross-source-only" && (
             <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
               <FilterIcon className="h-3 w-3 mr-1" />
@@ -412,6 +465,14 @@ export default function ConnectionReviewTools() {
                 <XCircle className="h-3 w-3 mr-1" />
               )}
               Reviewed
+            </Badge>
+          )}
+
+          {/* 🔧 NEW: Optimistic processing indicator */}
+          {showOptimisticContinue && isSubmitting && (
+            <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
+              <Clock className="h-3 w-3 mr-1 animate-pulse" />
+              Processing...
             </Badge>
           )}
 
@@ -469,35 +530,66 @@ export default function ConnectionReviewTools() {
                 </Button>
               </div>
             </div>
-          ) : (
-             <div className="space-y-3 p-1">
-                <Card className={`border-2 ${isClusterFinalized ? "border-purple-200 bg-purple-50" : (edgeStatus === "CONFIRMED_MATCH" ? "border-green-200 bg-green-50" : "border-red-200 bg-red-50")}`}>
+          ) : shouldShowContinue ? (
+            <div className="space-y-3 p-1">
+                <Card className={`border-2 ${
+                  showOptimisticContinue 
+                    ? "border-blue-200 bg-blue-50"  // Optimistic processing state
+                    : isClusterFinalized 
+                      ? "border-purple-200 bg-purple-50" 
+                      : (edgeStatus === "CONFIRMED_MATCH" ? "border-green-200 bg-green-50" : "border-red-200 bg-red-50")
+                }`}>
                     <CardContent className="p-3">
                         <div className="flex items-center gap-3">
-                            {isClusterFinalized ? <CheckCircle className="h-6 w-6 text-purple-600" /> : (edgeStatus === "CONFIRMED_MATCH" ? <CheckCircle className="h-6 w-6 text-green-600" /> : <XCircle className="h-6 w-6 text-red-600" />)}
+                            {showOptimisticContinue ? (
+                              <Clock className="h-6 w-6 text-blue-600 animate-pulse" />
+                            ) : isClusterFinalized ? (
+                              <CheckCircle className="h-6 w-6 text-purple-600" />
+                            ) : (edgeStatus === "CONFIRMED_MATCH" ? (
+                              <CheckCircle className="h-6 w-6 text-green-600" />
+                            ) : (
+                              <XCircle className="h-6 w-6 text-red-600" />
+                            ))}
                             <div>
                                 <h4 className="font-semibold text-sm">
-                                    {isClusterFinalized ? "Cluster Finalized" : "Connection Reviewed"}
+                                    {showOptimisticContinue 
+                                      ? "Review Submitted" 
+                                      : isClusterFinalized 
+                                        ? "Cluster Finalized" 
+                                        : "Connection Reviewed"}
                                 </h4>
                                 <p className="text-xs text-muted-foreground">
-                                    {isClusterFinalized ? "All connections in this cluster have been reviewed." : "You can continue to the next unreviewed item."}
+                                    {showOptimisticContinue 
+                                      ? "Processing in background. You can continue reviewing." 
+                                      : isClusterFinalized 
+                                        ? "All connections in this cluster have been reviewed." 
+                                        : "You can continue to the next unreviewed item."}
                                 </p>
                             </div>
                         </div>
                     </CardContent>
                 </Card>
+                
+                {/* 🔧 ENHANCED: Continue button with smart navigation */}
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={handleContinueToNext}
                   className="w-full"
-                  disabled={isContinuing || isSubmitting}
+                  disabled={isContinuing}
                 >
-                  {isContinuing ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <SkipForward className="h-4 w-4 mr-1" />}
-                  Continue
+                  {isContinuing ? (
+                    <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                  ) : (
+                    <SkipForward className="h-4 w-4 mr-1" />
+                  )}
+                  {isCurrentClusterCompleteForFilter 
+                    ? `Continue to Next Cluster (${workflowFilter})`
+                    : "Continue to Next Connection"
+                  }
                 </Button>
              </div>
-          )}
+          ) : null}
           
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
              <Card>
@@ -543,43 +635,43 @@ export default function ConnectionReviewTools() {
                             {methods.map(
                               (
                                 method: {
-                                  methodType: string; // Changed from method_type
-                                  preRlConfidence: number; // Changed from pre_rl_confidence
-                                  rlConfidence: number; // Changed from rl_confidence
-                                  combinedConfidence: number; // Changed from combined_confidence
+                                  methodType: string;
+                                  preRlConfidence: number;
+                                  rlConfidence: number;
+                                  combinedConfidence: number;
                                 },
                                 index: React.Key
                               ) => (
                                 <div
                                   key={
-                                    method.methodType // Changed from method_type
-                                      ? `${method.methodType}-${index}` // Changed from method_type
+                                    method.methodType
+                                      ? `${method.methodType}-${index}`
                                       : index
                                   }
                                   className="grid grid-cols-[1fr_auto_auto_auto] gap-2 items-center text-xs"
                                 >
                                   <div className="truncate">
-                                    {method.methodType?.replace(/_/g, " ") ?? // Changed from method_type
+                                    {method.methodType?.replace(/_/g, " ") ??
                                       "Unknown Method"}
                                   </div>
                                   <div className="text-right">
                                     <span className="text-xs text-muted-foreground">
                                       Pre-RL:{" "}
                                     </span>
-                                    {method.preRlConfidence?.toFixed(2) ?? // Changed from pre_rl_confidence
+                                    {method.preRlConfidence?.toFixed(2) ??
                                       "N/A"}
                                   </div>
                                   <div className="text-right">
                                     <span className="text-xs text-muted-foreground">
                                       RL:{" "}
                                     </span>
-                                    {method.rlConfidence?.toFixed(2) ?? "N/A"} {/* Changed from rl_confidence */}
+                                    {method.rlConfidence?.toFixed(2) ?? "N/A"}
                                   </div>
                                   <div className="text-right font-medium">
                                     <span className="text-xs text-muted-foreground">
                                       Combined:{" "}
                                     </span>
-                                    {method.combinedConfidence?.toFixed(2) ?? // Changed from combined_confidence
+                                    {method.combinedConfidence?.toFixed(2) ??
                                       "N/A"}
                                   </div>
                                 </div>

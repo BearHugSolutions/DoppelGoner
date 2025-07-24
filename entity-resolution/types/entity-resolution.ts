@@ -11,6 +11,7 @@
 */
 
 import { Node } from "reactflow";
+import type { SimulationNodeDatum } from "d3";
 
 // --- User and Opinion Types ---
 // Represents a single opinion available to a user
@@ -325,7 +326,7 @@ export interface ServiceMatchHumanFeedback extends HumanFeedbackBase {
 }
 
 // --- Visualization and Connection Types ---
-export interface BaseNode {
+export interface BaseNode extends SimulationNodeDatum {
   id: string;
   name: string | null;
   sourceSystem?: string | null;
@@ -336,8 +337,8 @@ export interface BaseNode {
 
 export interface BaseLink {
   id: string;
-  source: string;
-  target: string;
+  source: string | BaseNode;
+  target: string | BaseNode;
   weight: number;
   status?:
     | "PENDING_REVIEW"

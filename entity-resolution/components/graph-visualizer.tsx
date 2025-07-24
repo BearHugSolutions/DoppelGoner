@@ -7,7 +7,6 @@ import type {
   EntityGroup,
   BaseNode,
   BaseLink,
-  EntityVisualizationDataResponse,
 } from "@/types/entity-resolution";
 import * as d3 from "d3";
 import {
