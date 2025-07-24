@@ -9,7 +9,7 @@
 |   - Provides request deduplication
 |   - Controls data invalidation and cleanup
 |   - Consumes EntityStateContext for selection-driven loading
-|   - 🔧 FIXED: Added optimistic update functions for immediate UI feedback
+|   - 🔧 PHASE 1: Enhanced optimistic update functions with progress calculation
 |
 ================================================================================
 */
@@ -28,6 +28,7 @@ import {
   ClusterProgressResponse,
   ResolutionMode,
   BaseLink,
+  WorkflowFilter,
 } from "@/types/entity-resolution";
 import {
   getServiceClusters,
@@ -89,7 +90,7 @@ interface ConnectionState {
 }
 
 // ============================================================================
-// Context Type - ENHANCED with Optimistic Updates
+// Context Type - 🔧 PHASE 1: ENHANCED with Progress Optimistic Updates
 // ============================================================================
 
 export interface EntityDataContextType {
@@ -117,7 +118,7 @@ export interface EntityDataContextType {
   performThreeClusterCleanup: (force?: boolean) => void;
   clearAllData: () => void;
 
-  // 🔧 NEW: Optimistic update functions
+  // 🔧 PHASE 1: Enhanced optimistic update functions with progress
   updateEdgeStatusOptimistically: (
     clusterId: string, 
     edgeId: string, 
@@ -129,6 +130,16 @@ export interface EntityDataContextType {
     clusterId: string, 
     wasReviewed: boolean
   ) => () => void; // Returns a revert function
+
+  // 🔧 PHASE 1: NEW - Progress-specific optimistic updates
+  updateProgressOptimistically: (
+    clusterId: string,
+    edgeId: string,
+    oldWasReviewed: boolean,
+    newWasReviewed: boolean,
+    newStatus: BaseLink["status"],
+    filterType: WorkflowFilter
+  ) => () => void;
 
   // Data queries
   isVisualizationDataLoaded: (clusterId: string) => boolean;
@@ -176,7 +187,7 @@ function uniqueBy<T>(items: T[], keySelector: (item: T) => string): T[] {
 }
 
 // ============================================================================
-// Provider Component - ENHANCED with Optimistic Updates
+// Provider Component - 🔧 PHASE 1: ENHANCED with Progress Optimistic Updates
 // ============================================================================
 
 export function EntityDataProvider({ children }: { children: ReactNode }) {
@@ -241,7 +252,115 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
   });
 
   // ========================================================================
-  // 🔧 NEW: Optimistic Update Functions
+  // 🔧 PHASE 1: Helper Functions for Progress Updates
+  // ========================================================================
+
+  // Helper function to determine if an edge is cross-source
+  const isCrossSourceEdge = useCallback((clusterId: string, edgeId: string): boolean => {
+    const vizState = visualizationData[clusterId];
+    if (!vizState?.data?.links || !vizState?.data?.nodes) return false;
+    
+    const edge = vizState.data.links.find(l => l.id === edgeId);
+    if (!edge) return false;
+    
+    const sourceNodeId = typeof edge.source === 'string' ? edge.source : edge.source.id;
+    const targetNodeId = typeof edge.target === 'string' ? edge.target : edge.target.id;
+    
+    const sourceNode = vizState.data.nodes.find(n => n.id === sourceNodeId);
+    const targetNode = vizState.data.nodes.find(n => n.id === targetNodeId);
+    
+    if (!sourceNode || !targetNode) return false;
+    
+    return !!(
+      sourceNode.sourceSystem && 
+      targetNode.sourceSystem && 
+      sourceNode.sourceSystem !== targetNode.sourceSystem
+    );
+  }, [visualizationData]);
+
+  // ========================================================================
+  // 🔧 PHASE 1: NEW Optimistic Progress Update Function
+  // ========================================================================
+
+  const updateProgressOptimistically = useCallback(
+    (
+      clusterId: string,
+      edgeId: string,
+      oldWasReviewed: boolean,
+      newWasReviewed: boolean,
+      newStatus: BaseLink["status"],
+      filterType: WorkflowFilter
+    ): (() => void) => {
+      console.log(`🚀 [EntityData] Optimistic progress update: Cluster ${clusterId}, Edge ${edgeId} -> ${newStatus}`);
+      
+      // Store original state for revert function
+      const originalServerProgress = serverProgress[clusterId];
+      
+      if (!originalServerProgress) {
+        console.warn(`No server progress data for cluster ${clusterId}`);
+        return () => {}; // No-op revert function
+      }
+      
+      // Update server progress optimistically
+      setServerProgress(prev => {
+        return produce(prev, draft => {
+          const clusterProg = draft[clusterId];
+          if (!clusterProg) return;
+          
+          // Determine which views to update based on edge characteristics
+          const shouldUpdateCrossSource = isCrossSourceEdge(clusterId, edgeId);
+          
+          // Update all relevant progress views
+          const viewsToUpdate = [
+            { key: 'allEdges', shouldUpdate: true },
+            { key: 'crossSourceEdges', shouldUpdate: shouldUpdateCrossSource },
+            { key: 'currentView', shouldUpdate: filterType === 'all' || (filterType === 'cross-source-only' && shouldUpdateCrossSource) }
+          ];
+          
+          viewsToUpdate.forEach(({ key, shouldUpdate }) => {
+            if (!shouldUpdate) return;
+            
+            const view = clusterProg[key as keyof ClusterProgress];
+            
+            // Only update if edge was previously unreviewed and is now reviewed
+            if (!oldWasReviewed && newWasReviewed && view.pendingEdges > 0) {
+              view.pendingEdges -= 1;
+              view.reviewedEdges += 1;
+              view.progressPercentage = view.totalEdges > 0 
+                ? Math.round((view.reviewedEdges / view.totalEdges) * 100) 
+                : 100;
+              view.isComplete = view.pendingEdges === 0;
+              
+              // Update decision counts
+              if (newStatus === 'CONFIRMED_MATCH') {
+                view.confirmedMatches += 1;
+              } else if (newStatus === 'CONFIRMED_NON_MATCH') {
+                view.confirmedNonMatches += 1;
+              }
+              
+              console.log(`✅ [EntityData] Updated ${key} progress for cluster ${clusterId}: ${view.reviewedEdges}/${view.totalEdges} (${view.progressPercentage}%)`);
+            }
+          });
+        });
+      });
+      
+      // Return revert function
+      return () => {
+        console.log(`↩️ [EntityData] Reverting optimistic progress update for cluster ${clusterId}`);
+        
+        if (originalServerProgress) {
+          setServerProgress(prev => ({
+            ...prev,
+            [clusterId]: originalServerProgress
+          }));
+        }
+      };
+    },
+    [serverProgress, isCrossSourceEdge]
+  );
+
+  // ========================================================================
+  // 🔧 PHASE 1: Enhanced Optimistic Update Functions
   // ========================================================================
 
   const updateEdgeStatusOptimistically = useCallback(
@@ -251,13 +370,17 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       newStatus: BaseLink["status"],
       wasReviewed: boolean = true
     ): (() => void) => {
-      console.log(`🚀 [EntityData] Optimistic update: Edge ${edgeId} in cluster ${clusterId} -> ${newStatus}`);
+      console.log(`🚀 [EntityData] Optimistic edge update: Edge ${edgeId} in cluster ${clusterId} -> ${newStatus}`);
       
-      // Store original state for revert function
+      // Store original states for revert functions
       const originalVizState = visualizationData[clusterId];
       const originalConnectionState = connectionData[edgeId];
       
-      // Update visualization data
+      // Get current edge state to determine if this is a new review
+      const currentEdge = originalVizState?.data?.links?.find(l => l.id === edgeId);
+      const oldWasReviewed = currentEdge?.wasReviewed ?? false;
+      
+      // 1. Update visualization data (existing logic)
       setVisualizationData(prev => {
         if (!prev[clusterId]?.data) return prev;
         
@@ -274,14 +397,13 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         });
       });
       
-      // Update connection data if it exists
+      // 2. Update connection data if it exists (existing logic)
       setConnectionData(prev => {
         if (!prev[edgeId]?.data) return prev;
         
         return produce(prev, draft => {
           const connState = draft[edgeId];
           if (connState?.data?.edge) {
-            // FIX: Handle undefined newStatus by coalescing to null
             connState.data.edge.status = newStatus ?? null;
             connState.data.edge.wasReviewed = wasReviewed;
             console.log(`✅ [EntityData] Optimistically updated connection ${edgeId} status to ${newStatus}`);
@@ -289,10 +411,21 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         });
       });
       
-      // Return revert function
+      // 3. 🔧 PHASE 1: NEW - Update progress optimistically
+      const revertProgress = updateProgressOptimistically(
+        clusterId,
+        edgeId,
+        oldWasReviewed,
+        wasReviewed,
+        newStatus,
+        workflowFilterRef.current
+      );
+      
+      // Return combined revert function
       return () => {
         console.log(`↩️ [EntityData] Reverting optimistic update for edge ${edgeId}`);
         
+        // Revert visualization data
         if (originalVizState) {
           setVisualizationData(prev => ({
             ...prev,
@@ -300,15 +433,19 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           }));
         }
         
+        // Revert connection data
         if (originalConnectionState) {
           setConnectionData(prev => ({
             ...prev,
             [edgeId]: originalConnectionState
           }));
         }
+        
+        // Revert progress data
+        revertProgress();
       };
     },
-    [visualizationData, connectionData]
+    [visualizationData, connectionData, updateProgressOptimistically]
   );
 
   const updateClusterCompletionOptimistically = useCallback(
@@ -1052,7 +1189,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
   }, [refreshTrigger]);
 
   // ========================================================================
-  // Context Value (ENHANCED with optimistic update functions)
+  // Context Value (🔧 ENHANCED with progress optimistic update functions)
   // ========================================================================
 
   const contextValue: EntityDataContextType = {
@@ -1078,9 +1215,10 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     performThreeClusterCleanup,
     clearAllData,
 
-    // 🔧 NEW: Optimistic update functions
+    // 🔧 PHASE 1: Enhanced optimistic update functions with progress
     updateEdgeStatusOptimistically,
     updateClusterCompletionOptimistically,
+    updateProgressOptimistically,
 
     // Data queries
     isVisualizationDataLoaded: useCallback((clusterId: string) => 
@@ -1143,7 +1281,7 @@ export function useEntityData(): EntityDataContextType {
 
 
 // ============================================================================
-// Utility Hooks (unchanged)
+// Utility Hooks (🔧 UPDATED with progress optimistics)
 // ============================================================================
 
 /**

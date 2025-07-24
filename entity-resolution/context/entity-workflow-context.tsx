@@ -10,7 +10,7 @@
 |   - Manages review submission and business rules
 |   - Provides computed/derived state
 |   - Consumes EntityStateContext and EntityDataContext
-|   - 🔧 FIXED: Restored optimistic updates for immediate UI feedback
+|   - 🔧 PHASE 1: Enhanced optimistic updates with progress calculation
 |   - 🔧 BUG FIX: Corrected optimistic progression when workflow filters are active.
 |
 ================================================================================
@@ -192,8 +192,8 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     loadBulkNodeDetails,
     getClusterById,
     isVisualizationDataLoaded,
-    updateEdgeStatusOptimistically, // 🔧 NEW: Get optimistic update function
-    updateClusterCompletionOptimistically, // 🔧 NEW: Get optimistic update function
+    updateEdgeStatusOptimistically, // 🔧 PHASE 1: Enhanced with progress updates
+    updateClusterCompletionOptimistically, // 🔧 PHASE 1: Enhanced with progress updates
   } = data;
 
   // ========================================================================
@@ -848,7 +848,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   );
 
   // ========================================================================
-  // Business Action Functions - 🔧 FIXED: Restored Optimistic Updates
+  // Business Action Functions - 🔧 PHASE 1: Enhanced Optimistic Updates
   // ========================================================================
 
   const enableDisconnectDependentServices = useCallback(async () => {
@@ -1164,6 +1164,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     ]
   );
 
+  // 🔧 PHASE 1: Enhanced submitEdgeReview with optimistic progress updates
   const submitEdgeReview = useCallback(
     async (edgeId: string, decision: GroupReviewDecision, notes?: string) => {
       if (!user?.id || !selectedOpinion) {
@@ -1176,16 +1177,14 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       }
       if (!selectedClusterId) {
         toast({
-          title: "Selection Error",
+          title: "Selection Error", 
           description: "Cluster must be selected.",
           variant: "destructive",
         });
         return;
       }
 
-      console.log(
-        `🚀 [EntityWorkflow] Submitting edge review: ${edgeId} -> ${decision}`
-      );
+      console.log(`🚀 [EntityWorkflow] Submitting edge review: ${edgeId} -> ${decision}`);
 
       // Set submission status
       setEdgeSubmissionStatus((prev) => ({
@@ -1193,9 +1192,10 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         [edgeId]: { isSubmitting: true, error: null },
       }));
 
-      // 🔧 FIXED: Apply optimistic update immediately for instant UI feedback
+      // 🔧 PHASE 1: Apply enhanced optimistic update with progress calculation
       const newStatus: BaseLink["status"] =
         decision === "ACCEPTED" ? "CONFIRMED_MATCH" : "CONFIRMED_NON_MATCH";
+      
       const revertOptimisticUpdate = updateEdgeStatusOptimistically(
         selectedClusterId,
         edgeId,
@@ -1214,9 +1214,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
         const response = await postEdgeReview(edgeId, payload, selectedOpinion);
 
-        console.log(
-          `✅ [EntityWorkflow] Edge review submitted successfully: ${edgeId}`
-        );
+        console.log(`✅ [EntityWorkflow] Edge review submitted successfully: ${edgeId}`);
 
         // Clear submission status on success
         setEdgeSubmissionStatus((prev) => ({
@@ -1237,34 +1235,22 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           });
         }
 
-        // 🔧 FIXED: Handle cluster finalization with optimistic update AND auto-advance
+        // 🔧 PHASE 1: Handle cluster finalization with optimistic update
         if (response.clusterFinalized && selectedClusterId) {
-          console.log(
-            `🎉 [EntityWorkflow] Cluster ${selectedClusterId} finalized`
-          );
+          console.log(`🎉 [EntityWorkflow] Cluster ${selectedClusterId} finalized`);
           updateClusterCompletionOptimistically(selectedClusterId, true);
 
-          // 🔧 NEW: Auto-advance to next cluster after finalization
           if (isAutoAdvanceEnabled) {
-            console.log(
-              `🚀 [EntityWorkflow] Cluster finalized and auto-advance enabled. Advancing to next cluster.`
-            );
+            console.log(`🚀 [EntityWorkflow] Auto-advancing to next cluster after finalization`);
             setTimeout(() => {
               advanceToNextCluster();
-            }, 100); // Small delay to allow optimistic updates to take effect
-          } else {
-            console.log(
-              `🚀 [EntityWorkflow] Cluster finalized but auto-advance disabled. Not advancing.`
-            );
+            }, 100);
           }
         } else {
-          // 🔧 NEW: If cluster not finalized, find next unreviewed edge
-          console.log(
-            `🔍 [EntityWorkflow] Cluster not finalized. Looking for next unreviewed edge.`
-          );
+          console.log(`🔍 [EntityWorkflow] Looking for next unreviewed edge`);
           setTimeout(() => {
             selectNextUnreviewedEdge(edgeId);
-          }, 100); // Small delay to allow optimistic updates to take effect
+          }, 100);
         }
 
         // Note: We don't revert the optimistic update on success since the server confirmed it
@@ -1276,7 +1262,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           error
         );
 
-        // 🔧 FIXED: Revert optimistic update on error
+        // 🔧 PHASE 1: Revert optimistic update on error (including progress)
         revertOptimisticUpdate();
 
         setEdgeSubmissionStatus((prev) => ({
@@ -1299,7 +1285,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       toast,
       disconnectDependentServicesEnabled,
       stateActions,
-      updateEdgeStatusOptimistically,
+      updateEdgeStatusOptimistically, // 🔧 PHASE 1: Enhanced function
       updateClusterCompletionOptimistically,
       isAutoAdvanceEnabled,
       advanceToNextCluster,

@@ -100,7 +100,6 @@ const ClusterListContent = ({
     return "bg-green-500";
   };
 
-  // Progress rendering with optimistic updates and processing states
   const renderClusterProgressWithFilterInfo = (cluster: EntityCluster) => {
     const currentProgress = queries.getClusterProgress(cluster.id);
     const totalProgress = queries.getClusterProgressUnfiltered(cluster.id);
