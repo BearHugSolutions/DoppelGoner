@@ -157,16 +157,6 @@ export const OverallProgressBar = () => {
             {overallProgress.overallProgressPercentage}% complete
           </span>
         </div>
-        
-        {/* ✨ NEW: Additional context for filtered views */}
-        {isFiltered && (
-          <div className="mt-1 pt-1 border-t border-gray-200">
-            <div className="text-xs text-blue-700 bg-blue-50 px-2 py-1 rounded">
-              <strong>Filter Active:</strong> Progress shown is for cross-source connections only. 
-              Switch to "All Connections" to see complete workflow progress.
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
