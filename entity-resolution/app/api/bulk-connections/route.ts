@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client';
 import { requireTeamContext } from '@/utils/team-context';
-import type { BulkConnectionsRequest, BulkConnectionsResponse } from "@/types/entity-resolution";
+import type { BulkConnectionsRequest, PaginatedBulkConnectionsResponse } from "@/types/entity-resolution";
 
 export async function POST(request: NextRequest) {
   const response = NextResponse.next();
@@ -10,7 +10,6 @@ export async function POST(request: NextRequest) {
   if (authResult instanceof NextResponse) return authResult;
   const { teamContext, user } = authResult;
 
-  // ✨ Extract the opinion name from the request header
   const opinionName = request.headers.get('X-Opinion-Name');
   
   console.log("Bulk Connections API: Request with opinion header:", opinionName);
@@ -37,10 +36,23 @@ export async function POST(request: NextRequest) {
     }
   }
 
+  // NEW: Validate pagination parameters
+  if (payload.limit !== undefined && (typeof payload.limit !== 'number' || !Number.isInteger(payload.limit) || payload.limit <= 0)) {
+    return NextResponse.json({ error: "If provided, 'limit' must be a positive integer." }, { status: 400 });
+  }
+  if (payload.cursor !== undefined && typeof payload.cursor !== 'string') {
+    return NextResponse.json({ error: "If provided, 'cursor' must be a string." }, { status: 400 });
+  }
+  if (payload.crossSystemOnly !== undefined && typeof payload.crossSystemOnly !== 'boolean') {
+    return NextResponse.json({ error: "If provided, 'crossSystemOnly' must be a boolean." }, { status: 400 });
+  }
+
   console.log(`Fetching bulk connection data for ${payload.items.length} items with opinion:`, opinionName || "default");
+  console.log("Payload:", JSON.stringify(payload, null, 2));
 
   try {
-    const gatewayResponse = await fetchFromGateway<BulkConnectionsResponse>(
+    // ✅ FIX: Use the correct paginated response type
+    const gatewayResponse = await fetchFromGateway<PaginatedBulkConnectionsResponse>(
       `/bulk-connections`,
       {
         method: 'POST',
@@ -49,10 +61,11 @@ export async function POST(request: NextRequest) {
           'Content-Type': 'application/json',
         },
       },
-      teamContext, // Pass team context
-      opinionName // ✨ Pass opinion name to gateway client
+      teamContext,
+      opinionName
     );
     
+    console.log("Gateway response:", gatewayResponse);
     return NextResponse.json(gatewayResponse);
 
   } catch (error: any) {

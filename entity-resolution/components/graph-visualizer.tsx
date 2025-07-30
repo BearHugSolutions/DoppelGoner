@@ -1,4 +1,4 @@
-// components/graph-visualizer.tsx
+// components/graph-visualizer.tsx - ENHANCED: Visual indicators for audit decisions
 "use client";
 
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
@@ -17,6 +17,7 @@ import {
   AlertTriangle,
   GitBranch,
   Info,
+  Bot, // NEW: For audit indicators
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -34,8 +35,10 @@ export default function GraphVisualizer() {
     resolutionMode,
     selectedClusterId,
     selectedEdgeId,
-    currentVisualizationData, // This is EntityVisualizationDataResponse | null
-    workflowFilter, // ✨ NEW: Get workflow filter state
+    currentVisualizationData,
+    workflowFilter,
+    auditMode, // NEW: Access audit mode
+    postProcessingAuditData, // NEW: Access audit decisions
     actions,
     queries,
   } = useEntityResolution();
@@ -52,7 +55,6 @@ export default function GraphVisualizer() {
 
   const [nodes, setNodes] = useState<BaseNode[]>([]);
   const [links, setLinks] = useState<BaseLink[]>([]);
-  // REFACTOR: Simplified state to only handle EntityGroup, as ServiceGroup is deprecated.
   const [displayGroups, setDisplayGroups] = useState<EntityGroup[]>([]);
 
   const [hoverNode, setHoverNode] = useState<string | null>(null);
@@ -77,8 +79,37 @@ export default function GraphVisualizer() {
   > | null>(null);
   const isProgrammaticZoomRef = useRef(false);
 
-  // REFACTOR: Simplified data processing logic.
-  // The backend now returns EntityGroup for both resolution modes, so the conditional logic is removed.
+  // NEW: Get audit decisions for current cluster
+  const auditDecisionsForCluster = useMemo(() => {
+    if (!selectedClusterId || !postProcessingAuditData?.data?.decisions) return [];
+    
+    return postProcessingAuditData.data.decisions.filter(
+      decision => decision.clusterId === selectedClusterId
+    );
+  }, [selectedClusterId, postProcessingAuditData]);
+
+  // NEW: Create a map of edge IDs to their audit decisions for quick lookup
+  const auditDecisionsByEdge = useMemo(() => {
+    const edgeMap = new Map<string, typeof auditDecisionsForCluster>();
+    
+    auditDecisionsForCluster.forEach(decision => {
+      const existing = edgeMap.get(decision.edgeId) || [];
+      edgeMap.set(decision.edgeId, [...existing, decision]);
+    });
+    
+    return edgeMap;
+  }, [auditDecisionsForCluster]);
+
+  // NEW: Helper function to check if an edge has audit decisions
+  const hasAuditDecisions = useCallback((edgeId: string) => {
+    return auditDecisionsByEdge.has(edgeId);
+  }, [auditDecisionsByEdge]);
+
+  // NEW: Helper function to get audit decisions for an edge
+  const getAuditDecisionsForEdge = useCallback((edgeId: string) => {
+    return auditDecisionsByEdge.get(edgeId) || [];
+  }, [auditDecisionsByEdge]);
+
   const processVisualizationData = useCallback(() => {
     const data = currentVisualizationData;
 
@@ -89,15 +120,8 @@ export default function GraphVisualizer() {
       return;
     }
 
-    // BUG FIX: Create deep copies of nodes and links.
-    // D3's force simulation mutates the objects passed to it by adding
-    // properties like 'x', 'y', 'vx', 'vy', and 'index'. If the objects
-    // from the context are immutable (e.g., from Immer), this will throw
-    // a "Cannot assign to read only property" error.
-    // By creating a new array of new, shallow-copied objects, we ensure
-    // that the data used by D3 is mutable.
-    const mutableNodes = (data.nodes || []).map((n) => ({ ...n }));
-    const mutableLinks = (data.links || []).map((l) => ({ ...l }));
+    const mutableNodes = (data.nodes || []).map((n: BaseNode) => ({ ...n }));
+    const mutableLinks = (data.links || []).map((l: BaseLink) => ({ ...l }));
 
     setNodes(mutableNodes);
     setLinks(mutableLinks);
@@ -105,7 +129,6 @@ export default function GraphVisualizer() {
     const allGroups = data.groups || [];
 
     if (Array.isArray(allGroups)) {
-      // Filter for valid EntityGroup objects, regardless of resolutionMode.
       const validGroups = allGroups.filter(
         (g): g is EntityGroup =>
           typeof g === "object" &&
@@ -120,8 +143,6 @@ export default function GraphVisualizer() {
     }
   }, [currentVisualizationData]);
 
-  // REFACTOR: Simplified contact info computation.
-  // Removed conditional logic for ServiceGroup as it's no longer a distinct type.
   const computeAllNodeContactInfo = useCallback(() => {
     if (!currentVisualizationData) return;
 
@@ -145,7 +166,6 @@ export default function GraphVisualizer() {
 
         if (!isNodeInGroup) continue;
 
-        // Determine which set of values to use (_1 or _2) based on the node's position in the group.
         const useSuffix1 = group.entityId1 === node.id;
 
         switch (group.matchValues?.type?.toLowerCase()) {
@@ -360,20 +380,32 @@ export default function GraphVisualizer() {
       .data(filteredLinks)
       .enter()
       .append("line")
-      .attr("stroke-width", (d) =>
-        d.status === "CONFIRMED_MATCH"
+      .attr("stroke-width", (d) => {
+        // NEW: Slightly thicker lines for edges with audit decisions
+        const baseWidth = d.status === "CONFIRMED_MATCH"
           ? 4
           : d.status === "CONFIRMED_NON_MATCH"
           ? 2
-          : 1 + d.weight * 3
-      )
-      .attr("stroke", (d) =>
-        d.status === "CONFIRMED_MATCH"
+          : 1 + d.weight * 3;
+        
+        return hasAuditDecisions(d.id) ? baseWidth + 1 : baseWidth;
+      })
+      .attr("stroke", (d) => {
+        // NEW: Different color scheme for edges with audit decisions
+        if (hasAuditDecisions(d.id)) {
+          return d.status === "CONFIRMED_MATCH"
+            ? "#0ea5e9" // Blue for audited matches
+            : d.status === "CONFIRMED_NON_MATCH"
+            ? "#f97316" // Orange for audited non-matches
+            : "#8b5cf6"; // Purple for audited pending
+        }
+        
+        return d.status === "CONFIRMED_MATCH"
           ? "#16a34a"
           : d.status === "CONFIRMED_NON_MATCH"
           ? "#dc2626"
-          : d3.interpolateRgb("#f87171", "#3b82f6")(d.weight)
-      )
+          : d3.interpolateRgb("#f87171", "#3b82f6")(d.weight);
+      })
       .attr("stroke-opacity", (d) =>
         d.status === "CONFIRMED_NON_MATCH"
           ? 0.4
@@ -381,9 +413,13 @@ export default function GraphVisualizer() {
           ? 0.9
           : 0.7
       )
-      .attr("stroke-dasharray", (d) =>
-        d.status === "CONFIRMED_NON_MATCH" ? "5,5" : "none"
-      )
+      .attr("stroke-dasharray", (d) => {
+        // NEW: Different dash pattern for edges with audit decisions
+        if (hasAuditDecisions(d.id) && d.status === "PENDING_REVIEW") {
+          return "8,4"; // Longer dashes for audited pending edges
+        }
+        return d.status === "CONFIRMED_NON_MATCH" ? "5,5" : "none";
+      })
       .attr("id", (d) => `link-${d.id}`)
       .on("mouseover", (event, d) => {
         setHoverLink(d.id);
@@ -540,6 +576,27 @@ export default function GraphVisualizer() {
       .attr("fill", "#374151")
       .attr("font-weight", "500");
 
+    // NEW: Add bot icons for edges with audit decisions
+    if (auditMode === "post_processing_audit" || auditDecisionsForCluster.length > 0) {
+      const auditEdgeIcons = g
+        .append("g")
+        .selectAll("foreignObject")
+        .data(filteredLinks.filter(l => hasAuditDecisions(l.id)))
+        .enter()
+        .append("foreignObject")
+        .attr("width", 16)
+        .attr("height", 16)
+        .style("pointer-events", "none")
+        .attr("id", (d) => `audit-icon-${d.id}`)
+        .html(() => `
+          <div style="width: 16px; height: 16px; background: #3b82f6; border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <svg width="10" height="10" fill="white" viewBox="0 0 24 24">
+              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+            </svg>
+          </div>
+        `);
+    }
+
     g.append("g")
       .selectAll("foreignObject")
       .data(nodes)
@@ -590,8 +647,8 @@ export default function GraphVisualizer() {
       .data(filteredLinks)
       .enter()
       .append("foreignObject")
-      .attr("width", 270)
-      .attr("height", 280)
+      .attr("width", 320) // Wider for audit info
+      .attr("height", 320) // Taller for audit info
       .style("pointer-events", "none")
       .style("opacity", 0)
       .attr("id", (d) => `link-tooltip-${d.id}`)
@@ -605,7 +662,6 @@ export default function GraphVisualizer() {
             ? d_link.target
             : (d_link.target as BaseNode).id;
 
-        // REFACTOR: Simplified group filtering logic, as all groups are now EntityGroup.
         const linkSpecificGroups = displayGroups.filter(
           (group) =>
             (group.entityId1 === linkSourceId &&
@@ -613,6 +669,9 @@ export default function GraphVisualizer() {
             (group.entityId1 === linkTargetId &&
               group.entityId2 === linkSourceId)
         );
+
+        // NEW: Get audit decisions for this edge
+        const auditDecisions = getAuditDecisionsForEdge(d_link.id);
 
         let statusHtml = "";
         if (d_link.status === "CONFIRMED_MATCH")
@@ -622,11 +681,54 @@ export default function GraphVisualizer() {
         else if (d_link.status === "PENDING_REVIEW")
           statusHtml = `<div style="color: #2563eb; margin-bottom: 8px; font-weight: 500; display: flex; align-items: center; gap: 4px; font-size: 11px;"><div style="width: 8px; height: 8px; background-color: #2563eb; border-radius: 50%;"></div>Pending Review</div>`;
 
+        // NEW: Add audit decisions section
+        let auditHtml = "";
+        if (auditDecisions.length > 0) {
+          const getFilterDisplayName = (filter: string) => {
+            switch (filter) {
+              case "disconnectDependentServices":
+                return "Disconnect Dependent Services";
+              default:
+                return filter;
+            }
+          };
+
+          auditHtml = `
+            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #e5e7eb;">
+              <div style="font-size: 10px; font-weight: 500; color: #3b82f6; margin-bottom: 4px; display: flex; align-items: center; gap: 4px;">
+                <svg width="12" height="12" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                </svg>
+                Automated Decisions (${auditDecisions.length})
+              </div>
+              <div style="max-height: 120px; overflow-y: auto; space-y: 4px;">
+                ${auditDecisions.slice(0, 3).map(decision => `
+                  <div style="background: #f1f5f9; border-radius: 4px; padding: 6px; margin-bottom: 4px;">
+                    <div style="font-size: 10px; font-weight: 500; color: #1e293b; margin-bottom: 2px;">
+                      ${getFilterDisplayName(decision.postProcFilter)}
+                    </div>
+                    <div style="font-size: 9px; color: #64748b;">
+                      ${decision.originalStatus || 'Unknown'} → ${decision.newStatus}
+                    </div>
+                    <div style="font-size: 9px; color: #64748b; margin-top: 2px;">
+                      ${decision.reviewedByHuman ? '✓ Reviewed' : '⏳ Pending Review'}
+                    </div>
+                  </div>
+                `).join('')}
+                ${auditDecisions.length > 3 ? `
+                  <div style="font-size: 9px; color: #64748b; text-align: center; font-style: italic;">
+                    +${auditDecisions.length - 3} more decisions...
+                  </div>
+                ` : ''}
+              </div>
+            </div>
+          `;
+        }
+
         let groupsHtml = "";
         if (linkSpecificGroups.length > 0) {
-          groupsHtml = `<div style="margin-top: 8px;"><div style="font-size: 10px; font-weight: 500; color: #6b7280; margin-bottom: 4px;">Match Methods:</div><div style="max-height: 150px; overflow-y: auto; space-y: 4px; padding-right: 5px;">${linkSpecificGroups
+          groupsHtml = `<div style="margin-top: 8px;"><div style="font-size: 10px; font-weight: 500; color: #6b7280; margin-bottom: 4px;">Match Methods:</div><div style="max-height: 100px; overflow-y: auto; space-y: 4px; padding-right: 5px;">${linkSpecificGroups
             .map((group) => {
-              // REFACTOR: No need to cast to a union type. 'group' is EntityGroup.
               const confidence = group.confidenceScore
                 ? group.confidenceScore.toFixed(3)
                 : "N/A";
@@ -650,13 +752,15 @@ export default function GraphVisualizer() {
             })
             .join("")}</div></div>`;
         }
+        
         const clickToReviewHtml =
           d_link.status === "PENDING_REVIEW"
             ? `<div style="font-size: 10px; color: #2563eb; margin-top: 6px; cursor: pointer;">Click edge to review →</div>`
             : "";
-        return `<div style="background: white; padding: 8px; border-radius: 6px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border: 1px solid #e5e7eb; font-size: 11px; max-width: 270px; height: 100%; overflow: hidden; display: flex; flex-direction: column;"><div style="font-weight: 500; font-size: 12px; margin-bottom: 4px;">Connection Details (${resolutionMode})</div><div style="font-size: 11px; margin-bottom: 8px;">Confidence: ${d_link.weight.toFixed(
+        
+        return `<div style="background: white; padding: 8px; border-radius: 6px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); border: 1px solid #e5e7eb; font-size: 11px; max-width: 320px; height: 100%; overflow: hidden; display: flex; flex-direction: column;"><div style="font-weight: 500; font-size: 12px; margin-bottom: 4px;">Connection Details (${resolutionMode})</div><div style="font-size: 11px; margin-bottom: 8px;">Confidence: ${d_link.weight.toFixed(
           2
-        )}</div>${statusHtml}${groupsHtml}${clickToReviewHtml}</div>`;
+        )}</div>${statusHtml}${auditHtml}${groupsHtml}${clickToReviewHtml}</div>`;
       });
 
     if (simulationRef.current) simulationRef.current.stop();
@@ -692,6 +796,12 @@ export default function GraphVisualizer() {
         labelElements
           .attr("x", (d) => (d as any).x)
           .attr("y", (d) => (d as any).y);
+        
+        // NEW: Position audit icons on edges
+        g.selectAll("foreignObject[id^='audit-icon-']")
+          .attr("x", (d) => ((d as any).source.x + (d as any).target.x) / 2 - 8)
+          .attr("y", (d) => ((d as any).source.y + (d as any).target.y) / 2 - 8);
+        
         g.selectAll("foreignObject[id^='tooltip-']")
           .attr("x", (d) => (d as any).x + 15)
           .attr("y", (d) => (d as any).y - 10);
@@ -702,7 +812,7 @@ export default function GraphVisualizer() {
           )
           .attr(
             "y",
-            (d) => ((d as any).source.y + (d as any).target.y) / 2 - 280 / 2
+            (d) => ((d as any).source.y + (d as any).target.y) / 2 - 160 // Adjusted for taller tooltip
           );
       });
     simulationRef.current = simulation;
@@ -764,6 +874,10 @@ export default function GraphVisualizer() {
     actions.setSelectedEdgeId,
     nodeContactInfo,
     resolutionMode,
+    auditMode,
+    auditDecisionsForCluster,
+    hasAuditDecisions,
+    getAuditDecisionsForEdge,
   ]);
 
   useEffect(() => {
@@ -824,8 +938,10 @@ export default function GraphVisualizer() {
       (l) => l.status === "CONFIRMED_NON_MATCH"
     ).length;
     const pending = links.filter((l) => l.status === "PENDING_REVIEW").length;
-    return { confirmed, nonMatch, pending, total: links.length };
-  }, [links]);
+    const withAuditDecisions = links.filter(l => hasAuditDecisions(l.id)).length; // NEW: Count edges with audit decisions
+    
+    return { confirmed, nonMatch, pending, total: links.length, withAuditDecisions };
+  }, [links, hasAuditDecisions]);
 
   if (isLoading) {
     return (
@@ -963,6 +1079,13 @@ export default function GraphVisualizer() {
               <div className="w-4 h-0.5 bg-blue-500"></div>
               <span>Pending Review ({edgeCounts.pending})</span>
             </div>
+            {/* NEW: Show audit decision count */}
+            {edgeCounts.withAuditDecisions > 0 && (
+              <div className="flex items-center gap-2 pt-1 border-t">
+                <Bot className="h-3 w-3 text-blue-600" />
+                <span>With Automated Decisions ({edgeCounts.withAuditDecisions})</span>
+              </div>
+            )}
             <div className="text-xs text-muted-foreground mt-2 pt-2 border-t">
               Total: {edgeCounts.total} connections
             </div>

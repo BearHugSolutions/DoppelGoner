@@ -1,17 +1,14 @@
 /*
 ================================================================================
 |
-|   File: /context/entity-workflow-context.tsx - Phase 3: Business Logic & Actions
+|   File: /context/entity-workflow-context.tsx - Enhanced with Pagination & Dual-Action Workflow
 |
-|   Description: Workflow management context for Entity Resolution
+|   Description: Workflow management with pagination and dual-action manual override for audit mode
 |   - Manages business logic and complex workflows
-|   - Handles progress calculations (client + server)
-|   - Controls auto-navigation and edge selection
-|   - Manages review submission and business rules
-|   - Provides computed/derived state
-|   - Consumes EntityStateContext and EntityDataContext
-|   - 🔧 PHASE 1: Enhanced optimistic updates with progress calculation
-|   - 🔧 BUG FIX: Corrected optimistic progression when workflow filters are active.
+|   - Implements cursor-based pagination for large clusters
+|   - Implements dual-action submitEdgeReview for audit mode
+|   - Handles auto-marking of audit decisions as reviewed
+|   - Provides audit-aware navigation and filtering
 |
 ================================================================================
 */
@@ -19,7 +16,7 @@
 
 import {
   EntityCluster,
-  EntityVisualizationDataResponse,
+  VisualizationData,
   EntityConnectionDataResponse,
   ClusterReviewProgress,
   GroupReviewDecision,
@@ -29,12 +26,20 @@ import {
   WorkflowFilter,
   DisconnectDependentServicesRequest,
   DisconnectDependentServicesResponse,
+  EdgeSelectionInfo,
 } from "@/types/entity-resolution";
+
+import type {
+  AuditMode,
+  PostProcessingAuditParams,
+} from "@/types/post-processing";
+
 import {
   postEdgeReview,
   postDisconnectDependentServices,
   getOpinionPreferences,
   updateOpinionPreferences,
+  bulkMarkPostProcessingReviewed,
 } from "@/utils/api-client";
 import {
   createContext,
@@ -44,12 +49,12 @@ import {
   useEffect,
   useMemo,
   type ReactNode,
+  useRef,
 } from "react";
 import { useAuth } from "./auth-context";
 import { useEntityState } from "./entity-state-context";
 import { useEntityData } from "./entity-data-context";
 import { useToast } from "@/hooks/use-toast";
-import { produce } from "immer";
 
 // ============================================================================
 // Constants
@@ -62,17 +67,6 @@ const CONNECTION_PAGE_SIZE = 200;
 // Types and Interfaces
 // ============================================================================
 
-interface EdgeSelectionInfo {
-  currentEdgeId: string | null;
-  nextUnreviewedEdgeId: string | null;
-  hasUnreviewedEdges: boolean;
-  currentEdgeIndex: number;
-  totalEdgesInView: number;
-  totalUnreviewedEdgesInCluster: number;
-  currentUnreviewedEdgeIndexInCluster: number;
-  totalEdgesInEntireCluster: number;
-}
-
 export interface OverallWorkflowProgress {
   totalPendingDecisions: number;
   totalCompletedDecisions: number;
@@ -82,13 +76,13 @@ export interface OverallWorkflowProgress {
 }
 
 export interface EntityWorkflowContextType {
-  // Computed progress (uses both client + server data)
+  // Computed progress
   clusterProgress: Record<string, ClusterReviewProgress>;
   overallProgress: OverallWorkflowProgress;
   edgeSelectionInfo: EdgeSelectionInfo;
 
   // Current computed data
-  currentVisualizationData: EntityVisualizationDataResponse | null;
+  currentVisualizationData: VisualizationData | null;
   currentConnectionData: EntityConnectionDataResponse | null;
   selectedClusterDetails: EntityCluster | null;
 
@@ -105,7 +99,18 @@ export interface EntityWorkflowContextType {
   advanceToNextCluster: () => Promise<void>;
   checkAndAdvanceIfComplete: (clusterIdToCheck?: string) => Promise<void>;
 
-  // Review actions
+  // Audit-specific workflow functions
+  initializeAuditMode: () => Promise<void>;
+  findNextAuditCluster: () => Promise<void>;
+  isClusterCompleteForAudit: (clusterId: string) => boolean;
+  getAuditNavigationState: () => {
+    currentClusterIndex: number;
+    totalClusters: number;
+    hasNextCluster: boolean;
+    hasPreviousCluster: boolean;
+  };
+
+  // Review actions with dual-action support
   submitEdgeReview: (
     edgeId: string,
     decision: GroupReviewDecision,
@@ -113,14 +118,9 @@ export interface EntityWorkflowContextType {
   ) => Promise<void>;
   enableDisconnectDependentServices: () => Promise<void>;
 
-  // Large cluster paging
+  // ✨ REFACTORED/NEW pagination actions
   initializeLargeClusterConnectionPaging: (clusterId: string) => Promise<void>;
-  viewNextConnectionPage: (clusterId: string) => Promise<void>;
-  loadConnectionDataForLinkPage: (
-    clusterId: string,
-    pageToLoad: number,
-    isPrefetch?: boolean
-  ) => Promise<void>;
+  loadMoreConnectionsForCluster: (clusterId: string) => Promise<void>;
 
   // Enhanced selection actions
   handleSetSelectedClusterId: (
@@ -141,7 +141,7 @@ export interface EntityWorkflowContextType {
     error: string | null;
   };
 
-  // 🔧 NEW: Filter-aware navigation helpers
+  // Filter-aware navigation helpers
   isClusterCompleteForCurrentFilter: (clusterId: string) => boolean;
   findNextViableCluster: (
     fromClusterId?: string
@@ -160,7 +160,7 @@ const EntityWorkflowContext = createContext<
 >(undefined);
 
 // ============================================================================
-// Provider Component
+// Provider Component - Enhanced with Pagination & Dual-Action Workflow
 // ============================================================================
 
 export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
@@ -169,13 +169,14 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   const state = useEntityState();
   const data = useEntityData();
 
-  // Destructure needed values
   const {
     selectedClusterId,
     selectedEdgeId,
     lastReviewedEdgeId,
     resolutionMode,
     workflowFilter,
+    auditMode,
+    postProcessingFilter,
     isAutoAdvanceEnabled,
     activelyPagingClusterId,
     largeClusterConnectionsPage,
@@ -189,14 +190,23 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     connectionData,
     serverProgress,
     overallServerProgress,
+    postProcessingAuditData,
+    clustersWithAuditData,
     loadClusterProgress,
     loadVisualizationDataForClusters,
+    loadMoreConnectionsForCluster: dataLoadMore, // Renamed to avoid conflict
     loadBulkConnections,
     loadBulkNodeDetails,
+    loadPostProcessingAuditData,
+    loadClustersWithAuditData,
+    bulkMarkDecisionsReviewed,
     getClusterById,
     isVisualizationDataLoaded,
-    updateEdgeStatusOptimistically, // 🔧 PHASE 1: Enhanced with progress updates
-    updateClusterCompletionOptimistically, // 🔧 PHASE 1: Enhanced with progress updates
+    updateEdgeStatusOptimistically,
+    updateClusterCompletionOptimistically,
+    isClustersWithAuditDataLoading,
+    getAuditFilteredVisualizationData,
+    loadAuditClusterRichData,
   } = data;
 
   // ========================================================================
@@ -214,6 +224,8 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
   const [lastWorkflowFilter, setLastWorkflowFilter] =
     useState<WorkflowFilter>(workflowFilter);
+
+  const initialAuditSelectionDone = useRef(false);
 
   // ========================================================================
   // Cross-source Detection Utility
@@ -244,17 +256,148 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   );
 
   // ========================================================================
+  // Audit-specific workflow functions
+  // ========================================================================
+
+  const initializeAuditMode = useCallback(async () => {
+    if (auditMode !== "post_processing_audit" || !selectedOpinion) return;
+
+    console.log("🔄 [EntityWorkflow] Initializing audit mode");
+
+    initialAuditSelectionDone.current = false;
+
+    // ✅ SIMPLE FIX: Don't specify entity type initially
+    const auditParams: PostProcessingAuditParams = {
+      // ❌ REMOVE: entityType: resolutionMode, // Let API return all available audit data
+      postProcFilter: postProcessingFilter || undefined,
+      reviewedByHuman: false,
+      page: 1,
+      limit: 20,
+      workflowFilter: workflowFilter || undefined,
+    };
+
+    console.log(
+      "🔄 [EntityWorkflow] Loading audit data without entity type filter:",
+      auditParams
+    );
+
+    // Data loading is handled by EntityDataContext
+  }, [auditMode, selectedOpinion, postProcessingFilter, workflowFilter]);
+
+  const getCorrectItemType = useCallback(
+    (clusterId?: string): "entity" | "service" => {
+      const targetClusterId = clusterId || selectedClusterId;
+
+      if (auditMode === "post_processing_audit" && targetClusterId) {
+        const auditClusterInfo = clustersWithAuditData?.data?.clusters?.find(
+          (c) => c.id === targetClusterId
+        );
+
+        if (auditClusterInfo) {
+          console.log(
+            `🔍 [EntityWorkflow] Using audit cluster entityType: ${auditClusterInfo.entityType} for cluster ${targetClusterId}`
+          );
+          return auditClusterInfo.entityType;
+        } else {
+          console.warn(
+            `⚠️ [EntityWorkflow] No audit cluster info found for ${targetClusterId}, falling back to resolutionMode: ${resolutionMode}`
+          );
+        }
+      }
+
+      return resolutionMode;
+    },
+    [auditMode, selectedClusterId, clustersWithAuditData, resolutionMode]
+  );
+
+  const findNextAuditCluster = useCallback(async () => {
+    if (auditMode !== "post_processing_audit") return;
+
+    const clusters = clustersWithAuditData?.data?.clusters || [];
+    const currentIndex = clusters.findIndex((c) => c.id === selectedClusterId);
+
+    for (let i = currentIndex + 1; i < clusters.length; i++) {
+      const cluster = clusters[i];
+      if (cluster.unreviewedDecisionsCount > 0) {
+        console.log(
+          `📍 [EntityWorkflow] Found next audit cluster: ${cluster.id}`
+        );
+        stateActions.setSelectedClusterId(cluster.id);
+        return;
+      }
+    }
+
+    const auditData = clustersWithAuditData?.data;
+    if (
+      auditData &&
+      auditData.page < Math.ceil(auditData.total / auditData.limit)
+    ) {
+      console.log("📄 [EntityWorkflow] Loading next page of audit clusters");
+
+      const nextPage = auditData.page + 1;
+      const auditParams: PostProcessingAuditParams = {
+        entityType: resolutionMode,
+        postProcFilter: postProcessingFilter || undefined,
+        reviewedByHuman: false,
+        page: nextPage,
+        limit: auditData.limit,
+        workflowFilter: workflowFilter || undefined,
+      };
+
+      await loadClustersWithAuditData(auditParams);
+    } else {
+      toast({
+        title: "Audit Complete",
+        description: "All automated decisions have been reviewed.",
+      });
+    }
+  }, [
+    auditMode,
+    clustersWithAuditData,
+    selectedClusterId,
+    resolutionMode,
+    postProcessingFilter,
+    stateActions,
+    loadClustersWithAuditData,
+    toast,
+    workflowFilter,
+  ]);
+
+  const isClusterCompleteForAudit = useCallback(
+    (clusterId: string) => {
+      if (auditMode !== "post_processing_audit") return false;
+
+      const clusters = clustersWithAuditData?.data?.clusters || [];
+      const cluster = clusters.find((c) => c.id === clusterId);
+
+      return cluster ? cluster.unreviewedDecisionsCount === 0 : false;
+    },
+    [auditMode, clustersWithAuditData]
+  );
+
+  const getAuditNavigationState = useCallback(() => {
+    const clusters = clustersWithAuditData?.data?.clusters || [];
+    const currentIndex = clusters.findIndex((c) => c.id === selectedClusterId);
+
+    return {
+      currentClusterIndex: currentIndex,
+      totalClusters: clusters.length,
+      hasNextCluster: currentIndex < clusters.length - 1,
+      hasPreviousCluster: currentIndex > 0,
+    };
+  }, [clustersWithAuditData, selectedClusterId]);
+
+  // ========================================================================
   // Progress Calculation Functions
   // ========================================================================
 
-  // Client-side progress calculation (fallback)
   const getClusterProgressInternal = useCallback(
     (
       clusterIdToQuery: string,
       filter: WorkflowFilter
     ): ClusterReviewProgress => {
       const clusterDetails = clusters.data.find(
-        (c) => c.id === clusterIdToQuery
+        (c: EntityCluster) => c.id === clusterIdToQuery
       );
       const vizState = visualizationData[clusterIdToQuery];
       const currentVizData = vizState?.data;
@@ -263,23 +406,27 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         let relevantLinks = currentVizData.links;
 
         if (filter === "cross-source-only") {
-          relevantLinks = currentVizData.links.filter((link) =>
+          relevantLinks = currentVizData.links.filter((link: BaseLink) =>
             isCrossSourceConnection(link, currentVizData.nodes)
           );
         }
 
         const totalEdges = relevantLinks.length;
-        const reviewedEdges = relevantLinks.filter((l) => l.wasReviewed).length;
-        const pendingReviewLinks = relevantLinks.filter((l) => !l.wasReviewed);
+        const reviewedEdges = relevantLinks.filter(
+          (l: BaseLink) => l.wasReviewed
+        ).length;
+        const pendingReviewLinks = relevantLinks.filter(
+          (l: BaseLink) => !l.wasReviewed
+        );
 
         const progressPercentage =
           totalEdges > 0 ? Math.round((reviewedEdges / totalEdges) * 100) : 100;
 
         const confirmedMatches = relevantLinks.filter(
-          (l) => l.status === "CONFIRMED_MATCH"
+          (l: BaseLink) => l.status === "CONFIRMED_MATCH"
         ).length;
         const confirmedNonMatches = relevantLinks.filter(
-          (l) => l.status === "CONFIRMED_NON_MATCH"
+          (l: BaseLink) => l.status === "CONFIRMED_NON_MATCH"
         ).length;
 
         return {
@@ -293,21 +440,17 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         };
       }
 
-      // Fallback logic when visualization data isn't loaded
-      // Note: For finalized clusters without viz data, we can't show accurate progress
       if (clusterDetails) {
         if (typeof clusterDetails.groupCount === "number") {
           const total = clusterDetails.groupCount;
 
-          // If cluster is marked as reviewed but we don't have viz data,
-          // assume it's complete but acknowledge we don't have detailed counts
           if (clusterDetails.wasReviewed) {
             return {
               totalEdges: total,
               reviewedEdges: total,
               pendingEdges: 0,
-              confirmedMatches: 0, // Unknown without viz data
-              confirmedNonMatches: 0, // Unknown without viz data
+              confirmedMatches: 0,
+              confirmedNonMatches: 0,
               progressPercentage: 100,
               isComplete: true,
             };
@@ -342,10 +485,8 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   // Progress Query Functions
   // ========================================================================
 
-  // Get cluster progress (current filter view) - prefers server data
   const getClusterProgress = useCallback(
     (clusterIdToQuery: string): ClusterReviewProgress => {
-      // Prefer server-side progress if available
       const serverProg = serverProgress[clusterIdToQuery];
       if (serverProg) {
         const currentProgress = serverProg.currentView;
@@ -360,13 +501,11 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         };
       }
 
-      // Fallback to existing client-side calculation
       return getClusterProgressInternal(clusterIdToQuery, workflowFilter);
     },
     [serverProgress, getClusterProgressInternal, workflowFilter]
   );
 
-  // Get unfiltered cluster progress (all edges)
   const getClusterProgressUnfiltered = useCallback(
     (clusterIdToQuery: string): ClusterReviewProgress => {
       const serverProg = serverProgress[clusterIdToQuery];
@@ -383,13 +522,11 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         };
       }
 
-      // Fallback to existing client-side calculation without filter
       return getClusterProgressInternal(clusterIdToQuery, "all");
     },
     [serverProgress, getClusterProgressInternal]
   );
 
-  // Get cross-source only cluster progress
   const getClusterProgressCrossSource = useCallback(
     (clusterIdToQuery: string): ClusterReviewProgress => {
       const serverProg = serverProgress[clusterIdToQuery];
@@ -406,7 +543,6 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         };
       }
 
-      // Fallback to existing client-side calculation with cross-source filter
       return getClusterProgressInternal(clusterIdToQuery, "cross-source-only");
     },
     [serverProgress, getClusterProgressInternal]
@@ -416,11 +552,10 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   // Computed State
   // ========================================================================
 
-  // Cluster progress map
   const clusterProgress = useMemo(() => {
     const reconstructed: Record<string, ClusterReviewProgress> = {};
 
-    clusters.data.forEach((cluster) => {
+    clusters.data.forEach((cluster: EntityCluster) => {
       reconstructed[cluster.id] = getClusterProgress(cluster.id);
     });
 
@@ -449,19 +584,16 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     getClusterById,
   ]);
 
-  // Overall progress
   const overallProgress = useMemo(() => {
     if (overallServerProgress) {
-      // Return the current view progress (respects current workflow filter)
       return overallServerProgress.currentView;
     }
 
-    // Fallback to existing client-side calculation
     let totalPending = 0;
     let totalCompleted = 0;
     let clustersComplete = 0;
 
-    clusters.data.forEach((cluster) => {
+    clusters.data.forEach((cluster: EntityCluster) => {
       const progress = clusterProgress[cluster.id];
       if (progress) {
         totalPending += progress.pendingEdges;
@@ -487,48 +619,69 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     };
   }, [overallServerProgress, clusters.data, clusterProgress]);
 
-  // Current visualization data with filters
-  const currentVisualizationData =
-    useMemo((): EntityVisualizationDataResponse | null => {
-      if (!selectedClusterId) return null;
+  // Get visualization data with audit filtering and pagination support
+  const currentVisualizationData = useMemo((): VisualizationData | null => {
+    if (!selectedClusterId) return null;
+
+    // In audit mode, use filtered visualization data
+    if (auditMode === "post_processing_audit") {
+      if (postProcessingAuditData.loading) {
+        console.log(
+          `⏳ [EntityWorkflow] Audit data still loading for cluster ${selectedClusterId}, waiting...`
+        );
+        return null;
+      }
 
       const vizState = visualizationData[selectedClusterId];
-      if (!vizState?.data) return null;
-
-      let data = vizState.data;
-
-      // Apply paging if needed
-      if (
-        selectedClusterId === activelyPagingClusterId &&
-        largeClusterConnectionsPage > 0
-      ) {
-        const allLinks = vizState.data.links;
-        const startIndex =
-          (largeClusterConnectionsPage - 1) * CONNECTION_PAGE_SIZE;
-        const endIndex = startIndex + CONNECTION_PAGE_SIZE;
-        const pagedLinks = allLinks.slice(startIndex, endIndex);
-        data = { ...vizState.data, links: pagedLinks };
-      }
-
-      // Apply workflow filter
-      if (workflowFilter === "cross-source-only") {
-        const filteredLinks = data.links.filter((link) =>
-          isCrossSourceConnection(link, data.nodes)
+      if (vizState?.loading) {
+        console.log(
+          `⏳ [EntityWorkflow] Visualization data still loading for cluster ${selectedClusterId}, waiting...`
         );
-        data = { ...data, links: filteredLinks };
+        return null;
       }
 
-      return data;
-    }, [
-      selectedClusterId,
-      visualizationData,
-      activelyPagingClusterId,
-      largeClusterConnectionsPage,
-      workflowFilter,
-      isCrossSourceConnection,
-    ]);
+      if (vizState?.data && !postProcessingAuditData.loading) {
+        const filteredData =
+          getAuditFilteredVisualizationData(selectedClusterId);
 
-  // Current connection data
+        if (!filteredData && vizState.data) {
+          console.log(
+            `ℹ️ [EntityWorkflow] No audit decisions for cluster ${selectedClusterId}, showing full cluster data`
+          );
+          return vizState.data;
+        }
+
+        return filteredData;
+      }
+
+      return null;
+    }
+
+    // Normal mode logic with pagination support
+    const vizState = visualizationData[selectedClusterId];
+    if (!vizState?.data) return null;
+
+    let dataToReturn = vizState.data;
+
+    // Apply workflow filter
+    if (workflowFilter === "cross-source-only") {
+      const filteredLinks = dataToReturn.links.filter((link: BaseLink) =>
+        isCrossSourceConnection(link, dataToReturn.nodes)
+      );
+      dataToReturn = { ...dataToReturn, links: filteredLinks };
+    }
+
+    return dataToReturn;
+  }, [
+    selectedClusterId,
+    auditMode,
+    postProcessingAuditData.loading,
+    visualizationData,
+    workflowFilter,
+    isCrossSourceConnection,
+    getAuditFilteredVisualizationData,
+  ]);
+
   const currentConnectionData =
     useMemo((): EntityConnectionDataResponse | null => {
       if (!selectedEdgeId) return null;
@@ -537,85 +690,86 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       return selectedEdgeConnectionState.data || null;
     }, [selectedEdgeId, connectionData]);
 
-  // Selected cluster details
   const selectedClusterDetails = useMemo((): EntityCluster | null => {
     if (!selectedClusterId) return null;
-    return clusters.data.find((c) => c.id === selectedClusterId) || null;
-  }, [selectedClusterId, clusters.data]);
 
-  // Edge selection info
+    if (auditMode === "post_processing_audit") {
+      const auditCluster = clustersWithAuditData?.data?.clusters?.find(
+        (c) => c.id === selectedClusterId
+      );
+      if (auditCluster) {
+        return {
+          id: auditCluster.id,
+          name: `Audit Cluster ${auditCluster.id.substring(0, 8)}`,
+          entityCount: auditCluster.totalDecisionsCount,
+          groupCount: auditCluster.unreviewedDecisionsCount,
+          averageCoherenceScore: null,
+          wasReviewed: auditCluster.unreviewedDecisionsCount === 0,
+        };
+      }
+    }
+
+    return (
+      clusters.data.find((c: EntityCluster) => c.id === selectedClusterId) ||
+      null
+    );
+  }, [selectedClusterId, clusters.data, auditMode, clustersWithAuditData]);
+
+  // ✨ ENHANCED: Edge selection info with pagination support
   const edgeSelectionInfo = useMemo((): EdgeSelectionInfo => {
-    const defaultEdgeInfo: EdgeSelectionInfo = {
+    const defaultInfo: EdgeSelectionInfo = {
       currentEdgeId: selectedEdgeId,
       nextUnreviewedEdgeId: null,
       hasUnreviewedEdges: false,
       currentEdgeIndex: -1,
-      totalEdgesInView: 0,
+      totalEdges: 0,
       totalUnreviewedEdgesInCluster: 0,
       currentUnreviewedEdgeIndexInCluster: -1,
       totalEdgesInEntireCluster: 0,
+      loadedLinksCount: 0,
+      totalConnectionsInFilter: null,
     };
 
-    const fullViz = selectedClusterId
-      ? visualizationData[selectedClusterId]?.data
+    const vizState = selectedClusterId
+      ? visualizationData[selectedClusterId]
       : null;
-    if (!fullViz?.links) {
-      return defaultEdgeInfo;
-    }
+    if (!vizState?.data) return defaultInfo;
 
-    const allLinksInCluster = fullViz.links;
-    defaultEdgeInfo.totalEdgesInEntireCluster = allLinksInCluster.length;
+    const { data } = vizState;
+    const allLinksInCluster = data.links; // This is the accumulated list
+    const totalConnections = data.totalConnections;
 
-    const allUnreviewedLinksInCluster = allLinksInCluster.filter(
-      (link) => !link.wasReviewed
+    defaultInfo.totalEdgesInEntireCluster = allLinksInCluster.length;
+    defaultInfo.loadedLinksCount = allLinksInCluster.length;
+    defaultInfo.totalConnectionsInFilter = totalConnections;
+
+    const unreviewedLinks = allLinksInCluster.filter(
+      (link: BaseLink) => !link.wasReviewed
     );
-    defaultEdgeInfo.hasUnreviewedEdges = allUnreviewedLinksInCluster.length > 0;
-    defaultEdgeInfo.totalUnreviewedEdgesInCluster =
-      allUnreviewedLinksInCluster.length;
+    defaultInfo.hasUnreviewedEdges = unreviewedLinks.length > 0;
+    defaultInfo.totalUnreviewedEdgesInCluster = unreviewedLinks.length;
 
     if (selectedEdgeId) {
-      defaultEdgeInfo.currentUnreviewedEdgeIndexInCluster =
-        allUnreviewedLinksInCluster.findIndex((l) => l.id === selectedEdgeId);
+      defaultInfo.currentEdgeIndex = allLinksInCluster.findIndex(
+        (l: BaseLink) => l.id === selectedEdgeId
+      );
+      defaultInfo.currentUnreviewedEdgeIndexInCluster =
+        unreviewedLinks.findIndex((l: BaseLink) => l.id === selectedEdgeId);
     }
 
-    const currentVizForView = currentVisualizationData;
-    if (currentVizForView?.links) {
-      defaultEdgeInfo.totalEdgesInView = currentVizForView.links.length;
-      if (selectedEdgeId) {
-        defaultEdgeInfo.currentEdgeIndex = currentVizForView.links.findIndex(
-          (l) => l.id === selectedEdgeId
-        );
-      }
-    }
-
-    if (defaultEdgeInfo.hasUnreviewedEdges) {
-      if (selectedEdgeId) {
-        const currentIdx = allUnreviewedLinksInCluster.findIndex(
-          (l) => l.id === selectedEdgeId
-        );
-        if (
-          currentIdx > -1 &&
-          currentIdx < allUnreviewedLinksInCluster.length - 1
-        ) {
-          defaultEdgeInfo.nextUnreviewedEdgeId =
-            allUnreviewedLinksInCluster[currentIdx + 1].id;
-        } else {
-          defaultEdgeInfo.nextUnreviewedEdgeId =
-            allUnreviewedLinksInCluster[0].id;
-        }
+    if (unreviewedLinks.length > 0) {
+      const currentIndex = unreviewedLinks.findIndex(
+        (l: BaseLink) => l.id === selectedEdgeId
+      );
+      if (currentIndex > -1 && currentIndex < unreviewedLinks.length - 1) {
+        defaultInfo.nextUnreviewedEdgeId = unreviewedLinks[currentIndex + 1].id;
       } else {
-        defaultEdgeInfo.nextUnreviewedEdgeId =
-          allUnreviewedLinksInCluster[0].id;
+        defaultInfo.nextUnreviewedEdgeId = unreviewedLinks[0].id;
       }
     }
 
-    return defaultEdgeInfo;
-  }, [
-    currentVisualizationData,
-    selectedEdgeId,
-    selectedClusterId,
-    visualizationData,
-  ]);
+    return defaultInfo;
+  }, [selectedEdgeId, selectedClusterId, visualizationData]);
 
   // ========================================================================
   // Helper Query Functions
@@ -633,7 +787,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         ? visualizationData[selectedClusterId]?.data
         : null;
       if (!currentViz?.links) return false;
-      const edge = currentViz.links.find((l) => l.id === edgeId);
+      const edge = currentViz.links.find((l: BaseLink) => l.id === edgeId);
       return edge ? edge.wasReviewed === true : false;
     },
     [selectedClusterId, visualizationData]
@@ -645,7 +799,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         ? visualizationData[selectedClusterId]?.data
         : null;
       if (!currentViz?.links) return null;
-      const edge = currentViz.links.find((l) => l.id === edgeId);
+      const edge = currentViz.links.find((l: BaseLink) => l.id === edgeId);
       return edge?.status ?? null;
     },
     [selectedClusterId, visualizationData]
@@ -668,7 +822,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       if (!vizState?.data?.links || !vizState?.data?.nodes) return true;
 
       const currentEdge = vizState.data.links.find(
-        (link) => link.id === selectedEdgeId
+        (link: BaseLink) => link.id === selectedEdgeId
       );
       if (!currentEdge) return false;
 
@@ -700,17 +854,15 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       if (!currentClusterId) return null;
 
       const currentIndex = clusters.data.findIndex(
-        (c) => c.id === currentClusterId
+        (c: EntityCluster) => c.id === currentClusterId
       );
       if (currentIndex === -1) return null;
 
-      // Look for next cluster that has unreviewed connections matching the current filter
       for (let i = currentIndex + 1; i < clusters.data.length; i++) {
-        const cluster = clusters.data[i];
-        if (cluster.wasReviewed) continue; // Skip finalized clusters
+        const cluster: EntityCluster = clusters.data[i];
+        if (cluster.wasReviewed) continue;
 
         const progress = getClusterProgress(cluster.id);
-        // A cluster is viable if it has pending edges according to current filter
         if (progress.pendingEdges > 0) {
           console.log(
             `📍 [EntityWorkflow] Found next viable cluster: ${cluster.id} (${progress.pendingEdges} pending for filter: ${workflowFilter})`
@@ -719,7 +871,6 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      // If no cluster found on current page, check if there are more pages
       if (clusters.page < Math.ceil(clusters.total / clusters.limit)) {
         console.log(
           `📄 [EntityWorkflow] No viable clusters on current page, suggesting next page load`
@@ -743,84 +894,87 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     async (id: string | null, isManualSelection: boolean = true) => {
       if (id === selectedClusterId) return;
 
-      // 🔧 NEW: Track manual cluster selections
       if (isManualSelection && id) {
         setManualClusterSelection({ clusterId: id, timestamp: Date.now() });
-        console.log(`📍 [EntityWorkflow] Manual cluster selection: ${id}`);
+        console.log(
+          `📍 [EntityWorkflow] Manual cluster selection: ${id} (audit mode: ${auditMode})`
+        );
       }
 
       stateActions.setSelectedClusterId(id);
 
       if (id && selectedOpinion) {
-        const clusterDetail = getClusterById(id);
-        const connectionCount = clusterDetail
-          ? clusterDetail.groupCount
-          : undefined;
-        const isLarge =
-          connectionCount !== undefined &&
-          connectionCount !== null &&
-          connectionCount > LARGE_CLUSTER_THRESHOLD;
-
-        if (
-          clusterDetail?.wasReviewed ||
-          (!isLarge && getClusterProgress(id).isComplete)
-        ) {
-          stateActions.setIsAutoAdvanceEnabled(false);
+        if (auditMode === "post_processing_audit") {
+          // Load rich data for audit cluster
+          await loadAuditClusterRichData(id);
         } else {
-          if (!(isLarge && largeClusterConnectionsPage === 0)) {
-            stateActions.setIsAutoAdvanceEnabled(true);
-          }
-        }
+          // Normal mode logic
+          const clusterDetail = getClusterById(id);
+          const connectionCount = clusterDetail
+            ? clusterDetail.groupCount
+            : undefined;
+          const isLarge =
+            connectionCount !== undefined &&
+            connectionCount !== null &&
+            connectionCount > LARGE_CLUSTER_THRESHOLD;
 
-        if (!isLarge) {
-          const vizState = visualizationData[id];
-          if ((!vizState?.data || vizState?.error) && !vizState?.loading) {
-            await loadVisualizationDataForClusters([
-              { clusterId: id, itemType: resolutionMode },
-            ]);
-          } else if (vizState?.data?.links) {
-            const unloadedConnectionItems = vizState.data.links
-              .filter((link) => {
-                const connState = connectionData[link.id];
-                const needsLoad =
-                  !connState ||
-                  (!connState.data && !connState.loading && !connState.error) ||
-                  connState.error;
-                return needsLoad;
-              })
-              .map((link) => ({ edgeId: link.id, itemType: resolutionMode }));
-
-            if (unloadedConnectionItems.length > 0) {
-              console.log(
-                `🔄 [EntityWorkflow] Loading ${unloadedConnectionItems.length} missing connections for cluster ${id}`
-              );
-              loadBulkConnections(unloadedConnectionItems);
+          if (
+            clusterDetail?.wasReviewed ||
+            (!isLarge && getClusterProgress(id).isComplete)
+          ) {
+            stateActions.setIsAutoAdvanceEnabled(false);
+          } else {
+            if (!(isLarge && largeClusterConnectionsPage === 0)) {
+              stateActions.setIsAutoAdvanceEnabled(true);
             }
           }
-        } else {
-          const vizState = visualizationData[id];
-          if (vizState?.data?.nodes) {
-            const nodeIdsFromViz = vizState.data.nodes.map((node) => ({
-              id: node.id,
-              nodeType: resolutionMode,
-            }));
-            await loadBulkNodeDetails(nodeIdsFromViz);
+
+          if (!isLarge) {
+            // ✅ FIXED: Get correct item type for this cluster
+            const correctItemType = getCorrectItemType(id);
+
+            const vizState = visualizationData[id];
+            if ((!vizState?.data || vizState?.error) && !vizState?.loading) {
+              await loadVisualizationDataForClusters([
+                {
+                  clusterId: id,
+                  itemType: correctItemType, // ✅ FIXED: Use correct item type
+                  limit: CONNECTION_PAGE_SIZE,
+                  crossSystemOnly: workflowFilter === "cross-source-only",
+                },
+              ]);
+            }
+          } else {
+            // ✅ FIXED: For large clusters, use correct item type for node details
+            const correctItemType = getCorrectItemType(id);
+
+            const vizState = visualizationData[id];
+            if (vizState?.data?.nodes) {
+              const nodeIdsFromViz = vizState.data.nodes.map(
+                (node: BaseNode) => ({
+                  id: node.id,
+                  nodeType: correctItemType, // ✅ FIXED: Use correct item type
+                })
+              );
+              await loadBulkNodeDetails(nodeIdsFromViz);
+            }
           }
         }
       }
     },
     [
       selectedClusterId,
+      auditMode,
       selectedOpinion,
       stateActions,
+      loadAuditClusterRichData,
       getClusterById,
       getClusterProgress,
       largeClusterConnectionsPage,
+      getCorrectItemType, // ✅ ADDED: Include the helper function
       visualizationData,
-      resolutionMode,
       loadVisualizationDataForClusters,
-      connectionData,
-      loadBulkConnections,
+      workflowFilter,
       loadBulkNodeDetails,
     ]
   );
@@ -854,7 +1008,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   );
 
   // ========================================================================
-  // Business Action Functions - 🔧 PHASE 1: Enhanced Optimistic Updates
+  // Business Action Functions
   // ========================================================================
 
   const enableDisconnectDependentServices = useCallback(async () => {
@@ -903,6 +1057,14 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   }, [user?.id, selectedOpinion, toast, stateActions]);
 
   const advanceToNextCluster = useCallback(async () => {
+    // Check if in audit mode and handle navigation separately
+    if (auditMode === "post_processing_audit") {
+      console.log(`🚀 [EntityWorkflow] Advancing to next audit cluster.`);
+      await findNextAuditCluster();
+      return;
+    }
+
+    // --- Original logic for manual review mode ---
     if (!selectedClusterId) {
       console.warn("🚫 [EntityWorkflow] No cluster selected, cannot advance.");
       return;
@@ -913,7 +1075,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     );
 
     const currentIndex = clusters.data.findIndex(
-      (c) => c.id === selectedClusterId
+      (c: EntityCluster) => c.id === selectedClusterId
     );
     if (currentIndex === -1) {
       console.warn(
@@ -923,13 +1085,11 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    // Clear paging state when advancing clusters
     stateActions.setActivelyPagingClusterId(null);
     stateActions.setLargeClusterConnectionsPage(0);
 
     let nextClusterSelected = false;
 
-    // Look for next unreviewed cluster on current page
     for (let i = currentIndex + 1; i < clusters.data.length; i++) {
       const nextClusterOnPage = clusters.data[i];
       if (!nextClusterOnPage.wasReviewed) {
@@ -937,37 +1097,31 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           `Selecting next unreviewed cluster in current page: ${nextClusterOnPage.id}`
         );
 
-        // Set the selected cluster
-        handleSetSelectedClusterId(nextClusterOnPage.id);
+        await handleSetSelectedClusterId(nextClusterOnPage.id, false);
         nextClusterSelected = true;
         break;
       }
     }
 
-    // If no unreviewed cluster found on current page, try next page
     if (!nextClusterSelected) {
       if (clusters.page < Math.ceil(clusters.total / clusters.limit)) {
         const nextPageToLoad = clusters.page + 1;
         console.log(`Loading next page (${nextPageToLoad}) of clusters.`);
 
         await loadClusterProgress(nextPageToLoad, clusters.limit);
-
-        // After loading new page, the auto-selection logic will handle
-        // selecting the first unreviewed cluster on the new page
       } else {
-        // No more pages - all clusters reviewed
         toast({
           title: "Workflow Complete",
           description: "All clusters have been reviewed.",
         });
         console.log("All clusters reviewed.");
         stateActions.setIsAutoAdvanceEnabled(false);
-
-        // Set selected cluster to null if all are reviewed and no more pages
         stateActions.setSelectedClusterId(null);
       }
     }
   }, [
+    auditMode,
+    findNextAuditCluster,
     selectedClusterId,
     clusters,
     loadClusterProgress,
@@ -983,14 +1137,16 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      const progress = getClusterProgress(targetClusterId);
+      const vizState = visualizationData[targetClusterId];
+      // ✨ UPDATED: A cluster is complete if there are no more unreviewed links AND hasMore is false
+      const unreviewedCount =
+        vizState?.data?.links.filter((l: BaseLink) => !l.wasReviewed).length ??
+        -1;
 
-      if (progress.isComplete && progress.totalEdges !== -1) {
-        // Mark cluster as reviewed - this would need to be handled by EntityDataContext
+      if (unreviewedCount === 0 && vizState && !vizState.hasMore) {
         console.log(
-          `✅ [EntityWorkflow] Cluster ${targetClusterId} is complete`
+          `✅ [EntityWorkflow] Cluster ${targetClusterId} is complete.`
         );
-
         if (targetClusterId === selectedClusterId && isAutoAdvanceEnabled) {
           console.log(
             `Cluster ${targetClusterId} is complete. Auto-advance ON. Advancing.`
@@ -1005,172 +1161,135 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     },
     [
       selectedClusterId,
-      getClusterProgress,
+      visualizationData,
       isAutoAdvanceEnabled,
       advanceToNextCluster,
     ]
   );
 
-  // Enhanced selectNextUnreviewedEdge to handle manual selections
   const selectNextUnreviewedEdge = useCallback(
     (afterEdgeId?: string | null) => {
-      const currentClusterId = selectedClusterId;
-      if (!currentClusterId) {
-        console.warn(
-          "🚫 [EntityWorkflow] No cluster selected for selecting next edge."
-        );
-        return;
-      }
+      if (!selectedClusterId) return;
+      const viz = visualizationData[selectedClusterId]?.data;
+      if (!viz) return;
 
-      const clusterDetail = getClusterById(currentClusterId);
-      if (clusterDetail?.wasReviewed) {
-        console.log(
-          `Cluster ${currentClusterId} was reviewed. No edges to select. Checking advance.`
-        );
-        checkAndAdvanceIfComplete(currentClusterId);
-        return;
-      }
-
-      // 🔧 NEW: Check if this is a recent manual selection and should not auto-advance
-      const isRecentManualSelection =
-        manualClusterSelection.clusterId === currentClusterId &&
-        Date.now() - manualClusterSelection.timestamp < 5000; // 5 second grace period
-
-      console.log(
-        `🔍 [EntityWorkflow] Selecting next unreviewed edge in cluster ${currentClusterId}, manual selection: ${isRecentManualSelection}`
-      );
-
-      const currentVizForSelection = currentVisualizationData;
-
-      if (
-        !currentVizForSelection?.links ||
-        currentVizForSelection.links.length === 0
-      ) {
-        if (currentClusterId === activelyPagingClusterId) {
-          const fullViz = visualizationData[currentClusterId]?.data;
-          if (
-            fullViz &&
-            fullViz.links.length >
-              largeClusterConnectionsPage * CONNECTION_PAGE_SIZE
-          ) {
-            console.log(
-              `No more unreviewed links on current page ${largeClusterConnectionsPage} of large cluster ${currentClusterId}. User may need to advance page.`
-            );
-            return;
-          }
-        }
-
-        // 🔧 ENHANCED: Handle manual selections differently
-        if (isRecentManualSelection) {
-          console.log(
-            `🚫 [EntityWorkflow] No links in current view for manually selected cluster ${currentClusterId}. Not auto-advancing due to recent manual selection.`
-          );
-          return; // Don't auto-advance if this was a recent manual selection
-        }
-
-        console.log(
-          `No links in current view for cluster ${currentClusterId}. Advancing to next cluster.`
-        );
-        advanceToNextCluster();
-        return;
-      }
-
-      const { links } = currentVizForSelection;
-      let startIdx = 0;
-      const referenceEdgeId =
-        afterEdgeId || lastReviewedEdgeId || selectedEdgeId;
-
-      if (referenceEdgeId) {
-        const idx = links.findIndex((l) => l.id === referenceEdgeId);
-        if (idx !== -1) {
-          startIdx = idx + 1;
-        } else {
-          console.warn(
-            `Ref edge ${referenceEdgeId} not found in current view. Starting from beginning of current view.`
-          );
-        }
-      }
-
-      for (let i = 0; i < links.length; i++) {
-        const link = links[(startIdx + i) % links.length];
-        if (!isEdgeReviewed(link.id)) {
-          console.log(
-            `Next unreviewed edge found in current view: ${link.id}. Selecting.`
-          );
-          setSelectedEdgeIdAction(link.id);
-          return;
-        }
-      }
-
-      // 🔧 ENHANCED: Handle completion differently for manual selections
-      if (isRecentManualSelection) {
-        console.log(
-          `🚫 [EntityWorkflow] No unreviewed edges in manually selected cluster ${currentClusterId} for filter '${workflowFilter}'. Not auto-advancing.`
-        );
-        setSelectedEdgeIdAction(null);
-        return;
-      }
-
-      // Original logic for auto-navigation
-      console.log(
-        `No more unreviewed edges in current view of cluster ${currentClusterId} for filter '${workflowFilter}'. Advancing.`
-      );
-      setSelectedEdgeIdAction(null);
-
-      const nextCluster = findNextViableCluster();
-
-      if (nextCluster === "next_page") {
-        const nextPageToLoad = clusters.page + 1;
-        if (nextPageToLoad <= Math.ceil(clusters.total / clusters.limit)) {
-          console.log(
-            `📄 [selectNextUnreviewedEdge] Loading next page (${nextPageToLoad}) of clusters.`
-          );
-          loadClusterProgress(nextPageToLoad, clusters.limit);
-        } else {
+      const unreviewedLinks = viz.links.filter((l: BaseLink) => !l.wasReviewed);
+      if (unreviewedLinks.length === 0) {
+        // ✨ UPDATED: If no unreviewed links and more can be loaded, don't advance cluster
+        if (visualizationData[selectedClusterId]?.hasMore) {
           toast({
-            title: "Workflow Complete",
-            description: `All clusters have been reviewed for the current filter (${workflowFilter}).`,
+            title: "Load More",
+            description:
+              "No more unreviewed connections in the loaded set. Click 'Load More' to see more.",
           });
+        } else {
+          checkAndAdvanceIfComplete(selectedClusterId);
         }
-      } else if (nextCluster) {
-        console.log(
-          `➡️ [selectNextUnreviewedEdge] Advancing to next unreviewed cluster: ${nextCluster.id}`
+        return;
+      }
+
+      const refId = afterEdgeId || lastReviewedEdgeId || selectedEdgeId;
+      let nextEdge: BaseLink | undefined;
+      if (refId) {
+        const currentIdx = unreviewedLinks.findIndex(
+          (l: BaseLink) => l.id === refId
         );
-        handleSetSelectedClusterId(nextCluster.id, false); // Mark as automatic selection
-      } else {
-        toast({
-          title: "Workflow Complete",
-          description: `All clusters have been reviewed for the current filter (${workflowFilter}).`,
-        });
-        console.log(
-          "✅ [selectNextUnreviewedEdge] All clusters reviewed for current filter."
-        );
+        if (currentIdx > -1 && currentIdx < unreviewedLinks.length - 1) {
+          nextEdge = unreviewedLinks[currentIdx + 1];
+        }
+      }
+
+      if (!nextEdge) {
+        nextEdge = unreviewedLinks[0];
+      }
+
+      if (nextEdge) {
+        stateActions.setSelectedEdgeId(nextEdge.id);
       }
     },
     [
       selectedClusterId,
       selectedEdgeId,
       lastReviewedEdgeId,
-      manualClusterSelection, // 🔧 NEW: Add manual selection tracking
-      checkAndAdvanceIfComplete,
-      getClusterById,
-      currentVisualizationData,
-      activelyPagingClusterId,
-      largeClusterConnectionsPage,
       visualizationData,
-      setSelectedEdgeIdAction,
-      isEdgeReviewed,
-      workflowFilter,
-      advanceToNextCluster,
-      findNextViableCluster,
-      clusters,
-      loadClusterProgress,
-      handleSetSelectedClusterId,
+      stateActions,
       toast,
+      checkAndAdvanceIfComplete,
     ]
   );
 
-  // 🔧 PHASE 1: Enhanced submitEdgeReview with optimistic progress updates
+  const initializeLargeClusterConnectionPaging = useCallback(
+    async (clusterId: string) => {
+      console.log(
+        `🚀 [EntityWorkflow] Initializing paginated fetch for large cluster: ${clusterId}`
+      );
+
+      // ✅ FIXED: Get correct item type for this cluster
+      const correctItemType = getCorrectItemType(clusterId);
+
+      // Set state to indicate paging has started for this cluster.
+      stateActions.setActivelyPagingClusterId(clusterId);
+      stateActions.setLargeClusterConnectionsPage(1); // Start at page 1
+      stateActions.setIsLoadingConnectionPageData(true);
+
+      try {
+        await loadVisualizationDataForClusters([
+          {
+            clusterId,
+            itemType: correctItemType, // ✅ FIXED: Use correct item type
+            limit: CONNECTION_PAGE_SIZE,
+            crossSystemOnly: workflowFilter === "cross-source-only",
+          },
+        ]);
+      } finally {
+        // Set loading to false after the data fetch attempt is complete.
+        stateActions.setIsLoadingConnectionPageData(false);
+      }
+    },
+    [
+      getCorrectItemType, // ✅ ADDED: Include the helper function
+      workflowFilter,
+      loadVisualizationDataForClusters,
+      stateActions,
+    ]
+  );
+
+  // ✅ NEW: Added function to handle loading more connections.
+  const loadMoreConnectionsForCluster = useCallback(
+    async (clusterId: string) => {
+      const vizState = visualizationData[clusterId];
+      if (!vizState || !vizState.hasMore || state.isLoadingConnectionPageData) {
+        return;
+      }
+
+      console.log(
+        `🔄 [EntityWorkflow] Loading more connections for cluster ${clusterId}`
+      );
+
+      stateActions.setIsLoadingConnectionPageData(true);
+      stateActions.setLargeClusterConnectionsPage(
+        largeClusterConnectionsPage + 1
+      );
+
+      try {
+        await dataLoadMore(clusterId);
+      } finally {
+        stateActions.setIsLoadingConnectionPageData(false);
+      }
+    },
+    [
+      visualizationData,
+      state.isLoadingConnectionPageData,
+      largeClusterConnectionsPage,
+      stateActions,
+      dataLoadMore,
+    ]
+  );
+
+  // ========================================================================
+  // DUAL-ACTION submitEdgeReview - Core of the audit integration
+  // ========================================================================
+
   const submitEdgeReview = useCallback(
     async (edgeId: string, decision: GroupReviewDecision, notes?: string) => {
       if (!user?.id || !selectedOpinion) {
@@ -1190,43 +1309,101 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         return;
       }
 
+      // ✅ FIXED: Get correct item type for the current cluster
+      const correctItemType = getCorrectItemType(selectedClusterId);
+
       console.log(
-        `🚀 [EntityWorkflow] Submitting edge review: ${edgeId} -> ${decision}`
+        `🚀 [EntityWorkflow] Submitting edge review: ${edgeId} -> ${decision} (audit mode: ${auditMode}, itemType: ${correctItemType})`
       );
 
-      // Set submission status
       setEdgeSubmissionStatus((prev) => ({
         ...prev,
         [edgeId]: { isSubmitting: true, error: null },
       }));
 
-      // 🔧 PHASE 1: Apply enhanced optimistic update with progress calculation
       const newStatus: BaseLink["status"] =
         decision === "ACCEPTED" ? "CONFIRMED_MATCH" : "CONFIRMED_NON_MATCH";
-
       const revertOptimisticUpdate = updateEdgeStatusOptimistically(
         selectedClusterId,
         edgeId,
         newStatus,
-        true // wasReviewed = true
+        true
       );
 
       try {
+        // 1. UNCHANGED: Submit traditional edge review
         const payload: EdgeReviewApiPayload = {
           decision: decision as "ACCEPTED" | "REJECTED",
           reviewerId: user.id,
           notes,
-          type: resolutionMode,
+          type: correctItemType, // ✅ FIXED: Use correct item type
           disconnectDependentServices: disconnectDependentServicesEnabled,
         };
 
         const response = await postEdgeReview(edgeId, payload, selectedOpinion);
-
         console.log(
-          `✅ [EntityWorkflow] Edge review submitted successfully: ${edgeId}`
+          `✅ [EntityWorkflow] Traditional edge review submitted: ${edgeId}`
         );
 
-        // Clear submission status on success
+        // 2. NEW: If in audit mode, auto-mark related decisions as reviewed
+        if (auditMode === "post_processing_audit") {
+          // ✅ FIXED: Use existing cluster-specific audit data, don't reload global data
+          const clusterAuditDecisions =
+            postProcessingAuditData?.data?.decisions?.filter(
+              (d) =>
+                d.clusterId === selectedClusterId &&
+                d.edgeId === edgeId &&
+                !d.reviewedByHuman
+            ) || [];
+
+          if (clusterAuditDecisions.length > 0) {
+            const decisionIds = clusterAuditDecisions.map((d) => d.id);
+            console.log(
+              `🔄 [EntityWorkflow] Auto-marking ${decisionIds.length} related audit decisions as reviewed`
+            );
+
+            await bulkMarkDecisionsReviewed(decisionIds, user.id);
+
+            console.log(
+              `✅ [EntityWorkflow] ${decisionIds.length} decisions marked as reviewed in backend`
+            );
+
+            // Only reload clusters data, not audit decisions
+            await loadClustersWithAuditData({
+              entityType: correctItemType, // ✅ FIXED: Use correct item type
+              postProcFilter: postProcessingFilter || undefined,
+              reviewedByHuman: false,
+              page: 1,
+              limit: 20,
+              workflowFilter: workflowFilter || undefined,
+            });
+
+            toast({
+              title: "Manual Review Submitted",
+              description: `Edge reviewed and ${clusterAuditDecisions.length} automated decisions marked as reviewed.`,
+            });
+          } else {
+            console.log(
+              `ℹ️ [EntityWorkflow] No unreviewed audit decisions found for edge ${edgeId} in cluster ${selectedClusterId}`
+            );
+            toast({
+              title: "Manual Review Submitted",
+              description: "Edge reviewed successfully.",
+            });
+          }
+        } else {
+          // Normal mode toast
+          if (
+            response.dependentServicesDisconnected &&
+            response.dependentServicesDisconnected > 0
+          ) {
+            toast({
+              title: "Review Submitted",
+              description: `Edge reviewed successfully. ${response.dependentServicesDisconnected} dependent service matches were also disconnected.`,
+            });
+          }
+        }
+
         setEdgeSubmissionStatus((prev) => ({
           ...prev,
           [edgeId]: { isSubmitting: false, error: null },
@@ -1234,30 +1411,35 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
         stateActions.setLastReviewedEdgeId(edgeId);
 
-        // Show additional feedback if dependent services were disconnected
-        if (
-          response.dependentServicesDisconnected &&
-          response.dependentServicesDisconnected > 0
-        ) {
-          toast({
-            title: "Review Submitted",
-            description: `Edge reviewed successfully. ${response.dependentServicesDisconnected} dependent service matches were also disconnected.`,
-          });
-        }
-
-        // 🔧 PHASE 1: Handle cluster finalization with optimistic update
+        // Handle cluster finalization
         if (response.clusterFinalized && selectedClusterId) {
           console.log(
             `🎉 [EntityWorkflow] Cluster ${selectedClusterId} finalized`
           );
           updateClusterCompletionOptimistically(selectedClusterId, true);
 
+          if (auditMode === "post_processing_audit") {
+            // Only reload clusters data for audit mode, not audit decisions
+            await loadClustersWithAuditData({
+              entityType: correctItemType, // ✅ FIXED: Use correct item type
+              postProcFilter: postProcessingFilter || undefined,
+              reviewedByHuman: false,
+              page: 1,
+              limit: 20,
+              workflowFilter: workflowFilter || undefined,
+            });
+          }
+
           if (isAutoAdvanceEnabled) {
             console.log(
               `🚀 [EntityWorkflow] Auto-advancing to next cluster after finalization`
             );
             setTimeout(() => {
-              advanceToNextCluster();
+              if (auditMode === "post_processing_audit") {
+                findNextAuditCluster();
+              } else {
+                advanceToNextCluster();
+              }
             }, 100);
           }
         } else {
@@ -1266,8 +1448,6 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
             selectNextUnreviewedEdge(edgeId);
           }, 100);
         }
-
-        // Note: We don't revert the optimistic update on success since the server confirmed it
       } catch (error) {
         const errorMessage =
           (error as Error).message || "An unknown error occurred.";
@@ -1276,7 +1456,6 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           error
         );
 
-        // 🔧 PHASE 1: Revert optimistic update on error (including progress)
         revertOptimisticUpdate();
 
         setEdgeSubmissionStatus((prev) => ({
@@ -1295,15 +1474,22 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       user,
       selectedClusterId,
       selectedOpinion,
-      resolutionMode,
+      auditMode,
+      postProcessingFilter,
+      postProcessingAuditData,
       toast,
       disconnectDependentServicesEnabled,
       stateActions,
-      updateEdgeStatusOptimistically, // 🔧 PHASE 1: Enhanced function
+      updateEdgeStatusOptimistically,
       updateClusterCompletionOptimistically,
+      bulkMarkDecisionsReviewed,
+      loadClustersWithAuditData,
       isAutoAdvanceEnabled,
+      findNextAuditCluster,
       advanceToNextCluster,
       selectNextUnreviewedEdge,
+      workflowFilter,
+      getCorrectItemType, // ✅ ADDED: Include the helper function
     ]
   );
 
@@ -1431,222 +1617,9 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   ]);
 
   // ========================================================================
-  // Large Cluster Paging Functions
-  // ========================================================================
-
-  const loadConnectionDataForLinkPage = useCallback(
-    async (
-      clusterId: string,
-      pageToLoad: number,
-      isPrefetch: boolean = false
-    ) => {
-      const viz = visualizationData[clusterId]?.data;
-      if (!viz || !viz.links) {
-        console.warn(
-          `🚫 [EntityWorkflow] loadConnectionDataForLinkPage: No visualization data or links for cluster ${clusterId}.`
-        );
-        if (!isPrefetch) stateActions.setIsLoadingConnectionPageData(false);
-        return;
-      }
-
-      if (!isPrefetch) {
-        stateActions.setIsLoadingConnectionPageData(true);
-      }
-
-      const startIndex = (pageToLoad - 1) * CONNECTION_PAGE_SIZE;
-      const endIndex = startIndex + CONNECTION_PAGE_SIZE;
-      const linksForPage = viz.links.slice(startIndex, endIndex);
-
-      if (linksForPage.length === 0) {
-        console.log(
-          `🚫 [EntityWorkflow] loadConnectionDataForLinkPage: No links for page ${pageToLoad} in cluster ${clusterId}.`
-        );
-        if (!isPrefetch) stateActions.setIsLoadingConnectionPageData(false);
-        return;
-      }
-
-      const connectionItemsToFetch = linksForPage
-        .map((link) => ({ edgeId: link.id, itemType: resolutionMode }))
-        .filter((item) => {
-          const connState = connectionData[item.edgeId];
-          return !connState || !connState.data || connState.error;
-        });
-
-      console.log(
-        `🔄 [EntityWorkflow] loadConnectionDataForLinkPage: Fetching connection data for ${connectionItemsToFetch.length} links on page ${pageToLoad} of cluster ${clusterId}. Prefetch: ${isPrefetch}`
-      );
-
-      if (connectionItemsToFetch.length > 0) {
-        try {
-          await loadBulkConnections(connectionItemsToFetch);
-        } catch (error) {
-          console.error(
-            `❌ [EntityWorkflow] Error loading connection data for page ${pageToLoad}, cluster ${clusterId}:`,
-            error
-          );
-          toast({
-            title: "Error Loading Connections",
-            description: (error as Error).message,
-            variant: "destructive",
-          });
-        }
-      }
-
-      if (!isPrefetch) {
-        stateActions.setIsLoadingConnectionPageData(false);
-        const totalLinks = viz.links.length;
-        if (endIndex < totalLinks) {
-          console.log(
-            `🔄 [EntityWorkflow] Prefetching connection data for page ${
-              pageToLoad + 1
-            } of cluster ${clusterId}`
-          );
-          loadConnectionDataForLinkPage(clusterId, pageToLoad + 1, true).catch(
-            (err) => {
-              console.warn(
-                `❌ [EntityWorkflow] Error prefetching connection data for page ${
-                  pageToLoad + 1
-                }:`,
-                err
-              );
-            }
-          );
-        }
-      }
-    },
-    [
-      visualizationData,
-      resolutionMode,
-      connectionData,
-      toast,
-      loadBulkConnections,
-      stateActions,
-    ]
-  );
-
-  const initializeLargeClusterConnectionPaging = useCallback(
-    async (clusterId: string) => {
-      console.log(
-        `🚀 [EntityWorkflow] Initializing connection paging for large cluster: ${clusterId}`
-      );
-      stateActions.setActivelyPagingClusterId(clusterId);
-      stateActions.setLargeClusterConnectionsPage(1);
-      stateActions.setIsLoadingConnectionPageData(true);
-
-      let viz = visualizationData[clusterId]?.data;
-      if (
-        !viz ||
-        visualizationData[clusterId]?.error ||
-        !visualizationData[clusterId]?.data?.links
-      ) {
-        console.log(
-          `🔄 [EntityWorkflow] Fetching/Re-fetching visualization data for large cluster ${clusterId} before paging connections.`
-        );
-        try {
-          await loadVisualizationDataForClusters([
-            { clusterId, itemType: resolutionMode },
-          ]);
-          viz = visualizationData[clusterId]?.data;
-          if (!viz || !viz.links)
-            throw new Error(
-              "Visualization data (with links) still not available after fetch."
-            );
-
-          const nodeIdsFromViz = viz.nodes.map((node) => ({
-            id: node.id,
-            nodeType: resolutionMode,
-          }));
-          if (nodeIdsFromViz.length > 0) {
-            await loadBulkNodeDetails(nodeIdsFromViz);
-          }
-        } catch (error) {
-          toast({
-            title: "Error Initializing Cluster",
-            description: `Failed to load visualization for ${clusterId}: ${
-              (error as Error).message
-            }`,
-            variant: "destructive",
-          });
-          stateActions.setIsLoadingConnectionPageData(false);
-          stateActions.setActivelyPagingClusterId(null);
-          stateActions.setLargeClusterConnectionsPage(0);
-          return;
-        }
-      } else {
-        const nodeIdsFromViz = viz.nodes.map((node) => ({
-          id: node.id,
-          nodeType: resolutionMode,
-        }));
-        if (nodeIdsFromViz.length > 0) {
-          await loadBulkNodeDetails(nodeIdsFromViz);
-        }
-      }
-
-      await loadConnectionDataForLinkPage(clusterId, 1, false);
-      setSelectedEdgeIdAction(null);
-    },
-    [
-      resolutionMode,
-      visualizationData,
-      toast,
-      loadConnectionDataForLinkPage,
-      loadBulkNodeDetails,
-      loadVisualizationDataForClusters,
-      setSelectedEdgeIdAction,
-      stateActions,
-    ]
-  );
-
-  const viewNextConnectionPage = useCallback(
-    async (clusterId: string) => {
-      if (clusterId !== activelyPagingClusterId) {
-        console.warn(
-          "🚫 [EntityWorkflow] viewNextConnectionPage called for a cluster that is not actively paging."
-        );
-        return;
-      }
-      const viz = visualizationData[clusterId]?.data;
-      if (!viz || !viz.links) {
-        console.warn(
-          "🚫 [EntityWorkflow] No visualization data to page for next connections."
-        );
-        return;
-      }
-      const totalLinks = viz.links.length;
-      const nextPage = largeClusterConnectionsPage + 1;
-      const startIndexForNextPage = (nextPage - 1) * CONNECTION_PAGE_SIZE;
-
-      if (startIndexForNextPage < totalLinks) {
-        console.log(
-          `🔄 [EntityWorkflow] Viewing next connection page ${nextPage} for cluster ${clusterId}`
-        );
-        stateActions.setLargeClusterConnectionsPage(nextPage);
-        setSelectedEdgeIdAction(null);
-        await loadConnectionDataForLinkPage(clusterId, nextPage, false);
-      } else {
-        toast({
-          title: "No More Connections",
-          description:
-            "You have reached the end of the connections for this cluster.",
-        });
-      }
-    },
-    [
-      activelyPagingClusterId,
-      largeClusterConnectionsPage,
-      visualizationData,
-      toast,
-      loadConnectionDataForLinkPage,
-      setSelectedEdgeIdAction,
-      stateActions,
-    ]
-  );
-
-  // ========================================================================
   // Effects
   // ========================================================================
 
-  // Load opinion preferences on opinion change
   useEffect(() => {
     if (selectedOpinion && user?.id) {
       console.log(
@@ -1668,10 +1641,8 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
             "❌ [EntityWorkflow] Failed to load opinion preferences:",
             error
           );
-          // Fallback to default (false) on error
           stateActions.setDisconnectDependentServicesEnabled(false);
 
-          // Only show toast for non-404 errors (404 means no preferences saved yet)
           if (
             !error.message?.includes("404") &&
             !error.message?.includes("Not found")
@@ -1684,12 +1655,16 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           }
         });
     } else if (!selectedOpinion) {
-      // No opinion selected, reset to default
       stateActions.setDisconnectDependentServicesEnabled(false);
     }
   }, [selectedOpinion, user?.id, toast, stateActions]);
 
-  // Effect to auto-select edge when visualization data loads
+  useEffect(() => {
+    if (auditMode === "post_processing_audit") {
+      initializeAuditMode();
+    }
+  }, [auditMode, initializeAuditMode]);
+
   useEffect(() => {
     if (
       selectedClusterId &&
@@ -1697,25 +1672,36 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       !selectedEdgeId
     ) {
       console.log(
-        `🔄 [EntityWorkflow] Cluster ${selectedClusterId} selected, (paged) viz data loaded, no edge selected. Evaluating next action using selectNextUnreviewedEdge.`
+        `🔄 [EntityWorkflow] Cluster ${selectedClusterId} selected, viz data loaded, no edge selected.`
       );
-      const justLoadedNewPageForLargeCluster =
-        selectedClusterId === activelyPagingClusterId &&
-        largeClusterConnectionsPage > 0 &&
-        !lastReviewedEdgeId;
 
-      if (
-        isAutoAdvanceEnabled ||
-        !lastReviewedEdgeId ||
-        justLoadedNewPageForLargeCluster
-      ) {
-        selectNextUnreviewedEdge();
+      if (auditMode === "post_processing_audit") {
+        // ✅ FIX: In audit mode, do NOT auto-advance - let users manually navigate
+        console.log(
+          `🛑 [EntityWorkflow] Audit mode: Skipping auto-advance, user should manually select connections`
+        );
+        return;
+      } else {
+        // Normal mode logic
+        const justLoadedNewPageForLargeCluster =
+          selectedClusterId === activelyPagingClusterId &&
+          largeClusterConnectionsPage > 0 &&
+          !lastReviewedEdgeId;
+
+        if (
+          isAutoAdvanceEnabled ||
+          !lastReviewedEdgeId ||
+          justLoadedNewPageForLargeCluster
+        ) {
+          selectNextUnreviewedEdge();
+        }
       }
     }
   }, [
     selectedClusterId,
     currentVisualizationData?.links?.length,
     selectedEdgeId,
+    auditMode,
     selectNextUnreviewedEdge,
     activelyPagingClusterId,
     largeClusterConnectionsPage,
@@ -1723,7 +1709,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     isAutoAdvanceEnabled,
   ]);
 
-  // Effect to auto-load connection data when edge is selected
+  // This effect is the safety net that ensures data is loaded for a selected edge if it wasn't pre-fetched.
   useEffect(() => {
     if (!selectedEdgeId) return;
 
@@ -1735,60 +1721,167 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
     if (needsLoad) {
       console.log(
-        `🔄 [EntityWorkflow] Auto-loading connection data for edge: ${selectedEdgeId}`
+        `🔄 [EntityWorkflow] Fallback: Auto-loading connection data for edge: ${selectedEdgeId}`
       );
-      // This would need to be handled by EntityDataContext
-      // For now, we'll use the data context's function
       data.loadSingleConnectionData(selectedEdgeId);
     }
-  }, [selectedEdgeId, connectionData, data]);
+  }, [selectedEdgeId, connectionData, data.loadSingleConnectionData]);
 
-  // Auto-select cluster when clusters load
+  // FIX: This new useEffect handles proactive pre-fetching of connection details.
   useEffect(() => {
-    if (!selectedClusterId && clusters.data.length > 0 && !clusters.loading) {
+    if (!selectedClusterId) return;
+
+    const vizState = visualizationData[selectedClusterId];
+    // Only run if we have links and are not in the middle of another operation
+    if (vizState?.data?.links && !state.isLoadingConnectionPageData) {
+      // ✅ FIXED: Get the correct item type for this cluster
+      const correctItemType = getCorrectItemType(selectedClusterId);
+
+      const unloadedConnectionItems = vizState.data.links
+        .filter((link: BaseLink) => {
+          const connState = connectionData[link.id];
+          // Check if data is missing and not already loading/in error state
+          const needsLoad =
+            !connState ||
+            (!connState.data && !connState.loading && !connState.error);
+          return needsLoad;
+        })
+        .map((link: BaseLink) => ({
+          edgeId: link.id,
+          itemType: correctItemType, // ✅ FIXED: Use correct item type
+        }));
+
+      if (unloadedConnectionItems.length > 0) {
+        console.log(
+          `🔄 [EntityWorkflow] Auto-pre-fetching ${unloadedConnectionItems.length} connection details for cluster ${selectedClusterId} with itemType: ${correctItemType}`
+        );
+        // Use a small timeout to batch requests if multiple updates happen quickly
+        const timer = setTimeout(() => {
+          loadBulkConnections(
+            unloadedConnectionItems,
+            workflowFilter === "cross-source-only"
+          );
+        }, 100);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [
+    selectedClusterId,
+    visualizationData, // This will trigger the effect when new links are loaded
+    connectionData, // To re-evaluate if something failed and needs a retry
+    getCorrectItemType, // ✅ ADDED: Include the helper function
+    workflowFilter,
+    loadBulkConnections,
+    state.isLoadingConnectionPageData,
+  ]);
+
+  useEffect(() => {
+    if (
+      auditMode === "post_processing_audit" &&
+      selectedClusterId &&
+      !postProcessingAuditData.loading &&
+      !isClustersWithAuditDataLoading()
+    ) {
+      const vizState = visualizationData[selectedClusterId];
+
+      if (
+        !vizState?.data ||
+        (!postProcessingAuditData.data && !postProcessingAuditData.loading)
+      ) {
+        console.log(
+          `🔄 [EntityWorkflow] Audit mode: ensuring rich data is loaded for cluster ${selectedClusterId}`
+        );
+
+        loadAuditClusterRichData(selectedClusterId);
+      }
+    }
+  }, [
+    auditMode,
+    selectedClusterId,
+    postProcessingAuditData.loading,
+    postProcessingAuditData.data,
+    visualizationData,
+    isClustersWithAuditDataLoading,
+    loadAuditClusterRichData,
+  ]);
+
+  useEffect(() => {
+    if (
+      auditMode === "normal" &&
+      !selectedClusterId &&
+      clusters.data.length > 0 &&
+      !clusters.loading
+    ) {
       const firstNonReviewedCluster = clusters.data.find((c) => !c.wasReviewed);
       if (firstNonReviewedCluster) {
         console.log(
           "🎯 [EntityWorkflow] Auto-selecting first unreviewed cluster:",
           firstNonReviewedCluster.id
         );
-        handleSetSelectedClusterId(firstNonReviewedCluster.id);
+        handleSetSelectedClusterId(firstNonReviewedCluster.id, false);
       } else if (clusters.data.length > 0) {
         const firstCluster = clusters.data[0];
         console.log(
           "🎯 [EntityWorkflow] All clusters on current page are reviewed. Auto-selecting first for viewing:",
           firstCluster.id
         );
-        handleSetSelectedClusterId(firstCluster.id);
-      } else if (clusters.total === 0) {
-        stateActions.setSelectedClusterId(null);
+        handleSetSelectedClusterId(firstCluster.id, false);
       }
-    } else if (
+    }
+
+    if (
+      auditMode === "post_processing_audit" &&
+      !isClustersWithAuditDataLoading() &&
+      !initialAuditSelectionDone.current
+    ) {
+      const auditClusters = clustersWithAuditData?.data?.clusters || [];
+      if (!selectedClusterId && auditClusters.length > 0) {
+        const firstUnreviewed =
+          auditClusters.find(
+            (c: { unreviewedDecisionsCount: number }) =>
+              c.unreviewedDecisionsCount > 0
+          ) || auditClusters[0];
+        if (firstUnreviewed) {
+          console.log(
+            `🎯 [EntityWorkflow] Auto-selecting first unreviewed audit cluster: ${firstUnreviewed.id}`
+          );
+          handleSetSelectedClusterId(firstUnreviewed.id, false);
+          initialAuditSelectionDone.current = true;
+        }
+      }
+    }
+
+    if (
+      auditMode === "normal" &&
       selectedClusterId &&
-      clusters.data.length === 0 &&
+      clusters.data.length > 0 &&
       !clusters.loading
     ) {
-      console.log(
-        "🎯 [EntityWorkflow] Current selected cluster no longer exists in an empty cluster list. Deselecting."
+      const selectedExists = clusters.data.some(
+        (c: { id: string }) => c.id === selectedClusterId
       );
-      stateActions.setSelectedClusterId(null);
+      if (!selectedExists) {
+        console.log(
+          "🎯 [EntityWorkflow] Current selected cluster no longer exists in list. Deselecting."
+        );
+        stateActions.setSelectedClusterId(null);
+      }
     }
   }, [
+    auditMode,
     selectedClusterId,
     clusters.data,
     clusters.loading,
-    clusters.total,
+    clustersWithAuditData,
+    isClustersWithAuditDataLoading,
     handleSetSelectedClusterId,
     stateActions,
   ]);
 
-  // Effect to handle workflow filter changes (Edge Case 1)
   useEffect(() => {
-    // Track filter changes
     if (lastWorkflowFilter !== workflowFilter) {
       setLastWorkflowFilter(workflowFilter);
 
-      // Check if current edge is still valid for the new filter
       if (selectedEdgeId && selectedClusterId) {
         const isValidForNewFilter = isCurrentEdgeValidForFilter(workflowFilter);
 
@@ -1797,22 +1890,17 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
             `🔍 [EntityWorkflow] Current edge ${selectedEdgeId} is not valid for filter ${workflowFilter}. Deselecting and finding next.`
           );
 
-          // Clear the current edge selection
           setSelectedEdgeIdAction(null);
 
-          // Trigger progress update by refreshing cluster progress
           data.loadClusterProgress(clusters.page, clusters.limit);
 
-          // Find next valid edge after a brief delay to allow progress update
           setTimeout(() => {
             selectNextUnreviewedEdge();
           }, 100);
         } else {
-          // Edge is still valid, but trigger progress update to refresh UI
           data.loadClusterProgress(clusters.page, clusters.limit);
         }
       } else {
-        // No edge selected, just update progress
         data.loadClusterProgress(clusters.page, clusters.limit);
       }
     }
@@ -1828,104 +1916,41 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     clusters,
   ]);
 
-  useEffect(() => {
-    if (
-      selectedClusterId &&
-      currentVisualizationData?.links &&
-      !selectedEdgeId
-    ) {
-      console.log(
-        `🔄 [EntityWorkflow] Cluster ${selectedClusterId} selected, viz data loaded, no edge selected.`
-      );
-
-      const justLoadedNewPageForLargeCluster =
-        selectedClusterId === activelyPagingClusterId &&
-        largeClusterConnectionsPage > 0 &&
-        !lastReviewedEdgeId;
-
-      const isRecentManualSelection =
-        manualClusterSelection.clusterId === selectedClusterId &&
-        Date.now() - manualClusterSelection.timestamp < 5000;
-
-      // 🔧 ENHANCED: More intelligent auto-advance logic
-      if (
-        isAutoAdvanceEnabled ||
-        !lastReviewedEdgeId ||
-        justLoadedNewPageForLargeCluster
-      ) {
-        // Check if there are any unreviewed edges in the current filter view
-        const hasUnreviewedInCurrentView = currentVisualizationData.links.some(
-          (link) => !isEdgeReviewed(link.id)
-        );
-
-        if (hasUnreviewedInCurrentView || isRecentManualSelection) {
-          selectNextUnreviewedEdge();
-        } else if (!isRecentManualSelection) {
-          // No unreviewed edges in current view and not a manual selection - advance
-          console.log(
-            `🚀 [EntityWorkflow] No unreviewed edges in current filter view for cluster ${selectedClusterId}. Auto-advancing.`
-          );
-          selectNextUnreviewedEdge();
-        } else {
-          // Recent manual selection with no unreviewed edges - don't advance
-          console.log(
-            `🚫 [EntityWorkflow] Recent manual selection of cluster ${selectedClusterId} with no unreviewed edges. Not auto-advancing.`
-          );
-        }
-      }
-    }
-  }, [
-    selectedClusterId,
-    currentVisualizationData?.links?.length,
-    selectedEdgeId,
-    selectNextUnreviewedEdge,
-    activelyPagingClusterId,
-    largeClusterConnectionsPage,
-    lastReviewedEdgeId,
-    isAutoAdvanceEnabled,
-    manualClusterSelection, // 🔧 NEW: Track manual selections
-    isEdgeReviewed,
-  ]);
-
   // ========================================================================
   // Context Value
   // ========================================================================
 
   const contextValue: EntityWorkflowContextType = {
-    // Computed progress
     clusterProgress,
     overallProgress,
     edgeSelectionInfo,
 
-    // Current computed data
     currentVisualizationData,
     currentConnectionData,
     selectedClusterDetails,
 
-    // Edge submission state
     edgeSubmissionStatus,
 
-    // Business actions
     selectNextUnreviewedEdge,
     selectPreviousUnreviewedInCluster,
     selectNextUnreviewedInCluster,
     advanceToNextCluster,
     checkAndAdvanceIfComplete,
 
-    // Review actions
+    initializeAuditMode,
+    findNextAuditCluster,
+    isClusterCompleteForAudit,
+    getAuditNavigationState,
+
     submitEdgeReview,
     enableDisconnectDependentServices,
 
-    // Large cluster paging
     initializeLargeClusterConnectionPaging,
-    viewNextConnectionPage,
-    loadConnectionDataForLinkPage,
+    loadMoreConnectionsForCluster,
 
-    // Enhanced selection actions
     handleSetSelectedClusterId,
     setSelectedEdgeIdAction,
 
-    // Progress queries
     getClusterProgress,
     getClusterProgressUnfiltered,
     getClusterProgressCrossSource,
@@ -1934,11 +1959,9 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     getEdgeStatus,
     getEdgeSubmissionStatus,
 
-    // 🔧 NEW: Filter-aware navigation helpers
     isClusterCompleteForCurrentFilter,
     findNextViableCluster,
 
-    // Cross-source detection
     isCrossSourceConnection,
   };
 
@@ -1969,9 +1992,6 @@ export function useEntityWorkflow(): EntityWorkflowContextType {
 // Utility Hooks
 // ============================================================================
 
-/**
- * Hook for components that only need progress data
- */
 export function useEntityProgress() {
   const {
     clusterProgress,
@@ -1990,9 +2010,6 @@ export function useEntityProgress() {
   };
 }
 
-/**
- * Hook for components that only need edge selection
- */
 export function useEdgeSelection() {
   const {
     edgeSelectionInfo,
@@ -2015,9 +2032,6 @@ export function useEdgeSelection() {
   };
 }
 
-/**
- * Hook for components that only need review actions
- */
 export function useEntityReview() {
   const {
     submitEdgeReview,
@@ -2034,9 +2048,6 @@ export function useEntityReview() {
   };
 }
 
-/**
- * Hook for components that need current data
- */
 export function useCurrentEntityData() {
   const {
     currentVisualizationData,
@@ -2048,5 +2059,21 @@ export function useCurrentEntityData() {
     currentVisualizationData,
     currentConnectionData,
     selectedClusterDetails,
+  };
+}
+
+export function useEntityAudit() {
+  const {
+    initializeAuditMode,
+    findNextAuditCluster,
+    isClusterCompleteForAudit,
+    getAuditNavigationState,
+  } = useEntityWorkflow();
+
+  return {
+    initializeAuditMode,
+    findNextAuditCluster,
+    isClusterCompleteForAudit,
+    getAuditNavigationState,
   };
 }

@@ -1,4 +1,5 @@
 // app/api/bulk-visualizations/route.ts
+
 import { NextRequest, NextResponse } from "next/server";
 import { fetchFromGateway, handleGatewayError } from '@/utils/gateway-client';
 import { requireTeamContext } from '@/utils/team-context';
@@ -10,9 +11,8 @@ export async function POST(request: NextRequest) {
   if (authResult instanceof NextResponse) return authResult;
   const { teamContext, user } = authResult;
 
-  // ✨ Extract the opinion name from the request header
   const opinionName = request.headers.get('X-Opinion-Name');
-  
+   
   console.log("Bulk Visualizations API: Request with opinion header:", opinionName);
 
   let payload: BulkVisualizationsRequest;
@@ -35,11 +35,22 @@ export async function POST(request: NextRequest) {
     if (!item.itemType || (item.itemType !== 'entity' && item.itemType !== 'service')) {
       return NextResponse.json({ error: "Each item must have a valid 'itemType' ('entity' or 'service')." }, { status: 400 });
     }
+    // NEW: Validate optional pagination and filter parameters
+    if (item.limit !== undefined && (typeof item.limit !== 'number' || !Number.isInteger(item.limit) || item.limit <= 0)) {
+        return NextResponse.json({ error: "If provided, 'limit' must be a positive integer." }, { status: 400 });
+    }
+    if (item.cursor !== undefined && typeof item.cursor !== 'string') {
+        return NextResponse.json({ error: "If provided, 'cursor' must be a string." }, { status: 400 });
+    }
+    if (item.crossSystemOnly !== undefined && typeof item.crossSystemOnly !== 'boolean') {
+        return NextResponse.json({ error: "If provided, 'crossSystemOnly' must be a boolean." }, { status: 400 });
+    }
   }
 
   console.log(`Fetching bulk visualization data for ${payload.items.length} items with opinion:`, opinionName || "default");
 
   try {
+    // The payload is passed directly to the gateway, which now understands the new fields.
     const gatewayResponse = await fetchFromGateway<BulkVisualizationsResponse>(
       `/bulk-visualizations`,
       {
@@ -49,8 +60,8 @@ export async function POST(request: NextRequest) {
           'Content-Type': 'application/json',
         },
       },
-      teamContext, // Pass team context
-      opinionName // ✨ Pass opinion name to gateway client
+      teamContext,
+      opinionName
     );
 
     return NextResponse.json(gatewayResponse);

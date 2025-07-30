@@ -1,7 +1,7 @@
-// components/cluster-selector.tsx - ENHANCED: Optimistic Progress Updates
+// components/cluster-selector.tsx - FIXED: Restore pagination visibility
 "use client";
 
-import { useCallback, useState, useEffect, Fragment, useRef } from "react";
+import { useCallback, useState, useEffect, Fragment } from "react";
 import { useEntityResolution } from "@/context/entity-resolution-context";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,7 @@ import {
   Layers,
   Info,
   Clock,
+  Bot,
 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -51,10 +52,10 @@ import {
   getOpinionPreferences,
   updateOpinionPreferences,
 } from "@/utils/api-client";
+import { formatDistanceToNow } from "date-fns";
 
 const LARGE_CLUSTER_THRESHOLD = 200;
 
-// Enhanced cluster list content component with optimistic progress display
 const ClusterListContent = ({
   page,
   loading,
@@ -78,13 +79,13 @@ const ClusterListContent = ({
   const handleClusterSelection = useCallback(
     async (clusterId: string) => {
       if (selectedClusterId !== clusterId) {
-        // Mark this as a manual selection
         actions.setSelectedClusterId(clusterId, true);
       } else if (!queries.isVisualizationDataLoaded(clusterId)) {
         const clusterDetail = queries.getClusterById(clusterId);
         const connectionCount = clusterDetail ? clusterDetail.groupCount : 0;
-        const isLarge = connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD;
-  
+        const isLarge =
+          connectionCount && connectionCount > LARGE_CLUSTER_THRESHOLD;
+
         if (!isLarge) {
           actions.invalidateVisualizationData(clusterId);
         }
@@ -100,98 +101,115 @@ const ClusterListContent = ({
     return "bg-green-500";
   };
 
-  const renderClusterProgressWithFilterInfo = (cluster: EntityCluster) => {
-    const currentProgress = queries.getClusterProgress(cluster.id);
-    const totalProgress = queries.getClusterProgressUnfiltered(cluster.id);
-    const crossSourceProgress = queries.getClusterProgressCrossSource(cluster.id);
-  
-    const isFiltered = workflowFilter === "cross-source-only";
-    const hasServerData = currentProgress.totalEdges !== -1;
-  
-    return (
-      <div className="mt-1">
-        <div className="flex justify-between text-xs mb-0.5 text-muted-foreground">
-          <div className="flex items-center gap-1">
-            <span>Review Progress</span>
-            {/* 🔧 NEW: Filter indicator */}
-            {isFiltered && crossSourceProgress.totalEdges === 0 && (
-              <Tooltip>
-                <TooltipTrigger>
-                  <Info className="h-3 w-3 text-amber-500" />
-                </TooltipTrigger>
-                <TooltipContent>
-                  <p>No cross-source connections in this cluster</p>
-                </TooltipContent>
-              </Tooltip>
-            )}
-          </div>
-          <span className="font-medium text-card-foreground">
-            {hasServerData
-              ? `${currentProgress.reviewedEdges} / ${currentProgress.totalEdges}`
-              : `${currentProgress.reviewedEdges} / ?`}
-            {isFiltered && crossSourceProgress.totalEdges === 0 && (
-              <span className="ml-1 text-amber-600">(filtered)</span>
-            )}
-          </span>
-        </div>
-  
-        <Progress
-          value={
-            currentProgress.progressPercentage === -1
-              ? 0
-              : currentProgress.progressPercentage
-          }
-          className={`h-1.5 ${
-            currentProgress.progressPercentage === -1
-              ? "bg-gray-200 [&>div]:bg-gray-400"
-              : isFiltered && crossSourceProgress.totalEdges === 0
-              ? "bg-amber-100 [&>div]:bg-amber-400" // Different color for filtered out
-              : ""
-          }`}
-        />
-  
-        {/* Rest of existing progress rendering logic */}
-        {hasServerData && (
-          <div className="mt-1 space-y-0.5">
-            <div className="flex justify-between text-xs text-muted-foreground">
-              <span>
-                {isFiltered ? "Cross-source decisions" : "All decisions"}
-              </span>
-              <span>
-                {currentProgress.confirmedMatches} ✓ /{" "}
-                {currentProgress.confirmedNonMatches} X
-              </span>
+  const renderClusterProgressWithFilterInfo = useCallback(
+    (cluster: EntityCluster) => {
+      const currentProgress = queries.getClusterProgress(cluster.id);
+      const totalProgress = queries.getClusterProgressUnfiltered(cluster.id);
+      const crossSourceProgress = queries.getClusterProgressCrossSource(
+        cluster.id
+      );
+
+      const isFiltered = workflowFilter === "cross-source-only";
+      const hasServerData = currentProgress.totalEdges !== -1;
+
+      return (
+        <div className="mt-1">
+          <div className="flex justify-between text-xs mb-0.5 text-muted-foreground">
+            <div className="flex items-center gap-1">
+              <span>Review Progress</span>
+              {isFiltered &&
+                crossSourceProgress.totalEdges === 0 &&
+                hasServerData && (
+                  <TooltipProvider key={`${cluster.id}-no-cross-source`}>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <Info className="h-3 w-3 text-amber-500" />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>No cross-source connections in this cluster</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
             </div>
-  
-            {isFiltered && crossSourceProgress.totalEdges === 0 && (
-              <div className="text-xs text-amber-600 bg-amber-50 px-2 py-1 rounded">
-                No cross-source connections to review
-              </div>
-            )}
-  
-            {isFiltered && totalProgress.totalEdges > currentProgress.totalEdges && (
-              <div className="flex justify-between text-xs text-muted-foreground/70">
-                <span>Total (all connections):</span>
-                <span>
-                  {totalProgress.reviewedEdges} / {totalProgress.totalEdges}
-                </span>
-              </div>
-            )}
-  
-            {!isFiltered && crossSourceProgress.totalEdges > 0 && (
-              <div className="flex justify-between text-xs text-muted-foreground/70">
-                <span>Cross-source available:</span>
-                <span>
-                  {crossSourceProgress.reviewedEdges} /{" "}
-                  {crossSourceProgress.totalEdges}
-                </span>
-              </div>
-            )}
+            <span className="font-medium text-card-foreground">
+              {hasServerData
+                ? `${currentProgress.reviewedEdges} / ${currentProgress.totalEdges}`
+                : `${currentProgress.reviewedEdges} / ?`}
+              {isFiltered &&
+                crossSourceProgress.totalEdges === 0 &&
+                hasServerData && (
+                  <span className="ml-1 text-amber-600">(filtered)</span>
+                )}
+            </span>
           </div>
-        )}
-      </div>
-    );
-  };
+
+          <Progress
+            value={
+              currentProgress.progressPercentage === -1
+                ? 0
+                : currentProgress.progressPercentage
+            }
+            className={`h-1.5 ${
+              currentProgress.progressPercentage === -1
+                ? "bg-gray-200 [&>div]:bg-gray-400"
+                : isFiltered &&
+                  crossSourceProgress.totalEdges === 0 &&
+                  hasServerData
+                ? "bg-amber-100 [&>div]:bg-amber-400"
+                : ""
+            }`}
+          />
+
+          {hasServerData && (
+            <div className="mt-1 space-y-0.5">
+              <div className="flex justify-between text-xs text-muted-foreground">
+                <span>
+                  {isFiltered ? "Cross-source decisions" : "All decisions"}
+                </span>
+                <span>
+                  {currentProgress.confirmedMatches} ✔ /{" "}
+                  {currentProgress.confirmedNonMatches} X
+                </span>
+              </div>
+
+              {isFiltered &&
+                crossSourceProgress.totalEdges === 0 &&
+                hasServerData && (
+                  <div className="text-xs text-amber-600 bg-amber-50 px-2 py-1 rounded">
+                    No cross-source connections to review
+                  </div>
+                )}
+
+              {isFiltered &&
+                hasServerData &&
+                totalProgress.totalEdges > currentProgress.totalEdges && (
+                  <div className="flex justify-between text-xs text-muted-foreground/70">
+                    <span>Total (all connections):</span>
+                    <span>
+                      {totalProgress.reviewedEdges} / {totalProgress.totalEdges}
+                    </span>
+                  </div>
+                )}
+
+              {!isFiltered &&
+                hasServerData &&
+                crossSourceProgress.totalEdges > 0 && (
+                  <div className="flex justify-between text-xs text-muted-foreground/70">
+                    <span>Cross-source available:</span>
+                    <span>
+                      {crossSourceProgress.reviewedEdges} /{" "}
+                      {crossSourceProgress.totalEdges}
+                    </span>
+                  </div>
+                )}
+            </div>
+          )}
+        </div>
+      );
+    },
+    [queries, workflowFilter]
+  );
 
   const entityLabel = resolutionMode === "entity" ? "Entities" : "Services";
   const groupLabel = "Potential Connections";
@@ -240,8 +258,6 @@ const ClusterListContent = ({
 
           const entityCount = cluster.entityCount;
           const groupCount = cluster.groupCount;
-
-          // 🔧 NEW: Determine processing state for enhanced styling
           const isProcessing = progress.isComplete && !cluster.wasReviewed;
 
           return (
@@ -251,7 +267,7 @@ const ClusterListContent = ({
                 isSelected
                   ? "ring-2 ring-primary border-primary shadow-md"
                   : isProcessing
-                  ? "border-blue-300 bg-blue-50" // Processing state styling
+                  ? "border-blue-300 bg-blue-50"
                   : "border-transparent hover:border-muted-foreground/30"
               }`}
               onClick={() => handleClusterSelection(cluster.id)}
@@ -334,7 +350,6 @@ const ClusterListContent = ({
 
                 {renderClusterProgressWithFilterInfo(cluster)}
 
-                {/* 🔧 ENHANCED: Completion status with processing state */}
                 {cluster.wasReviewed && (
                   <div className="flex items-center mt-1.5 text-green-600 text-xs font-medium">
                     <CheckCircle className="h-3.5 w-3.5 mr-1" />
@@ -342,7 +357,6 @@ const ClusterListContent = ({
                   </div>
                 )}
 
-                {/* 🔧 NEW: Processing indicator */}
                 {isProcessing && (
                   <div className="flex items-center mt-1.5 text-blue-600 text-xs font-medium">
                     <Clock className="h-3.5 w-3.5 mr-1 animate-pulse" />
@@ -358,7 +372,6 @@ const ClusterListContent = ({
   );
 };
 
-// Post Processing Filters Dialog Component (unchanged)
 const PostProcessingFiltersDialog = () => {
   const { disconnectDependentServicesEnabled, actions } = useEntityResolution();
   const { selectedOpinion } = useAuth();
@@ -370,18 +383,14 @@ const PostProcessingFiltersDialog = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingPreferences, setIsLoadingPreferences] = useState(false);
 
-  // Load current preferences when dialog opens
   useEffect(() => {
     if (isOpen && selectedOpinion) {
       setIsLoadingPreferences(true);
       getOpinionPreferences(selectedOpinion)
         .then((response) => {
-          console.log("Loaded preferences:", response);
           setTempEnabled(response.preferences.disconnectDependentServices);
         })
         .catch((error) => {
-          console.error("Failed to load preferences:", error);
-          setTempEnabled(disconnectDependentServicesEnabled);
           toast({
             title: "Warning",
             description:
@@ -415,31 +424,17 @@ const PostProcessingFiltersDialog = () => {
 
     setIsSubmitting(true);
     try {
-      console.log(
-        `Saving preference: disconnectDependentServices = ${tempEnabled} for opinion: ${selectedOpinion}`
-      );
-
       await updateOpinionPreferences(
-        {
-          disconnectDependentServices: tempEnabled,
-        },
+        { disconnectDependentServices: tempEnabled },
         selectedOpinion
       );
 
       actions.setDisconnectDependentServicesEnabled(tempEnabled);
 
       if (tempEnabled && !disconnectDependentServicesEnabled) {
-        console.log(
-          "Enabling dependent service disconnection - triggering bulk processing"
-        );
-
         try {
           await actions.enableDisconnectDependentServices();
         } catch (bulkError) {
-          console.error(
-            "Bulk processing failed, but preference was saved:",
-            bulkError
-          );
           toast({
             title: "Preference Saved with Warning",
             description:
@@ -456,13 +451,11 @@ const PostProcessingFiltersDialog = () => {
 
       setIsOpen(false);
     } catch (error) {
-      console.error("Failed to save preferences:", error);
       toast({
         title: "Error Saving Preferences",
         description: `Failed to save preferences: ${(error as Error).message}`,
         variant: "destructive",
       });
-
       setTempEnabled(disconnectDependentServicesEnabled);
     } finally {
       setIsSubmitting(false);
@@ -530,11 +523,7 @@ const PostProcessingFiltersDialog = () => {
                 id="disconnect-dependent"
                 checked={tempEnabled}
                 onCheckedChange={(checked) => {
-                  if (checked === "indeterminate") {
-                    setTempEnabled(false);
-                  } else {
-                    setTempEnabled(checked);
-                  }
+                  setTempEnabled(checked === true);
                 }}
                 disabled={isSubmitting || !selectedOpinion}
               />
@@ -555,61 +544,11 @@ const PostProcessingFiltersDialog = () => {
                     </span>
                   )}
                 </label>
-
-                {tempEnabled && !disconnectDependentServicesEnabled && (
-                  <div className="bg-amber-50 border border-amber-200 rounded-md p-3">
-                    <div className="flex items-start space-x-2">
-                      <AlertTriangle className="h-4 w-4 text-amber-600 mt-0.5 flex-shrink-0" />
-                      <div className="text-sm text-amber-800">
-                        <p className="font-medium mb-2">
-                          Important: This action processes historical data
-                        </p>
-                        <p className="mb-3">
-                          This setting will automatically disconnect service
-                          matches when you mark two entities as non-matches. It
-                          applies to all future decisions and will also process
-                          your existing review history for this opinion.
-                        </p>
-
-                        <p className="mb-3">
-                          <strong>How it works:</strong> When two organizations
-                          are marked as different entities, any service matches
-                          between those organizations will also be automatically
-                          marked as non-matches.
-                        </p>
-
-                        <p className="mb-3">
-                          <strong>Example:</strong> If you mark "Salvation Army
-                          - Seattle" and "Salvation Army - Bellevue" as
-                          different organizations, but want their identical
-                          "Coat Drive" services to remain matched, you should
-                          NOT enable this setting. However, if you want to
-                          reduce service management overhead by ensuring service
-                          matches are consistent with entity decisions, enable
-                          this setting.
-                        </p>
-
-                        <p className="text-xs text-amber-700">
-                          This setting will be saved for the current opinion:{" "}
-                          <strong>{selectedOpinion}</strong>
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
                 {!tempEnabled && (
                   <p className="text-sm text-muted-foreground">
                     When enabled, service matches will be automatically
                     disconnected when their parent entities are marked as
                     non-matches.
-                  </p>
-                )}
-
-                {!selectedOpinion && (
-                  <p className="text-sm text-destructive bg-destructive/10 p-2 rounded">
-                    You must select an opinion before configuring
-                    post-processing filters.
                   </p>
                 )}
               </div>
@@ -644,10 +583,8 @@ const PostProcessingFiltersDialog = () => {
   );
 };
 
-// Workflow Filter Component with enhanced descriptions
 const WorkflowFilterSelector = () => {
   const { workflowFilter, actions } = useEntityResolution();
-
   return (
     <div className="space-y-2">
       <div className="grid grid-cols-2 gap-2">
@@ -676,64 +613,248 @@ const WorkflowFilterSelector = () => {
   );
 };
 
-// Main ClusterSelector component with stable effects (unchanged from previous fix)
-export default function ClusterSelector() {
-  const { resolutionMode, clusterFilterStatus, clusters } =
+const AuditModeToggle = () => {
+  const { auditMode, clustersWithAuditData, actions } = useEntityResolution();
+  const unviewedCount =
+    clustersWithAuditData?.data?.auditCounts?.totalUnreviewed || 0;
+
+  return (
+    <div className="flex items-center gap-2">
+      <Button
+        variant={auditMode === "normal" ? "default" : "outline"}
+        onClick={() => actions.setAuditMode("normal")}
+        size="sm"
+        className="flex-1"
+      >
+        Manual Review
+      </Button>
+      <Button
+        variant={auditMode === "post_processing_audit" ? "default" : "outline"}
+        onClick={() => actions.setAuditMode("post_processing_audit")}
+        size="sm"
+        className="flex-1 relative"
+      >
+        <Bot className="h-3 w-3 mr-1" />
+        Audit Mode
+        {auditMode === "normal" && unviewedCount > 0 && (
+          <Badge
+            variant="destructive"
+            className="absolute -top-2 -right-2 h-5 min-w-5 p-0 text-xs flex items-center justify-center"
+          >
+            {unviewedCount}
+          </Badge>
+        )}
+      </Button>
+    </div>
+  );
+};
+
+const PostProcessingFilterSelector = () => {
+  const { postProcessingFilter, actions } = useEntityResolution();
+
+  return (
+    <div className="space-y-2">
+      <label className="text-sm font-medium">Audit Filter</label>
+      <div className="flex flex-col sm:flex-row gap-2">
+        <Button
+          variant={postProcessingFilter === null ? "default" : "outline"}
+          onClick={() => actions.setPostProcessingFilter(null)}
+          size="sm"
+          className="w-full flex-1"
+        >
+          All Decisions
+        </Button>
+        <Button
+          variant={
+            postProcessingFilter === "disconnectDependentServices"
+              ? "default"
+              : "outline"
+          }
+          onClick={() =>
+            actions.setPostProcessingFilter("disconnectDependentServices")
+          }
+          size="sm"
+          className="w-full flex-1"
+        >
+          Dependent Services
+        </Button>
+      </div>
+    </div>
+  );
+};
+
+const AuditClusterList = () => {
+  const { selectedClusterId, actions, queries } = useEntityResolution();
+  const { clustersWithAuditData, visualizationData, postProcessingAuditData } =
     useEntityResolution();
-  const { actions } = useEntityResolution();
+
+  const clusters = clustersWithAuditData?.data?.clusters || [];
+
+  return (
+    <div className="space-y-2">
+      {clusters.map((cluster) => {
+        const vizState = visualizationData[cluster.id];
+        const hasVizData = !!vizState?.data;
+        const isLoadingViz = !!vizState?.loading;
+
+        const clusterAuditDecisions =
+          postProcessingAuditData?.data?.decisions?.filter(
+            (d) => d.clusterId === cluster.id
+          ) || [];
+        const affectedEdgeCount = new Set(
+          clusterAuditDecisions.map((d) => d.edgeId)
+        ).size;
+
+        return (
+          <Card
+            key={cluster.id}
+            className={`cursor-pointer transition-colors hover:bg-accent ${
+              selectedClusterId === cluster.id ? "ring-2 ring-primary" : ""
+            }`}
+            onClick={() => actions.setSelectedClusterId(cluster.id)}
+          >
+            <CardContent className="p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Bot className="h-4 w-4 text-blue-600" />
+                  <span className="font-medium text-sm">
+                    {cluster.entityType === "entity" ? "Entity" : "Service"}{" "}
+                    Cluster
+                  </span>
+
+                  {isLoadingViz && (
+                    <div
+                      className="h-2 w-2 bg-blue-500 rounded-full animate-pulse"
+                      title="Loading visualization data"
+                    />
+                  )}
+                  {hasVizData && !isLoadingViz && (
+                    <div
+                      className="h-2 w-2 bg-green-500 rounded-full"
+                      title="Rich data loaded"
+                    />
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="text-xs">
+                    {cluster.unreviewedDecisionsCount} unreviewed
+                  </Badge>
+                </div>
+              </div>
+
+              {hasVizData && vizState.data && (
+                <div className="mt-2 text-xs text-muted-foreground">
+                  <div className="grid grid-cols-2 gap-2">
+                    <span>Affected Edges: {affectedEdgeCount}</span>
+                    <span>Total Decisions: {cluster.totalDecisionsCount}</span>
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-2 text-sm text-muted-foreground">
+                <div className="flex items-center gap-1">
+                  <Clock className="h-3 w-3" />
+                  <span className="text-xs">
+                    Updated:{" "}
+                    {formatDistanceToNow(new Date(cluster.lastDecisionAt))} ago
+                  </span>
+                </div>
+              </div>
+
+              {cluster.totalDecisionsCount > 0 && (
+                <div className="mt-2">
+                  <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                    <span>Review Progress</span>
+                    <span>
+                      {cluster.totalDecisionsCount -
+                        cluster.unreviewedDecisionsCount}{" "}
+                      / {cluster.totalDecisionsCount}
+                    </span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-1.5">
+                    <div
+                      className="bg-green-600 h-1.5 rounded-full transition-all duration-300"
+                      style={{
+                        width: `${Math.round(
+                          ((cluster.totalDecisionsCount -
+                            cluster.unreviewedDecisionsCount) /
+                            cluster.totalDecisionsCount) *
+                            100
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        );
+      })}
+    </div>
+  );
+};
+
+const AuditClusterSection = () => {
+  const { auditMode, clustersWithAuditData } = useEntityResolution();
+
+  if (auditMode !== "post_processing_audit") {
+    return null;
+  }
+
+  return (
+    <div className="space-y-4 flex flex-col flex-grow min-h-0">
+      <PostProcessingFilterSelector />
+
+      <div className="flex-grow overflow-y-auto pr-1 custom-scrollbar">
+        <AuditClusterList />
+      </div>
+
+      {clustersWithAuditData?.data?.auditCounts && (
+        <div className="text-xs text-muted-foreground bg-muted/50 p-2 rounded-lg mt-auto flex-shrink-0">
+          <div className="font-medium mb-1">Audit Summary:</div>
+          <div className="space-y-0.5">
+            <div>
+              Total unreviewed:{" "}
+              {clustersWithAuditData.data.auditCounts.totalUnreviewed}
+            </div>
+            <div>
+              Total reviewed:{" "}
+              {clustersWithAuditData.data.auditCounts.totalReviewed}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default function ClusterSelector() {
+  const { resolutionMode, clusterFilterStatus, auditMode, clusters, actions } =
+    useEntityResolution();
 
   const { page, total, limit, loading } = clusters;
   const [pageInput, setPageInput] = useState(page.toString());
   const totalPages = Math.ceil(total / limit);
 
-  const clusterFilterStatusRef = useRef(clusterFilterStatus);
-  clusterFilterStatusRef.current = clusterFilterStatus;
-
-  const actionsRef = useRef(actions);
-  actionsRef.current = actions;
-
-  const loadingRef = useRef<{
-    isInitialLoadDone: boolean;
-    lastFilterParams: string;
-  }>({
-    isInitialLoadDone: false,
-    lastFilterParams: "",
-  });
-
   useEffect(() => {
     setPageInput(page.toString());
   }, [page]);
 
-  // Stable effect that doesn't cause cascading loads
+  // Load clusters when filter parameters change (but not in audit mode)
   useEffect(() => {
-    const currentFilter = clusterFilterStatusRef.current;
-    const filterParams = `${resolutionMode}-${currentFilter}`;
-
-    if (
-      loadingRef.current.isInitialLoadDone &&
-      loadingRef.current.lastFilterParams === filterParams
-    ) {
-      console.log(
-        "🚫 [ClusterSelector] Skipping duplicate load for same filter params:",
-        filterParams
-      );
-      return;
+    if (auditMode === "post_processing_audit") {
+      return; // Skip in audit mode - data is loaded differently
     }
 
-    console.log(
-      "🔄 [ClusterSelector] Loading clusters for filter change:",
-      filterParams
-    );
+    console.log("🔄 [ClusterSelector] Loading clusters for filter change:", {
+      resolutionMode,
+      clusterFilterStatus,
+    });
 
-    loadingRef.current = {
-      isInitialLoadDone: true,
-      lastFilterParams: filterParams,
-    };
-
-    setTimeout(() => {
-      actionsRef.current.loadClusterProgress(1);
-    }, 50);
-  }, [clusterFilterStatus, resolutionMode]);
+    // Load first page when filters change
+    actions.loadClusterProgress(1);
+  }, [clusterFilterStatus, resolutionMode, auditMode]);
 
   const handleValueChange = (value: string) => {
     actions.setClusterFilterStatus(value as ClusterFilterStatus);
@@ -742,10 +863,11 @@ export default function ClusterSelector() {
   const handlePageChange = useCallback(
     (newPage: number) => {
       if (newPage >= 1 && newPage <= totalPages) {
+        console.log(`🔄 [ClusterSelector] Loading page ${newPage}`);
         actions.loadClusterProgress(newPage, limit);
       }
     },
-    [actions.loadClusterProgress, totalPages, limit]
+    [actions, totalPages, limit]
   );
 
   const handlePageInputSubmit = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -773,71 +895,97 @@ export default function ClusterSelector() {
         <h3 className="text-lg font-semibold text-card-foreground border-b pb-2">
           {resolutionMode === "entity" ? "Entity Clusters" : "Service Clusters"}
         </h3>
-        <WorkflowFilterSelector />
-        <ResolutionModeSwitcher />
+
+        {auditMode === "normal" && (
+          <>
+            <WorkflowFilterSelector />
+            <ResolutionModeSwitcher />
+          </>
+        )}
+
+        <AuditModeToggle />
+
         <PostProcessingFiltersDialog />
 
         <div className="flex flex-col flex-grow min-h-0">
-          <Tabs
-            value={clusterFilterStatus}
-            onValueChange={handleValueChange}
-            className="flex flex-col flex-grow min-h-0"
-          >
-            <TabsList className="grid w-full grid-cols-2 flex-shrink-0">
-              <TabsTrigger value="unreviewed">Unreviewed</TabsTrigger>
-              <TabsTrigger value="reviewed">Reviewed</TabsTrigger>
-            </TabsList>
-            <TabsContent
-              value="unreviewed"
-              className="flex-grow flex flex-col mt-2 min-h-0"
-            >
-              <ClusterListContent page={page} loading={loading} />
-            </TabsContent>
-            <TabsContent
-              value="reviewed"
-              className="flex-grow flex flex-col mt-2 min-h-0"
-            >
-              <ClusterListContent page={page} loading={loading} />
-            </TabsContent>
-          </Tabs>
-          {totalPages > 1 && (
-            <div className="flex justify-between items-center pt-3 border-t flex-shrink-0 min-h-0">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => handlePageChange(page - 1)}
-                disabled={page === 1 || loading}
-                className="text-xs"
+          {auditMode === "normal" ? (
+            <>
+              <Tabs
+                value={clusterFilterStatus}
+                onValueChange={handleValueChange}
+                className="flex flex-col flex-grow min-h-0"
               >
-                <ChevronLeft className="h-2 w-2 mr-0.5" />
-                Prev
-              </Button>
-              <div className="text-xs text-muted-foreground flex items-center gap-2">
-                Page
-                <Input
-                  type="number"
-                  value={pageInput}
-                  onChange={(e) => setPageInput(e.target.value)}
-                  onKeyDown={handlePageInputSubmit}
-                  onBlur={handleInputBlur}
-                  className="h-8 w-12 text-center"
-                  min="1"
-                  max={totalPages}
-                  disabled={loading}
-                />
-                of {totalPages}
+                <TabsList className="grid w-full grid-cols-2 flex-shrink-0">
+                  <TabsTrigger value="unreviewed">Unreviewed</TabsTrigger>
+                  <TabsTrigger value="reviewed">Reviewed</TabsTrigger>
+                </TabsList>
+                <TabsContent
+                  value="unreviewed"
+                  className="flex-grow flex flex-col mt-2 min-h-0"
+                >
+                  <ClusterListContent page={page} loading={loading} />
+                </TabsContent>
+                <TabsContent
+                  value="reviewed"
+                  className="flex-grow flex flex-col mt-2 min-h-0"
+                >
+                  <ClusterListContent page={page} loading={loading} />
+                </TabsContent>
+              </Tabs>
+
+              {/* ✅ FIX: Always show pagination section when conditions are met */}
+              <div className="flex justify-between items-center pt-3 border-t flex-shrink-0 mt-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handlePageChange(page - 1)}
+                  disabled={page === 1 || loading}
+                  className="text-xs"
+                >
+                  <ChevronLeft className="h-3 w-3 mr-1" />
+                  Prev
+                </Button>
+                <div className="text-xs text-muted-foreground flex items-center gap-2">
+                  Page
+                  <Input
+                    type="number"
+                    value={pageInput}
+                    onChange={(e) => setPageInput(e.target.value)}
+                    onKeyDown={handlePageInputSubmit}
+                    onBlur={handleInputBlur}
+                    className="h-8 w-12 text-center"
+                    min="1"
+                    max={totalPages}
+                    disabled={loading}
+                  />
+                  of {totalPages}
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handlePageChange(page + 1)}
+                  disabled={page >= totalPages || loading}
+                  className="text-xs"
+                >
+                  Next
+                  <ChevronRight className="h-3 w-3 ml-1" />
+                </Button>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => handlePageChange(page + 1)}
-                disabled={page >= totalPages || loading}
-                className="text-xs"
-              >
-                Next
-                <ChevronRight className="h-2 w-2 ml-0.5" />
-              </Button>
-            </div>
+              {/* ✅ DEBUG: Show pagination state information */}
+              {auditMode === "normal" && (
+                <div className="text-xs text-muted-foreground mt-2 p-2 bg-muted/30 rounded">
+                  <div>
+                    Debug: Page {page} of {totalPages} | Total: {total} | Limit:{" "}
+                    {limit}
+                  </div>
+                  <div>
+                    Audit Mode: {auditMode}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <AuditClusterSection />
           )}
         </div>
       </div>

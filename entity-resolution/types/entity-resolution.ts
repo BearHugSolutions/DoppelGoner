@@ -5,7 +5,7 @@
 |
 |   Description: Centralized TypeScript types for the application.
 |   - This file integrates new user/opinion types with the existing application types.
-|   - UPDATED: Added WorkflowFilter type for cross-source system filtering
+|   - UPDATED: Added types for paginated connection fetching.
 |
 ================================================================================
 */
@@ -41,7 +41,7 @@ export interface UpdateOpinionPreferencesRequest {
 export interface UpdateOpinionPreferencesResponse {
   message: string;
   preferences: OpinionPreferences;
-  opinionName: string;
+  opinionName:string;
 }
 
 // Represents the authenticated user, updated with opinions
@@ -127,13 +127,20 @@ export interface BulkConnectionRequestItem {
   itemType: ResolutionMode; // 'entity' or 'service'
 }
 
+// ✨ UPDATED with pagination and filtering fields
 export interface BulkConnectionsRequest {
   items: BulkConnectionRequestItem[];
+  limit?: number;
+  cursor?: string;
+  crossSystemOnly?: boolean; // Note: camelCase for JSON payload
 }
 
 export interface BulkVisualizationRequestItem {
   clusterId: string;
   itemType: ResolutionMode; // 'entity' or 'service'
+  limit?: number;
+  cursor?: string;
+  crossSystemOnly?: boolean;
 }
 
 export interface BulkVisualizationsRequest {
@@ -351,6 +358,23 @@ export interface BaseLink {
   wasReviewed?: boolean | null;
 }
 
+export interface PaginatedLinks<T> {
+  links: T[];
+  next_cursor: string | null;
+  has_more: boolean;
+}
+
+export interface VisualizationDataResponse {
+  clusterId: string;
+  nodes: BaseNode[];
+  links: PaginatedLinks<BaseLink>;
+  groups: EntityGroup[] | Record<string, any>;
+  totalConnections: number;
+  crossSystemConnections: number;
+}
+
+export type BulkVisualizationsResponse = VisualizationDataResponse[];
+
 export interface VisualizationEntityEdge {
   id: string;
   clusterId: string;
@@ -369,15 +393,6 @@ export interface VisualizationEntityEdge {
   wasReviewed?: boolean | null;
 }
 
-export interface VisualizationData {
-  clusterId: string;
-  nodes: BaseNode[];
-  links: BaseLink[];
-  groups: EntityGroup[] | Record<string, any>;
-}
-export type EntityVisualizationDataResponse = VisualizationData;
-export type BulkVisualizationsResponse = VisualizationData[];
-
 export interface EntityConnectionDataResponse {
   edge: VisualizationEntityEdge;
   entity1: Organization | Service;
@@ -388,13 +403,24 @@ export interface EntityConnectionDataResponse {
 }
 
 export type BulkConnectionResponseItem = EntityConnectionDataResponse;
+
+// ✨ NEW: The paginated response type for bulk connections
+export interface PaginatedBulkConnectionsResponse {
+  connections: EntityConnectionDataResponse[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+// The old response type is a simple array, preserved for compatibility.
 export type BulkConnectionsResponse = BulkConnectionResponseItem[];
+
 
 export function isEntityConnectionData(
   data: BulkConnectionResponseItem,
   mode?: ResolutionMode
 ): data is EntityConnectionDataResponse {
-  return "entity1" in data && "entityGroups" in data;
+  // This type guard checks if the object has the properties of EntityConnectionDataResponse
+  return "edge" in data && "entity1" in data && "entity2" in data && "entityGroups" in data;
 }
 
 // --- Review and Action Types ---
@@ -574,6 +600,29 @@ export interface NodeDetailResponse {
 }
 
 // --- UI State Management Types ---
+// This is the shape of the data stored in the context, not the direct API response.
+// The `links` array here will be the ACCUMULATED list of links.
+export interface VisualizationData {
+  clusterId: string;
+  nodes: BaseNode[];
+  links: BaseLink[];
+  groups: EntityGroup[] | Record<string, any>;
+  totalConnections: number | null;
+  crossSystemConnections: number | null;
+}
+
+// ✨ NEW: State slice for managing paginated bulk connection data
+export interface BulkConnectionDataState {
+  connections: Record<string, EntityConnectionDataResponse>; // Store by edge ID for easy access
+  connectionOrder: string[]; // Maintain the order of connections
+  isLoading: boolean;
+  isLoadingMore: boolean;
+  error: string | null;
+  nextCursor: string | null;
+  hasMore: boolean;
+  filter: WorkflowFilter;
+}
+
 export interface ClustersState {
   data: EntityCluster[];
   total: number;
@@ -584,10 +633,14 @@ export interface ClustersState {
 }
 
 export interface VisualizationState {
-  data: EntityVisualizationDataResponse | null;
+  data: VisualizationData | null;
   loading: boolean;
   error: string | null;
   lastUpdated: number | null;
+  // Pagination state
+  nextCursor: string | null;
+  hasMore: boolean;
+  isLoadingMore: boolean;
 }
 
 export interface ConnectionState {
@@ -606,9 +659,10 @@ export interface EdgeSelectionInfo {
   totalUnreviewedEdgesInCluster: number;
   currentUnreviewedEdgeIndexInCluster: number;
   totalEdgesInEntireCluster: number;
+  loadedLinksCount: number; // NEW: Track loaded links
+  totalConnectionsInFilter: number | null; // NEW: Track total connections for the current filter
 }
 
-// ✨ UPDATED: Entity Resolution Context Type with workflow filter support
 export interface EntityResolutionContextType {
   resolutionMode: ResolutionMode;
   selectedClusterId: string | null;
@@ -625,18 +679,15 @@ export interface EntityResolutionContextType {
   clusters: ClustersState;
   visualizationData: Record<string, VisualizationState>;
   connectionData: Record<string, ConnectionState>;
+  bulkConnectionData: BulkConnectionDataState; // ✨ NEW: State for paginated connections
   nodeDetails: Record<string, NodeDetailResponse | null | "loading" | "error">;
 
   clusterProgress: Record<string, ClusterReviewProgress>;
   edgeSelectionInfo: EdgeSelectionInfo;
 
-  currentVisualizationData: EntityVisualizationDataResponse | null;
+  currentVisualizationData: VisualizationData | null; // Note: this is the accumulated data
   currentConnectionData: EntityConnectionDataResponse | null;
   selectedClusterDetails: EntityCluster | null;
-
-  activelyPagingClusterId: string | null;
-  largeClusterConnectionsPage: number;
-  isLoadingConnectionPageData: boolean;
 
   actions: {
     setResolutionMode: (mode: ResolutionMode) => void;
@@ -675,12 +726,15 @@ export interface EntityResolutionContextType {
     setIsAutoAdvanceEnabled: (enabled: boolean) => void;
     selectPreviousUnreviewedInCluster: () => void;
     selectNextUnreviewedInCluster: () => void;
-    initializeLargeClusterConnectionPaging: (
-      clusterId: string
-    ) => Promise<void>;
-    viewNextConnectionPage: (clusterId: string) => Promise<void>;
-    getActivelyPagingClusterId: () => string | null;
-    getLargeClusterConnectionsPage: () => number;
+    
+    initializeLargeClusterConnectionPaging: (clusterId: string) => Promise<void>;
+    loadMoreConnectionsForCluster: (clusterId: string) => Promise<void>;
+    
+    // ✨ NEW: Actions for paginated bulk connections
+    loadInitialBulkConnections: (items: BulkConnectionRequestItem[], filter: WorkflowFilter) => Promise<void>;
+    loadMoreBulkConnections: () => Promise<void>;
+
+
     performThreeClusterCleanup: () => void;
     getCacheStats: () => any;
   };
@@ -704,5 +758,11 @@ export interface EntityResolutionContextType {
     getNodeDetail: (
       nodeId: string
     ) => NodeDetailResponse | null | "loading" | "error";
+    
+    getClusterPaginationState: (clusterId: string) => { 
+      hasMore: boolean; 
+      isLoadingMore: boolean; 
+      nextCursor: string | null 
+    };
   };
 }

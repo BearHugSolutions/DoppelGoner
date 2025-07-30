@@ -1,15 +1,15 @@
 /*
 ================================================================================
 |
-|   File: /context/entity-state-context.tsx - Phase 1: Core State Management
+|   File: /context/entity-state-context.tsx - ENHANCED: Complete Data Clearing
 |
-|   Description: Foundation context for Entity Resolution state management
-|   - Manages core selections (cluster, edge, mode)
-|   - Handles filters and preferences
-|   - Controls UI state and configuration
-|   - Provides foundation for EntityDataContext and EntityWorkflowContext
-|   - Clean, focused state management with clear responsibilities
-|   - 🔧 FIXED: Workflow filter changes no longer trigger unnecessary data clearing
+|   Description: Enhanced state management with comprehensive data clearing
+|   - Ensures complete data clearing on ALL mode switches
+|   - Consistent clearing behavior for workflowFilter, resolutionMode, auditMode
+|   - Eliminates stale data across all interface switches
+|   - 🔧 ENHANCED: setWorkflowFilter now clears ALL data like other switches
+|   - 🔧 ENHANCED: All switches call clearAllData explicitly
+|   - 🔧 FIX: Optimized selection setters to prevent unnecessary re-renders
 |
 ================================================================================
 */
@@ -20,6 +20,7 @@ import {
   ClusterFilterStatus,
   WorkflowFilter,
 } from "@/types/entity-resolution";
+import type { AuditMode } from "@/types/post-processing";
 import {
   createContext,
   useCallback,
@@ -27,6 +28,7 @@ import {
   useState,
   useEffect,
   useMemo,
+  useRef,
   type ReactNode,
 } from "react";
 import { useAuth } from "./auth-context";
@@ -36,6 +38,10 @@ import { useAuth } from "./auth-context";
 // ============================================================================
 
 export interface EntityStateContextType {
+  // 🆕 NEW: Audit-specific state
+  auditMode: AuditMode;
+  postProcessingFilter: string | null;
+  
   // Core selection state
   selectedClusterId: string | null;
   selectedEdgeId: string | null;
@@ -62,6 +68,10 @@ export interface EntityStateContextType {
 
   // Core actions
   actions: {
+    // 🆕 NEW: Audit actions
+    setAuditMode: (mode: AuditMode) => void;
+    setPostProcessingFilter: (filter: string | null) => void;
+    
     // Selection actions
     setSelectedClusterId: (id: string | null) => void;
     setSelectedEdgeId: (id: string | null) => void;
@@ -87,6 +97,9 @@ export interface EntityStateContextType {
     triggerRefresh: (target?: "all" | "clusters" | "current_visualization" | "current_connection") => void;
     clearSelections: () => void;
     resetUIState: () => void;
+    
+    // 🆕 NEW: Explicit data clearing action
+    triggerCompleteDataClear: () => void;
   };
 
   // Queries for derived state
@@ -94,6 +107,10 @@ export interface EntityStateContextType {
     hasValidSelection: () => boolean;
     isLargeClusterPaging: () => boolean;
     getCurrentPageInfo: () => { clusterId: string | null; page: number };
+    
+    // 🆕 NEW: Audit queries
+    isInAuditMode: () => boolean;
+    getAuditFilterDisplayName: () => string;
   };
 }
 
@@ -110,6 +127,10 @@ const EntityStateContext = createContext<EntityStateContextType | undefined>(
 // ============================================================================
 
 const DEFAULT_STATE = {
+  // 🆕 NEW: Audit defaults
+  auditMode: "normal" as AuditMode,
+  postProcessingFilter: null as string | null,
+  
   selectedClusterId: null as string | null,
   selectedEdgeId: null as string | null,
   resolutionMode: "entity" as ResolutionMode,
@@ -132,6 +153,15 @@ const DEFAULT_STATE = {
 
 export function EntityStateProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
+
+  // ========================================================================
+  // Audit State
+  // ========================================================================
+
+  const [auditMode, setAuditModeState] = useState<AuditMode>(DEFAULT_STATE.auditMode);
+  const [postProcessingFilter, setPostProcessingFilterState] = useState<string | null>(
+    DEFAULT_STATE.postProcessingFilter
+  );
 
   // ========================================================================
   // Core State
@@ -200,16 +230,23 @@ export function EntityStateProvider({ children }: { children: ReactNode }) {
     DEFAULT_STATE.refreshTrigger
   );
 
+  // 🆕 NEW: Special trigger for complete data clearing
+  const [completeDataClearTrigger, setCompleteDataClearTrigger] = useState<number>(0);
+
   // ========================================================================
-  // Smart Actions with Business Logic
+  // Ref for accessing clearAllData from EntityDataContext
+  // ========================================================================
+  
+  const clearAllDataRef = useRef<(() => void) | null>(null);
+
+  // ========================================================================
+  // 🔧 ENHANCED: Complete State Reset Function
   // ========================================================================
 
-  const setResolutionMode = useCallback((mode: ResolutionMode) => {
-    if (mode === resolutionMode) return;
+  const performCompleteStateReset = useCallback(() => {
+    console.log("🧹🧹🧹 [EntityState] PERFORMING COMPLETE STATE RESET 🧹🧹🧹");
     
-    console.log(`🔄 [EntityState] Switching resolution mode from ${resolutionMode} to ${mode}`);
-    
-    // Clear all selections when mode changes
+    // Clear all selections
     setSelectedClusterIdState(null);
     setSelectedEdgeIdState(null);
     setLastReviewedEdgeIdState(null);
@@ -221,55 +258,116 @@ export function EntityStateProvider({ children }: { children: ReactNode }) {
     setIsAutoAdvanceEnabledState(true);
     setIsReviewToolsMaximizedState(false);
     
-    // Update mode
-    setResolutionModeState(mode);
+    // Reset filter status to default for fresh start
+    setClusterFilterStatusState("unreviewed");
     
-    // Trigger refresh to reload data for new mode
-    setRefreshTriggerState(prev => prev + 1);
-  }, [resolutionMode]);
-
-  const setSelectedClusterId = useCallback((id: string | null) => {
-    if (id === selectedClusterId) return;
-    
-    console.log(`🎯 [EntityState] Setting selected cluster: ${id}`);
-    
-    // Clear edge selection when cluster changes
-    setSelectedEdgeIdState(null);
-    setLastReviewedEdgeIdState(null);
-    
-    // Clear paging state if not selecting the actively paging cluster
-    if (id !== activelyPagingClusterId) {
-      setActivelyPagingClusterIdState(null);
-      setLargeClusterConnectionsPageState(0);
-      setIsLoadingConnectionPageDataState(false);
+    // Call external data clearing if available
+    if (clearAllDataRef.current) {
+      console.log("🧹 [EntityState] Calling EntityDataContext.clearAllData()");
+      clearAllDataRef.current();
     }
     
-    setSelectedClusterIdState(id);
-  }, [selectedClusterId, activelyPagingClusterId]);
+    // Trigger a complete refresh
+    setRefreshTriggerState(prev => prev + 1);
+    setCompleteDataClearTrigger(prev => prev + 1);
+  }, []);
 
-  const setSelectedEdgeId = useCallback((id: string | null) => {
-    if (id === selectedEdgeId) return;
+  // ========================================================================
+  // 🔧 ENHANCED: Smart Actions with Complete Data Clearing
+  // ========================================================================
+
+  const setAuditMode = useCallback((mode: AuditMode) => {
+    if (mode === auditMode) return;
     
-    console.log(`🔗 [EntityState] Setting selected edge: ${id}`);
-    setSelectedEdgeIdState(id);
-  }, [selectedEdgeId]);
+    console.log(`🔄 [EntityState] Switching audit mode from ${auditMode} to ${mode} - CLEARING ALL DATA`);
+    
+    setAuditModeState(mode);
+    
+    // 🔧 ENHANCED: Perform complete state reset for audit mode switches
+    performCompleteStateReset();
+  }, [auditMode, performCompleteStateReset]);
 
+  const setPostProcessingFilter = useCallback((filter: string | null) => {
+    if (filter === postProcessingFilter) return;
+    
+    console.log(`🔍 [EntityState] Setting post-processing filter: ${filter} - CLEARING ALL DATA`);
+    setPostProcessingFilterState(filter);
+    
+    // 🔧 ENHANCED: Perform complete state reset for filter changes
+    performCompleteStateReset();
+  }, [postProcessingFilter, performCompleteStateReset]);
+
+  const setResolutionMode = useCallback((mode: ResolutionMode) => {
+    if (mode === resolutionMode) return;
+    
+    console.log(`🔄 [EntityState] Switching resolution mode from ${resolutionMode} to ${mode} - CLEARING ALL DATA`);
+    
+    setResolutionModeState(mode);
+    
+    // 🔧 ENHANCED: Perform complete state reset for resolution mode switches
+    performCompleteStateReset();
+  }, [resolutionMode, performCompleteStateReset]);
+
+  // 🔧 ENHANCED: setWorkflowFilter now clears ALL data like other switches
   const setWorkflowFilter = useCallback((filter: WorkflowFilter) => {
     if (filter === workflowFilter) return;
     
-    console.log(`🔍 [EntityState] Setting workflow filter: ${filter} - will validate current selection`);
+    console.log(`🔍 [EntityState] Setting workflow filter from ${workflowFilter} to ${filter} - CLEARING ALL DATA`);
     setWorkflowFilterState(filter);
     
-    // 🔧 NEW: Don't trigger full refresh, but do increment trigger for edge validation
-    // This allows EntityWorkflowContext to detect the filter change and validate current edge
-    setRefreshTriggerState(prev => prev + 1);
-  }, [workflowFilter]);
+    // 🔧 ENHANCED: Now performs complete state reset like other major switches
+    performCompleteStateReset();
+  }, [workflowFilter, performCompleteStateReset]);
+
+  const setSelectedClusterId = useCallback((id: string | null) => {
+    // 🔧 OPTIMIZATION: Use functional update to remove dependency on selectedClusterId
+    // This prevents the `actions` object from being recreated on every cluster selection.
+    setSelectedClusterIdState(currentId => {
+      if (id === currentId) return currentId;
+
+      console.log(`🎯 [EntityState] Setting selected cluster: ${id}`);
+
+      // Clear edge selection when cluster changes
+      setSelectedEdgeIdState(null);
+      setLastReviewedEdgeIdState(null);
+
+      // This part still needs activelyPagingClusterId, so it must remain a dependency.
+      if (id !== activelyPagingClusterId) {
+        setActivelyPagingClusterIdState(null);
+        setLargeClusterConnectionsPageState(0);
+        setIsLoadingConnectionPageDataState(false);
+      }
+      
+      return id;
+    });
+  }, [activelyPagingClusterId]);
+
+  const setSelectedEdgeId = useCallback((id: string | null) => {
+    // 🔧 FIX: Use functional update to remove dependency on selectedEdgeId.
+    // This prevents the `actions` object from being recreated on every edge selection,
+    // which was causing the useEffect for opinion-preferences to re-run unnecessarily.
+    setSelectedEdgeIdState(currentId => {
+      if (id === currentId) {
+        return currentId;
+      }
+      console.log(`🔗 [EntityState] Setting selected edge: ${id}`);
+      return id;
+    });
+  }, []); // No dependency
 
   const setClusterFilterStatus = useCallback((status: ClusterFilterStatus) => {
     if (status === clusterFilterStatus) return;
     
-    console.log(`📊 [EntityState] Setting cluster filter status: ${status}`);
+    console.log(`📊 [EntityState] Setting cluster filter status: ${status} - CLEARING CLUSTER DATA`);
     setClusterFilterStatusState(status);
+    
+    // Clear selections when filter changes (but not all data since this is just a view filter)
+    setSelectedClusterIdState(null);
+    setSelectedEdgeIdState(null);
+    setLastReviewedEdgeIdState(null);
+    setActivelyPagingClusterIdState(null);
+    setLargeClusterConnectionsPageState(0);
+    setIsLoadingConnectionPageDataState(false);
     
     // Trigger refresh to reload clusters with new filter
     setRefreshTriggerState(prev => prev + 1);
@@ -289,6 +387,12 @@ export function EntityStateProvider({ children }: { children: ReactNode }) {
     
     setRefreshTriggerState(prev => prev + 1);
   }, []);
+
+  // 🆕 NEW: Explicit complete data clear action
+  const triggerCompleteDataClear = useCallback(() => {
+    console.log("🧹 [EntityState] Explicit complete data clear requested");
+    performCompleteStateReset();
+  }, [performCompleteStateReset]);
 
   const clearSelections = useCallback(() => {
     console.log("🧹 [EntityState] Clearing all selections");
@@ -324,6 +428,10 @@ export function EntityStateProvider({ children }: { children: ReactNode }) {
   // ========================================================================
 
   const actions = useMemo(() => ({
+    // 🆕 NEW: Audit actions
+    setAuditMode,
+    setPostProcessingFilter,
+    
     // Selection actions
     setSelectedClusterId,
     setSelectedEdgeId,
@@ -349,7 +457,10 @@ export function EntityStateProvider({ children }: { children: ReactNode }) {
     triggerRefresh,
     clearSelections,
     resetUIState,
+    triggerCompleteDataClear,
   }), [
+    setAuditMode,
+    setPostProcessingFilter,
     setSelectedClusterId,
     setSelectedEdgeId,
     setResolutionMode,
@@ -358,6 +469,7 @@ export function EntityStateProvider({ children }: { children: ReactNode }) {
     triggerRefresh,
     clearSelections,
     resetUIState,
+    triggerCompleteDataClear,
   ]);
 
   // ========================================================================
@@ -375,13 +487,31 @@ export function EntityStateProvider({ children }: { children: ReactNode }) {
       clusterId: activelyPagingClusterId,
       page: largeClusterConnectionsPage,
     }),
-  }), [selectedClusterId, activelyPagingClusterId, largeClusterConnectionsPage]);
+    
+    // 🆕 NEW: Audit queries
+    isInAuditMode: () => auditMode === "post_processing_audit",
+    
+    getAuditFilterDisplayName: () => {
+      if (!postProcessingFilter) return "All Automated Decisions";
+      
+      switch (postProcessingFilter) {
+        case "disconnectDependentServices":
+          return "Disconnect Dependent Services";
+        default:
+          return postProcessingFilter;
+      }
+    },
+  }), [selectedClusterId, activelyPagingClusterId, largeClusterConnectionsPage, auditMode, postProcessingFilter]);
 
   // ========================================================================
   // Context Value
   // ========================================================================
 
   const contextValue: EntityStateContextType = {
+    // 🆕 NEW: Audit state
+    auditMode,
+    postProcessingFilter,
+    
     // Core selection state
     selectedClusterId,
     selectedEdgeId,
@@ -478,6 +608,27 @@ export function useEntityFilters() {
 }
 
 /**
+ * 🆕 NEW: Hook for components that only need audit state
+ */
+export function useEntityAudit() {
+  const {
+    auditMode,
+    postProcessingFilter,
+    actions: { setAuditMode, setPostProcessingFilter },
+    queries: { isInAuditMode, getAuditFilterDisplayName }
+  } = useEntityState();
+  
+  return {
+    auditMode,
+    postProcessingFilter,
+    setAuditMode,
+    setPostProcessingFilter,
+    isInAuditMode,
+    getAuditFilterDisplayName,
+  };
+}
+
+/**
  * Hook for components that only need UI state
  */
 export function useEntityUI() {
@@ -503,6 +654,11 @@ export function useEntityStateDebug() {
   
   const logCurrentState = useCallback(() => {
     console.group("🐛 [EntityState] Current State");
+    console.log("Audit:", {
+      mode: state.auditMode,
+      filter: state.postProcessingFilter,
+      isInAuditMode: state.queries.isInAuditMode(),
+    });
     console.log("Selection:", {
       clusterId: state.selectedClusterId,
       edgeId: state.selectedEdgeId,
@@ -525,4 +681,19 @@ export function useEntityStateDebug() {
   }, [state]);
   
   return { logCurrentState };
+}
+
+// ============================================================================
+// 🆕 NEW: Hook to register clearAllData function from EntityDataContext
+// ============================================================================
+
+export function useRegisterClearAllData(clearAllDataFn: () => void) {
+  const state = useEntityState();
+  
+  useEffect(() => {
+    // Register the clearAllData function from EntityDataContext
+    if (typeof clearAllDataFn === 'function') {
+      (state as any).clearAllDataRef = clearAllDataFn;
+    }
+  }, [clearAllDataFn, state]);
 }

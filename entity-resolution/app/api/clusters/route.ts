@@ -19,9 +19,11 @@ export async function GET(request: NextRequest) {
   const limit = searchParams.get("limit") || "10";
   const type = searchParams.get("type") || "entity";
   const review_status = searchParams.get("review_status") || "unreviewed";
+  const workflow_filter = searchParams.get("workflow_filter") || "all";
 
   console.log("Fetching clusters for type: ", type);
   console.log("Fetching clusters for review_status: ", review_status);
+  console.log("Fetching clusters for workflow_filter: ", workflow_filter);
   console.log("Using opinion: ", opinionName || "default");
 
   try {
@@ -34,6 +36,7 @@ export async function GET(request: NextRequest) {
           limit,
           type,
           review_status,
+          workflow_filter,
         },
       },
       teamContext, // Pass team context
