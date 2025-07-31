@@ -809,22 +809,6 @@ const AuditClusterSection = () => {
       <div className="flex-grow overflow-y-auto pr-1 custom-scrollbar">
         <AuditClusterList />
       </div>
-
-      {clustersWithAuditData?.data?.auditCounts && (
-        <div className="text-xs text-muted-foreground bg-muted/50 p-2 rounded-lg mt-auto flex-shrink-0">
-          <div className="font-medium mb-1">Audit Summary:</div>
-          <div className="space-y-0.5">
-            <div>
-              Total unreviewed:{" "}
-              {clustersWithAuditData.data.auditCounts.totalUnreviewed}
-            </div>
-            <div>
-              Total reviewed:{" "}
-              {clustersWithAuditData.data.auditCounts.totalReviewed}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };
@@ -971,18 +955,6 @@ export default function ClusterSelector() {
                   <ChevronRight className="h-3 w-3 ml-1" />
                 </Button>
               </div>
-              {/* ✅ DEBUG: Show pagination state information */}
-              {auditMode === "normal" && (
-                <div className="text-xs text-muted-foreground mt-2 p-2 bg-muted/30 rounded">
-                  <div>
-                    Debug: Page {page} of {totalPages} | Total: {total} | Limit:{" "}
-                    {limit}
-                  </div>
-                  <div>
-                    Audit Mode: {auditMode}
-                  </div>
-                </div>
-              )}
             </>
           ) : (
             <AuditClusterSection />

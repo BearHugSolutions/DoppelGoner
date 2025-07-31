@@ -232,6 +232,7 @@ export async function getPostProcessingAuditData(
 
     // ✅ FIX: Add response validation logging
     console.log(`[API_CLIENT] Audit data response received:`, {
+      decisions: result.decisions,
       decisionsCount: result.decisions?.length || 0,
       total: result.total,
       page: result.page,

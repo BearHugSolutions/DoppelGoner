@@ -1,6 +1,5 @@
-
-// In app/api/post-processing-audit/route.ts
-// Update the GET function to handle missing entity_type parameter
+// app/api/post-processing-audit/route.ts
+// FIXED: Properly pass query parameters to the Rust backend
 
 import { fetchFromGateway, handleGatewayError } from "@/utils/gateway-client";
 import { requireTeamContext } from "@/utils/team-context";
@@ -20,7 +19,7 @@ export async function GET(request: NextRequest) {
   // Extract query parameters
   const { searchParams } = new URL(request.url);
   const queryParams = {
-    entity_type: searchParams.get('entity_type'), // ✅ This can be null now
+    entity_type: searchParams.get('entity_type'),
     post_proc_filter: searchParams.get('post_proc_filter'),
     reviewed_by_human: searchParams.get('reviewed_by_human'),
     cluster_id: searchParams.get('cluster_id'),
@@ -46,17 +45,23 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    // 🔧 FIX: Build the URL with query parameters manually
+    let gatewayUrl = '/post-processing-audit';
+    if (Object.keys(filteredParams).length > 0) {
+      const queryString = new URLSearchParams(filteredParams).toString();
+      gatewayUrl = `${gatewayUrl}?${queryString}`;
+    }
+
+    console.log("[API_CLIENT] Gateway URL:", gatewayUrl);
+
     const gatewayResponse = await fetchFromGateway(
-      `/post-processing-audit`,
+      gatewayUrl,  // ← Now includes query parameters in the URL
       {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
         },
-        // Convert query params to URL search params
-        ...(Object.keys(filteredParams).length > 0 && {
-          searchParams: new URLSearchParams(filteredParams)
-        })
+        // Removed the searchParams property - not needed anymore
       },
       teamContext,
       opinionName

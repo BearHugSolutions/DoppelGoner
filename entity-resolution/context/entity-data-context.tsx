@@ -1799,7 +1799,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         );
         return null;
       }
-
+  
       if (auditMode === "post_processing_audit") {
         if (postProcessingAuditData.loading) {
           console.log(
@@ -1807,31 +1807,41 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           );
           return null;
         }
-
+  
         if (!postProcessingAuditData.data) {
           console.log(
             `🚫 [EntityData] No audit data available for cluster ${clusterId}`
           );
-          return null;
+          // If no audit data, return an empty graph structure
+          return {
+            ...vizState.data,
+            nodes: [],
+            links: [],
+          };
         }
-
+  
         const affectedEdgeIds = new Set(getAuditAffectedEdges(clusterId));
-
+  
         console.log(
           `🔍 [EntityData] Filtering audit visualization for cluster ${clusterId}: ${affectedEdgeIds.size} affected edges out of ${vizState.data.links.length} total links`
         );
-
+  
+        // If no affected edges are found for this cluster, return an empty graph.
         if (affectedEdgeIds.size === 0) {
           console.log(
-            `⚠️ [EntityData] No audit-affected edges for cluster ${clusterId} - this cluster may not have audit decisions`
+            `⚠️ [EntityData] No audit-affected edges for cluster ${clusterId} - returning an empty graph.`
           );
-          return vizState.data;
+          return {
+            ...vizState.data,
+            nodes: [],
+            links: [],
+          };
         }
-
+  
         const filteredLinks = vizState.data.links.filter((link) =>
           affectedEdgeIds.has(link.id)
         );
-
+  
         const connectedNodeIds = new Set<string>();
         filteredLinks.forEach((link) => {
           const sourceId =
@@ -1841,22 +1851,23 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           connectedNodeIds.add(sourceId);
           connectedNodeIds.add(targetId);
         });
-
+  
         const filteredNodes = vizState.data.nodes.filter((node) =>
           connectedNodeIds.has(node.id)
         );
-
+  
         console.log(
           `✅ [EntityData] Audit filtered visualization: ${filteredLinks.length}/${vizState.data.links.length} links, ${filteredNodes.length}/${vizState.data.nodes.length} nodes`
         );
-
+  
         return {
           ...vizState.data,
           links: filteredLinks,
           nodes: filteredNodes,
         };
       }
-
+  
+      // If not in audit mode, return the original data
       return vizState.data;
     },
     [
@@ -1866,6 +1877,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       getAuditAffectedEdges,
     ]
   );
+  
 
   const loadAuditClusterRichData = useCallback(
     async (clusterId: string) => {
