@@ -1331,12 +1331,13 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       );
 
       try {
-        // 1. UNCHANGED: Submit traditional edge review
+        // This function now only submits the traditional edge review.
+        // The second part of the dual action (bulk marking) is handled in the component.
         const payload: EdgeReviewApiPayload = {
           decision: decision as "ACCEPTED" | "REJECTED",
           reviewerId: user.id,
           notes,
-          type: correctItemType, // ✅ FIXED: Use correct item type
+          type: correctItemType,
           disconnectDependentServices: disconnectDependentServicesEnabled,
         };
 
@@ -1345,63 +1346,14 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           `✅ [EntityWorkflow] Traditional edge review submitted: ${edgeId}`
         );
 
-        // 2. NEW: If in audit mode, auto-mark related decisions as reviewed
-        if (auditMode === "post_processing_audit") {
-          // ✅ FIXED: Use existing cluster-specific audit data, don't reload global data
-          const clusterAuditDecisions =
-            postProcessingAuditData?.data?.decisions?.filter(
-              (d) =>
-                d.clusterId === selectedClusterId &&
-                d.edgeId === edgeId &&
-                !d.reviewedByHuman
-            ) || [];
-
-          if (clusterAuditDecisions.length > 0) {
-            const decisionIds = clusterAuditDecisions.map((d) => d.id);
-            console.log(
-              `🔄 [EntityWorkflow] Auto-marking ${decisionIds.length} related audit decisions as reviewed`
-            );
-
-            await bulkMarkDecisionsReviewed(decisionIds, user.id);
-
-            console.log(
-              `✅ [EntityWorkflow] ${decisionIds.length} decisions marked as reviewed in backend`
-            );
-
-            // Only reload clusters data, not audit decisions
-            await loadClustersWithAuditData({
-              entityType: correctItemType, // ✅ FIXED: Use correct item type
-              postProcFilter: postProcessingFilter || undefined,
-              reviewedByHuman: false,
-              page: 1,
-              limit: 20,
-              workflowFilter: workflowFilter || undefined,
-            });
-
-            toast({
-              title: "Manual Review Submitted",
-              description: `Edge reviewed and ${clusterAuditDecisions.length} automated decisions marked as reviewed.`,
-            });
-          } else {
-            console.log(
-              `ℹ️ [EntityWorkflow] No unreviewed audit decisions found for edge ${edgeId} in cluster ${selectedClusterId}`
-            );
-            toast({
-              title: "Manual Review Submitted",
-              description: "Edge reviewed successfully.",
-            });
-          }
-        } else {
-          // Normal mode toast
-          if (
-            response.dependentServicesDisconnected &&
-            response.dependentServicesDisconnected > 0
-          ) {
-            toast({
-              title: "Review Submitted",
-              description: `Edge reviewed successfully. ${response.dependentServicesDisconnected} dependent service matches were also disconnected.`,
-            });
-          }
+        if (
+          response.dependentServicesDisconnected &&
+          response.dependentServicesDisconnected > 0
+        ) {
+          toast({
+            title: "Review Submitted",
+            description: `Edge reviewed successfully. ${response.dependentServicesDisconnected} dependent service matches were also disconnected.`,
+          });
         }
 
         setEdgeSubmissionStatus((prev) => ({
@@ -1421,7 +1373,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           if (auditMode === "post_processing_audit") {
             // Only reload clusters data for audit mode, not audit decisions
             await loadClustersWithAuditData({
-              entityType: correctItemType, // ✅ FIXED: Use correct item type
+              entityType: correctItemType,
               postProcFilter: postProcessingFilter || undefined,
               reviewedByHuman: false,
               page: 1,
@@ -1476,20 +1428,18 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       selectedOpinion,
       auditMode,
       postProcessingFilter,
-      postProcessingAuditData,
       toast,
       disconnectDependentServicesEnabled,
       stateActions,
       updateEdgeStatusOptimistically,
       updateClusterCompletionOptimistically,
-      bulkMarkDecisionsReviewed,
       loadClustersWithAuditData,
       isAutoAdvanceEnabled,
       findNextAuditCluster,
       advanceToNextCluster,
       selectNextUnreviewedEdge,
       workflowFilter,
-      getCorrectItemType, // ✅ ADDED: Include the helper function
+      getCorrectItemType,
     ]
   );
 

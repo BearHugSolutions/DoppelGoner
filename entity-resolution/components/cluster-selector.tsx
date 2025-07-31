@@ -625,18 +625,18 @@ const AuditModeToggle = () => {
         variant={auditMode === "normal" ? "default" : "outline"}
         onClick={() => actions.setAuditMode("normal")}
         size="sm"
-        className="flex-1 justify-center text-xs h-auto py-2 px-2"
+        className="flex-1 justify-center text-xs h-auto py-2 px-2 truncate"
       >
-        <Hand className="h-3 w-3 mr-1" />
+        <Hand className="h-3 w-3 mr-1 hidden xl:block" />
         Manual Review
       </Button>
       <Button
         variant={auditMode === "post_processing_audit" ? "default" : "outline"}
         onClick={() => actions.setAuditMode("post_processing_audit")}
         size="sm"
-        className="flex-1 justify-center text-xs h-auto py-2 px-2"
+        className="flex-1 justify-center text-xs h-auto py-2 px-2 truncate"
       >
-        <Bot className="h-3 w-3 mr-1" />
+        <Bot className="h-3 w-3 mr-1 hidden xl:block" />
         Audit Mode
         {auditMode === "normal" && unviewedCount > 0 && (
           <Badge
@@ -662,7 +662,7 @@ const PostProcessingFilterSelector = () => {
           variant={postProcessingFilter === null ? "default" : "outline"}
           onClick={() => actions.setPostProcessingFilter(null)}
           size="sm"
-          className="flex-1 justify-center text-xs h-auto py-2 px-2"
+          className="flex-1 justify-center text-xs h-auto py-2 px-2 truncate"
         >
           All Decisions
         </Button>
@@ -676,7 +676,7 @@ const PostProcessingFilterSelector = () => {
             actions.setPostProcessingFilter("disconnectDependentServices")
           }
           size="sm"
-          className="flex-1 justify-center text-xs h-auto py-2 px-2"
+          className="flex-1 justify-center text-xs h-auto py-2 px-2 truncate"
         >
           Dependent Services
         </Button>

@@ -193,37 +193,21 @@ export default function ConnectionReviewTools() {
     return queries.findNextViableCluster(selectedClusterId || undefined);
   }, [selectedClusterId, queries]);
 
-  // FIX: This useEffect is redundant as the logic is (and should be) handled in the workflow context.
-  // By removing it, we eliminate the "duplicate request" logs and centralize data loading logic.
-  /*
-  useEffect(() => {
-    if (
-      selectedEdgeId &&
-      !currentConnectionData &&
-      !queries.isConnectionDataLoading(selectedEdgeId) &&
-      !isLoadingConnectionPageData
-    ) {
-      actions.loadSingleConnectionData(selectedEdgeId);
-    }
-  }, [
-    selectedEdgeId,
-    currentConnectionData,
-    queries,
-    actions,
-    isLoadingConnectionPageData,
-  ]);
-  */
-
   useEffect(() => {
     setShowOptimisticContinue(false);
   }, [selectedEdgeId]);
 
+  /**
+   * MODIFIED: This handler now explicitly performs the dual action for audit reviews.
+   * 1. It calls `submitEdgeReview` to record the manual decision.
+   * 2. If in audit mode, it then calls `bulkMarkDecisionsReviewed` for the related automated decisions.
+   */
   const handleReviewDecision = useCallback(
     async (decision: GroupReviewDecision) => {
-      if (!selectedEdgeId || !selectedClusterId) {
+      if (!selectedEdgeId || !selectedClusterId || !reviewerId) {
         toast({
           title: "Error",
-          description: "No connection or cluster selected.",
+          description: "No connection, cluster, or reviewer ID found.",
           variant: "destructive",
         });
         return;
@@ -266,21 +250,50 @@ export default function ConnectionReviewTools() {
       setShowOptimisticContinue(true);
 
       try {
+        // This now performs the dual action as requested
+        
+        // Action 1: Submit the traditional feedback
         await actions.submitEdgeReview(selectedEdgeId, decision);
 
-        if (isReReview) {
-          const reviewType = selectedClusterDetails?.wasReviewed
-            ? "finalized cluster"
-            : "connection";
-          toast({
-            title: "Decision Updated",
-            description: `Successfully changed decision to "${
-              decision === "ACCEPTED" ? "Match" : "Not a Match"
-            }" for ${reviewType}.`,
-          });
+        // Action 2: If in audit mode, also mark the underlying decisions as reviewed.
+        if (auditMode === 'post_processing_audit') {
+          const decisionsToMark = postProcessingAuditData?.data?.decisions?.filter(
+            d => d.edgeId === selectedEdgeId && !d.reviewedByHuman
+          );
+
+          if (decisionsToMark && decisionsToMark.length > 0) {
+            const decisionIds = decisionsToMark.map(d => d.id);
+            console.log(`[ConnectionReviewTools] Marking ${decisionIds.length} post-processing decisions as reviewed.`);
+            await actions.bulkMarkDecisionsReviewed(decisionIds, reviewerId);
+            toast({
+              title: "Review Submitted",
+              description: `Manual review recorded and ${decisionIds.length} automated decision(s) marked as reviewed.`,
+            });
+          } else {
+             toast({
+                title: "Decision Updated",
+                description: `Successfully changed decision to "${
+                  decision === "ACCEPTED" ? "Match" : "Not a Match"
+                }". No pending automated decisions to mark.`,
+              });
+          }
+        } else {
+            // Toast for non-audit mode
+            toast({
+              title: isReReview ? "Decision Updated" : "Review Submitted",
+              description: `Successfully recorded decision: "${
+                decision === "ACCEPTED" ? "Match" : "Not a Match"
+              }".`,
+            });
         }
       } catch (error) {
         setShowOptimisticContinue(false);
+        // The workflow context might also show a toast, but a specific one here is good.
+        toast({
+            title: "Error Submitting Review",
+            description: (error as Error).message || "An unknown error occurred.",
+            variant: "destructive",
+        });
       }
     },
     [
@@ -292,6 +305,10 @@ export default function ConnectionReviewTools() {
       selectedClusterDetails?.wasReviewed,
       actions,
       isSubmitting,
+      // Add new dependencies
+      auditMode,
+      postProcessingAuditData,
+      reviewerId,
     ]
   );
 
@@ -421,8 +438,7 @@ export default function ConnectionReviewTools() {
                 <Bot className="h-12 w-12 text-blue-600 mx-auto mb-4" />
                 <h4 className="font-medium mb-2">No Reviewable Audit Data</h4>
                 <p className="text-sm text-muted-foreground mb-4">
-                  All automated decisions have been reviewed or the clusters no
-                  longer contain active data.
+                  No clusters impacted by automated decisions remain unreviewed.
                 </p>
                 <Button
                   variant="outline"
