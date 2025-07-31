@@ -16,11 +16,10 @@ export default function ResolutionModeSwitcher() {
 
   return (
     <div className="flex flex-col sm:flex-row gap-2 w-full">
-      <div className="w-1/2">
         <Button
           variant={resolutionMode === "entity" ? "default" : "outline"}
           onClick={() => handleModeChange("entity")}
-          className="w-full flex items-center justify-center"
+          className="flex-1 justify-center text-xs h-auto py-2 px-2"
           size="sm"
         >
           <Building className="h-3 w-3 mr-0.5 flex-shrink-0" />
@@ -28,12 +27,10 @@ export default function ResolutionModeSwitcher() {
             Organization
           </span>
         </Button>
-      </div>
-      <div className="w-1/2">
         <Button
           variant={resolutionMode === "service" ? "default" : "outline"}
           onClick={() => handleModeChange("service")}
-          className="w-full flex items-center justify-center"
+          className="flex-1 justify-center text-xs h-auto py-2 px-2"
           size="sm"
         >
           <Users2 className="h-3 w-3 mr-0.5 flex-shrink-0" />
@@ -41,7 +38,6 @@ export default function ResolutionModeSwitcher() {
             Service
           </span>
         </Button>
-      </div>
     </div>
   );
 }

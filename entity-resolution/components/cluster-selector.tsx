@@ -29,6 +29,7 @@ import {
   Info,
   Clock,
   Bot,
+  Hand,
 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -484,7 +485,7 @@ const PostProcessingFiltersDialog = () => {
   return (
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
-        <Button variant="outline" size="sm" className="w-full flex py-2">
+        <Button variant="outline" size="sm" className="flex-1 justify-center text-xs h-auto py-2 px-2 max-h-10">
           <Filter className="h-4 w-4 mr-0.5" />
           Post Processing Filters
         </Button>
@@ -592,7 +593,7 @@ const WorkflowFilterSelector = () => {
           variant={workflowFilter === "all" ? "default" : "outline"}
           onClick={() => actions.setWorkflowFilter("all")}
           size="sm"
-          className="justify-center text-xs h-auto py-2 px-2"
+          className="flex-1 justify-center text-xs h-auto py-2 px-2"
         >
           <Layers className="h-3 w-2 mr-1" />
           <div className="text-left truncate">All Connections</div>
@@ -603,7 +604,7 @@ const WorkflowFilterSelector = () => {
           }
           onClick={() => actions.setWorkflowFilter("cross-source-only")}
           size="sm"
-          className="justify-center text-xs h-auto py-2 px-2 gap-0"
+          className="flex-1 justify-center text-xs h-auto py-2 px-2 gap-0"
         >
           <GitBranch className="h-3 w-2 mr-1" />
           <div className="text-left truncate">Cross-Source</div>
@@ -624,15 +625,16 @@ const AuditModeToggle = () => {
         variant={auditMode === "normal" ? "default" : "outline"}
         onClick={() => actions.setAuditMode("normal")}
         size="sm"
-        className="flex-1"
+        className="flex-1 justify-center text-xs h-auto py-2 px-2"
       >
+        <Hand className="h-3 w-3 mr-1" />
         Manual Review
       </Button>
       <Button
         variant={auditMode === "post_processing_audit" ? "default" : "outline"}
         onClick={() => actions.setAuditMode("post_processing_audit")}
         size="sm"
-        className="flex-1 relative"
+        className="flex-1 justify-center text-xs h-auto py-2 px-2"
       >
         <Bot className="h-3 w-3 mr-1" />
         Audit Mode
@@ -660,7 +662,7 @@ const PostProcessingFilterSelector = () => {
           variant={postProcessingFilter === null ? "default" : "outline"}
           onClick={() => actions.setPostProcessingFilter(null)}
           size="sm"
-          className="w-full flex-1"
+          className="flex-1 justify-center text-xs h-auto py-2 px-2"
         >
           All Decisions
         </Button>
@@ -674,7 +676,7 @@ const PostProcessingFilterSelector = () => {
             actions.setPostProcessingFilter("disconnectDependentServices")
           }
           size="sm"
-          className="w-full flex-1"
+          className="flex-1 justify-center text-xs h-auto py-2 px-2"
         >
           Dependent Services
         </Button>
