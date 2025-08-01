@@ -1,14 +1,13 @@
 /*
 ================================================================================
 |
-|   File: /context/entity-data-context.tsx - COMPLETE: Pagination + Enhanced Clearing
+|   File: /context/entity-data-context.tsx - STEP 2: AbortController Infrastructure
 |
-|   Description: Complete data management context with pagination and enhanced clearing
-|   - Manages fetching and caching of all entity resolution data
-|   - Implements cursor-based pagination for connection loading
-|   - Handles appending new links to existing visualization data
-|   - Enhanced data clearing integration with EntityStateContext
-|   - Comprehensive request management and optimization
+|   Description: Enhanced data management context with AbortController infrastructure
+|   - Added controller tracking and management utilities
+|   - Added request key generation helpers
+|   - Prepared infrastructure for gradual AbortController integration
+|   - Maintains existing request deduplication and functionality
 |
 ================================================================================
 */
@@ -181,6 +180,10 @@ export interface EntityDataContextType {
   performThreeClusterCleanup: (force?: boolean) => void;
   clearAllData: () => void;
 
+  // 🆕 NEW: AbortController management
+  cancelActiveRequests: (pattern?: string) => void;
+  cancelAllRequests: () => void;
+
   // Optimistic update functions
   updateEdgeStatusOptimistically: (
     clusterId: string,
@@ -300,6 +303,110 @@ const initialBulkConnectionDataState: BulkConnectionDataState = {
 };
 
 // ============================================================================
+// 🆕 NEW: AbortController Management Utilities
+// ============================================================================
+
+/**
+ * Generates a standardized request key for controller tracking
+ */
+function generateRequestKey(
+  operation: string,
+  params: Record<string, any> = {},
+  opinion?: string
+): string {
+  const paramString = Object.entries(params)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}:${JSON.stringify(value)}`)
+    .join(",");
+
+  const opinionSuffix = opinion ? `-${opinion}` : "";
+  return `${operation}-${paramString}${opinionSuffix}`;
+}
+
+/**
+ * Generates a request key for cluster progress requests
+ */
+function generateClusterProgressKey(
+  page: number,
+  limit: number,
+  filterStatus: string,
+  workflowFilter: string,
+  mode: string,
+  opinion?: string
+): string {
+  return generateRequestKey(
+    "cluster-progress",
+    { page, limit, filterStatus, workflowFilter, mode },
+    opinion
+  );
+}
+
+/**
+ * Generates a request key for visualization requests
+ */
+function generateVisualizationKey(
+  items: BulkVisualizationRequestItem[],
+  opinion?: string
+): string {
+  const itemKeys = items
+    .map(
+      (item) =>
+        `${item.clusterId}-${item.itemType}-${item.cursor || "initial"}-${
+          item.crossSystemOnly || false
+        }`
+    )
+    .sort()
+    .join(",");
+
+  return generateRequestKey("visualization", { items: itemKeys }, opinion);
+}
+
+/**
+ * Generates a request key for audit data requests
+ */
+function generateAuditDataKey(
+  params: PostProcessingAuditParams,
+  opinion?: string
+): string {
+  return generateRequestKey("audit-data", params, opinion);
+}
+
+/**
+ * Generates a request key for connection requests
+ */
+function generateConnectionKey(
+  items: BulkConnectionRequestItem[],
+  crossSystemOnly: boolean,
+  opinion?: string
+): string {
+  const itemKeys = items
+    .map((item) => `${item.edgeId}-${item.itemType}`)
+    .sort()
+    .join(",");
+
+  return generateRequestKey(
+    "connections",
+    { items: itemKeys, crossSystemOnly },
+    opinion
+  );
+}
+
+/**
+ * Generates a request key for node details requests
+ */
+function generateNodeDetailsKey(
+  nodes: NodeIdentifier[],
+  opinion?: string
+): string {
+  const nodeKeys = nodes
+    .map((node) => `${node.id}-${node.nodeType}`)
+    .sort()
+    .join(",");
+
+  return generateRequestKey("node-details", { nodes: nodeKeys }, opinion);
+}
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 
@@ -310,7 +417,7 @@ function uniqueBy<T>(items: T[], keySelector: (item: T) => string): T[] {
 }
 
 // ============================================================================
-// Provider Component - Enhanced with Complete Clearing and Pagination
+// Provider Component - Enhanced with AbortController Infrastructure
 // ============================================================================
 
 export function EntityDataProvider({ children }: { children: ReactNode }) {
@@ -376,10 +483,15 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     });
 
   // ========================================================================
-  // Request Management Refs
+  // 🆕 NEW: AbortController Management Refs
   // ========================================================================
 
+  // Existing request tracking (maintained for compatibility)
   const activeRequestsRef = useRef<Set<string>>(new Set());
+
+  // 🆕 NEW: AbortController tracking
+  const activeControllersRef = useRef<Map<string, AbortController>>(new Map());
+
   const lastRequestTimeRef = useRef<number>(0);
   const cleanupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastCleanupStateRef = useRef<string>("");
@@ -411,6 +523,180 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
   // Track last clear trigger to prevent redundant clearing
   const lastClearTriggerRef = useRef<number>(0);
 
+  const clearAllDataRef = useRef<(() => void) | null>(null);
+  const cancelAllRequestsRef = useRef<((pattern?: string) => void) | null>(
+    null
+  );
+
+  // ========================================================================
+  // 🆕 NEW: AbortController Management Functions
+  // ========================================================================
+
+  /**
+   * Creates and tracks an AbortController for a request
+   */
+  const createControllerForRequest = useCallback(
+    (requestKey: string): AbortController => {
+      // Cancel any existing controller for this request key
+      const existingController = activeControllersRef.current.get(requestKey);
+      if (existingController && !existingController.signal.aborted) {
+        console.log(
+          `🛑 [EntityData] Replacing active controller: ${requestKey}`
+        );
+        existingController.abort();
+      }
+
+      // Create new controller with enhanced error handling
+      const controller = new AbortController();
+
+      // Add automatic cleanup when aborted
+      controller.signal.addEventListener(
+        "abort",
+        () => {
+          // Schedule cleanup with a small delay to avoid race conditions
+          setTimeout(() => {
+            if (activeControllersRef.current.get(requestKey) === controller) {
+              activeControllersRef.current.delete(requestKey);
+            }
+          }, 100);
+        },
+        { once: true }
+      );
+
+      activeControllersRef.current.set(requestKey, controller);
+      console.log(`🎯 [EntityData] Created controller: ${requestKey}`);
+
+      return controller;
+    },
+    []
+  );
+
+  /**
+   * Cancels a specific request by key
+   */
+  const cancelController = useCallback((requestKey: string): void => {
+    const controller = activeControllersRef.current.get(requestKey);
+    if (controller) {
+      console.log(`🛑 [EntityData] Cancelling request: ${requestKey}`);
+      controller.abort();
+      activeControllersRef.current.delete(requestKey);
+    }
+  }, []);
+
+  /**
+   * Cleanup completed/aborted controllers
+   */
+  const cleanupCompletedControllers = useCallback((): void => {
+    const toRemove: string[] = [];
+    let activeCount = 0;
+    let abortedCount = 0;
+
+    for (const [requestKey, controller] of activeControllersRef.current) {
+      if (controller.signal.aborted) {
+        toRemove.push(requestKey);
+        abortedCount++;
+      } else {
+        activeCount++;
+      }
+    }
+
+    if (toRemove.length > 0) {
+      toRemove.forEach((requestKey) => {
+        activeControllersRef.current.delete(requestKey);
+      });
+      console.log(
+        `🧹 [EntityData] Cleaned ${toRemove.length} completed controllers (${activeCount} active, ${abortedCount} cleaned)`
+      );
+    }
+  }, []);
+
+  /**
+   * Cancels all active requests matching a pattern
+   */
+  const cancelActiveRequests = useCallback(
+    (pattern?: string): void => {
+      const controllersToCancel: [string, AbortController][] = [];
+
+      for (const [requestKey, controller] of activeControllersRef.current) {
+        if (
+          !controller.signal.aborted &&
+          (!pattern || requestKey.includes(pattern))
+        ) {
+          controllersToCancel.push([requestKey, controller]);
+        }
+      }
+
+      if (controllersToCancel.length > 0) {
+        console.log(
+          `🛑 [EntityData] Cancelling ${controllersToCancel.length} requests${
+            pattern ? ` matching "${pattern}"` : ""
+          }`
+        );
+
+        controllersToCancel.forEach(([requestKey, controller]) => {
+          try {
+            controller.abort();
+          } catch (error) {
+            console.warn(
+              `⚠️ [EntityData] Error aborting controller ${requestKey}:`,
+              error
+            );
+          }
+        });
+
+        // Schedule cleanup
+        setTimeout(cleanupCompletedControllers, 50);
+      }
+    },
+    [cleanupCompletedControllers]
+  );
+  /**
+   * Cancels all active controllers
+   */
+  const cancelAllControllers = useCallback((): void => {
+    const activeCount = activeControllersRef.current.size;
+    if (activeCount > 0) {
+      console.log(
+        `🛑 [EntityData] Cancelling all ${activeCount} active requests`
+      );
+
+      for (const [requestKey, controller] of activeControllersRef.current) {
+        controller.abort();
+      }
+
+      activeControllersRef.current.clear();
+    }
+  }, []);
+
+  /**
+   * Cancels all active requests (public API)
+   */
+  const cancelAllRequests = useCallback((): void => {
+    cancelAllControllers();
+  }, [cancelAllControllers]);
+
+  // ========================================================================
+  // Request Management Functions (Enhanced)
+  // ========================================================================
+
+  const isRequestInProgress = useCallback((requestKey: string): boolean => {
+    return activeRequestsRef.current.has(requestKey);
+  }, []);
+
+  const addActiveRequest = useCallback((requestKey: string) => {
+    activeRequestsRef.current.add(requestKey);
+  }, []);
+
+  const removeActiveRequest = useCallback((requestKey: string) => {
+    activeRequestsRef.current.delete(requestKey);
+
+    // Also clean up the controller if it exists
+    const controller = activeControllersRef.current.get(requestKey);
+    if (controller) {
+      activeControllersRef.current.delete(requestKey);
+    }
+  }, []);
+
   // ========================================================================
   // ENHANCED: Complete Data Clearing Function
   // ========================================================================
@@ -425,33 +711,69 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     }
 
     lastClearTriggerRef.current = currentTime;
-
     console.log("🧹🧹🧹 [EntityData] PERFORMING COMPLETE DATA CLEARING 🧹🧹🧹");
 
-    // Clear all data states
-    setClusters(initialClustersState);
-    setVisualizationData({});
-    setConnectionData({});
-    setNodeDetails({});
-    setPendingNodeFetches(new Set());
-    setServerProgress({});
-    setOverallServerProgress(null);
+    // Step 1: Cancel all active requests with comprehensive error handling
+    try {
+      const activeCount = activeControllersRef.current.size;
+      if (activeCount > 0) {
+        console.log(
+          `🛑 [EntityData] Cancelling ${activeCount} active requests`
+        );
 
-    // Clear audit data
-    setPostProcessingAuditData({
-      data: null,
-      loading: false,
-      error: null,
-      lastUpdated: null,
-    });
-    setClustersWithAuditData({
-      data: null,
-      loading: false,
-      error: null,
-      lastUpdated: null,
-    });
+        for (const [requestKey, controller] of activeControllersRef.current) {
+          try {
+            if (!controller.signal.aborted) {
+              controller.abort();
+            }
+          } catch (error) {
+            console.warn(
+              `⚠️ [EntityData] Error aborting controller ${requestKey}:`,
+              error
+            );
+          }
+        }
 
-    // Clear all active requests
+        activeControllersRef.current.clear();
+      }
+    } catch (error) {
+      console.error(
+        "❌ [EntityData] Error during request cancellation:",
+        error
+      );
+    }
+
+    // Step 2: Clear all data states
+    try {
+      setClusters(initialClustersState);
+      setVisualizationData({});
+      setConnectionData({});
+      setNodeDetails({});
+      setPendingNodeFetches(new Set());
+      setServerProgress({});
+      setOverallServerProgress(null);
+
+      // Clear audit data
+      setPostProcessingAuditData({
+        data: null,
+        loading: false,
+        error: null,
+        lastUpdated: null,
+      });
+      setClustersWithAuditData({
+        data: null,
+        loading: false,
+        error: null,
+        lastUpdated: null,
+      });
+
+      // Clear bulk connection data
+      setBulkConnectionData(initialBulkConnectionDataState);
+    } catch (error) {
+      console.error("❌ [EntityData] Error during state clearing:", error);
+    }
+
+    // Step 3: Reset tracking variables
     activeRequestsRef.current.clear();
     lastRequestTimeRef.current = 0;
 
@@ -473,6 +795,24 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     console.log("✅ [EntityData] Complete data clearing finished");
   }, []);
 
+  const registerClearAllData = useCallback((clearAllDataFn: () => void) => {
+    console.log(
+      "📝 [EntityState] Registering clearAllData function from EntityDataContext"
+    );
+    clearAllDataRef.current = clearAllDataFn;
+  }, []);
+
+  // Function to register the cancelAllRequests function from EntityDataContext
+  const registerCancelAllRequests = useCallback(
+    (cancelAllRequestsFn: (pattern?: string) => void) => {
+      console.log(
+        "📝 [EntityState] Registering cancelAllRequests function from EntityDataContext"
+      );
+      cancelAllRequestsRef.current = cancelAllRequestsFn;
+    },
+    []
+  );
+
   // ========================================================================
   // NEW: Register clearAllData with EntityStateContext
   // ========================================================================
@@ -485,23 +825,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
   }, [clearAllData, state]);
 
   // ========================================================================
-  // Request Management Functions
-  // ========================================================================
-
-  const isRequestInProgress = useCallback((requestKey: string): boolean => {
-    return activeRequestsRef.current.has(requestKey);
-  }, []);
-
-  const addActiveRequest = useCallback((requestKey: string) => {
-    activeRequestsRef.current.add(requestKey);
-  }, []);
-
-  const removeActiveRequest = useCallback((requestKey: string) => {
-    activeRequestsRef.current.delete(requestKey);
-  }, []);
-
-  // ========================================================================
-  // Data Loading Functions
+  // Data Loading Functions (Prepared for AbortController Integration)
   // ========================================================================
 
   const debugAuditDataMismatch = useCallback(
@@ -553,9 +877,12 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return null;
       }
 
-      const requestKey = `audit-${JSON.stringify(params)}-${
+      // 🆕 NEW: Generate request key and check for duplicates
+      const requestKey = generateAuditDataKey(
+        params,
         selectedOpinionRef.current
-      }`;
+      );
+
       if (isRequestInProgress(requestKey)) {
         console.log(
           "🚫 [EntityData] Duplicate audit data request in progress, skipping"
@@ -568,7 +895,11 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         params,
         opinion: selectedOpinionRef.current,
         isClusterSpecific: !!params.clusterId,
+        requestKey,
       });
+
+      // ✅ STEP 7: Create AbortController for this request
+      const controller = createControllerForRequest(requestKey);
 
       addActiveRequest(requestKey);
 
@@ -579,9 +910,11 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       }));
 
       try {
+        // ✅ STEP 7: Pass controller.signal to the API call
         const response = await getPostProcessingAuditData(
           params,
-          selectedOpinionRef.current
+          selectedOpinionRef.current,
+          controller.signal // ✅ Now actually using the signal
         );
 
         const decisionCount = Array.isArray(response?.decisions)
@@ -674,6 +1007,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
 
         return response;
       } catch (error) {
+        // ✅ STEP 7: Handle AbortError gracefully
+        if (error instanceof Error && error.name === "AbortError") {
+          console.log(
+            `🛑 [EntityData] Audit data request aborted: ${requestKey}`
+          );
+          return null;
+        }
+
         console.error(
           "❌ [EntityData] Failed to load post-processing audit data:",
           error
@@ -687,9 +1028,16 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return null;
       } finally {
         removeActiveRequest(requestKey);
+        cleanupCompletedControllers();
       }
     },
-    [isRequestInProgress, addActiveRequest, removeActiveRequest]
+    [
+      isRequestInProgress,
+      addActiveRequest,
+      removeActiveRequest,
+      createControllerForRequest,
+      cleanupCompletedControllers,
+    ]
   );
 
   const loadBulkNodeDetails = useCallback(
@@ -714,10 +1062,12 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      const requestKey = `nodes-${nodesToFetch
-        .map((n) => `${n.id}-${n.nodeType}`)
-        .sort()
-        .join(",")}`;
+      // 🆕 NEW: Generate request key and check for duplicates
+      const requestKey = generateNodeDetailsKey(
+        nodesToFetch,
+        selectedOpinionRef.current
+      );
+
       if (isRequestInProgress(requestKey)) {
         console.log(
           "🚫 [EntityData] Duplicate node request in progress, skipping"
@@ -754,6 +1104,9 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         `📦 [EntityData] Actually fetching: ${trulyNeedsFetching.length} nodes`
       );
 
+      // ✅ STEP 7: Create AbortController for this request
+      const controller = createControllerForRequest(requestKey);
+
       addActiveRequest(requestKey);
 
       const nodeIdsToLoad = trulyNeedsFetching.map((n) => n.id);
@@ -780,6 +1133,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           return newSet;
         });
         removeActiveRequest(requestKey);
+        cleanupCompletedControllers();
       };
 
       try {
@@ -788,9 +1142,11 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           const chunk = trulyNeedsFetching.slice(i, i + NODE_FETCH_SIZE);
 
           try {
+            // ✅ STEP 7: Pass controller.signal to the API call
             const response = await getBulkNodeDetails(
               { items: chunk },
-              selectedOpinionRef.current
+              selectedOpinionRef.current,
+              controller.signal // ✅ Now actually using the signal
             );
 
             setNodeDetails((prev) => {
@@ -808,6 +1164,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
               return newState;
             });
           } catch (error) {
+            // ✅ STEP 7: Handle AbortError gracefully
+            if (error instanceof Error && error.name === "AbortError") {
+              console.log(
+                `🛑 [EntityData] Node details request aborted: ${requestKey}`
+              );
+              return;
+            }
+
             console.error(`❌ [EntityData] Error fetching node chunk:`, error);
 
             setNodeDetails((prev) => {
@@ -829,22 +1193,30 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       isRequestInProgress,
       addActiveRequest,
       removeActiveRequest,
+      createControllerForRequest,
+      cleanupCompletedControllers,
     ]
   );
 
   // ========================================================================
-  // REFACTORED: Pagination-Aware Visualization Data Loading
+  // REFACTORED: Pagination-Aware Visualization Data Loading (Prepared for AbortController)
   // ========================================================================
 
   const loadVisualizationDataForClusters = useCallback(
     async (items: BulkVisualizationRequestItem[]) => {
       if (!selectedOpinionRef.current || items.length === 0) return;
 
-      const requestKey = `viz-${items
-        .map((i) => `${i.clusterId}-${i.cursor || "initial"}`)
-        .sort()
-        .join(",")}`;
+      // 🆕 NEW: Generate request key and check for duplicates
+      const requestKey = generateVisualizationKey(
+        items,
+        selectedOpinionRef.current
+      );
+
       if (isRequestInProgress(requestKey)) return;
+
+      // ✅ STEP 5: Create AbortController for this request
+      const controller = createControllerForRequest(requestKey);
+
       addActiveRequest(requestKey);
 
       setVisualizationData((prev) =>
@@ -865,8 +1237,13 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       );
 
       try {
+        // ✅ STEP 5: Pass controller.signal to the API call
         const response: VisualizationDataResponse[] =
-          await getBulkVisualizations({ items }, selectedOpinionRef.current);
+          await getBulkVisualizations(
+            { items },
+            selectedOpinionRef.current,
+            controller.signal // ✅ Now actually using the signal
+          );
 
         setVisualizationData((prev) =>
           produce(prev, (draft) => {
@@ -955,6 +1332,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           loadBulkNodeDetails(allNodeIdentifiers);
         }
       } catch (error) {
+        // ✅ STEP 5: Handle AbortError gracefully
+        if (error instanceof Error && error.name === "AbortError") {
+          console.log(
+            `🛑 [EntityData] Visualization request aborted: ${requestKey}`
+          );
+          return;
+        }
+
         console.error(
           "❌ [EntityData] Failed to load visualization data:",
           error
@@ -972,6 +1357,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         );
       } finally {
         removeActiveRequest(requestKey);
+        cleanupCompletedControllers();
       }
     },
     [
@@ -979,11 +1365,13 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       addActiveRequest,
       removeActiveRequest,
       loadBulkNodeDetails,
+      createControllerForRequest,
+      cleanupCompletedControllers,
     ]
   );
 
   // ========================================================================
-  // NEW: Load More Connections for Cluster (Pagination)
+  // NEW: Load More Connections for Cluster (Pagination) - Prepared for AbortController
   // ========================================================================
 
   const loadMoreConnectionsForCluster = useCallback(
@@ -1019,9 +1407,13 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      const requestKey = `clusters-audit-${JSON.stringify(params)}-${
+      // 🆕 NEW: Generate request key and check for duplicates
+      const requestKey = generateRequestKey(
+        "clusters-audit",
+        params,
         selectedOpinionRef.current
-      }`;
+      );
+
       if (isRequestInProgress(requestKey)) {
         console.log(
           "🚫 [EntityData] Duplicate clusters audit data request in progress, skipping"
@@ -1030,6 +1422,9 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       }
 
       console.log(`🔍 [EntityData] Loading clusters with audit data:`, params);
+
+      // ✅ STEP 7: Create AbortController for this request
+      const controller = createControllerForRequest(requestKey);
 
       addActiveRequest(requestKey);
 
@@ -1042,9 +1437,11 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       try {
         // ✅ FIX: Try both entity types if no specific entity type provided
         // or if the provided entity type returns no results
+        // ✅ STEP 7: Pass controller.signal to the API call
         let response = await getClustersWithPostProcessingDecisions(
           params,
-          selectedOpinionRef.current
+          selectedOpinionRef.current,
+          controller.signal // ✅ Now actually using the signal
         );
 
         // ✅ FIX: If no clusters found for the requested entity type, try the other type
@@ -1063,7 +1460,8 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           const alternateResponse =
             await getClustersWithPostProcessingDecisions(
               alternateParams,
-              selectedOpinionRef.current
+              selectedOpinionRef.current,
+              controller.signal // ✅ Also pass signal to alternate call
             );
 
           if (alternateResponse.clusters.length > 0) {
@@ -1087,7 +1485,8 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         if (clustersToValidate.length > 0) {
           const { valid, invalid } = await validateAuditClustersHaveData(
             clustersToValidate,
-            selectedOpinionRef.current
+            selectedOpinionRef.current,
+            controller.signal // ✅ Pass signal to validation call too
           );
 
           if (invalid.length > 0) {
@@ -1143,6 +1542,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           console.log(`✅ [EntityData] No audit clusters to validate.`);
         }
       } catch (error) {
+        // ✅ STEP 7: Handle AbortError gracefully
+        if (error instanceof Error && error.name === "AbortError") {
+          console.log(
+            `🛑 [EntityData] Clusters audit request aborted: ${requestKey}`
+          );
+          return;
+        }
+
         console.error(
           "❌ [EntityData] Failed to load clusters with audit data:",
           error
@@ -1155,6 +1562,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         }));
       } finally {
         removeActiveRequest(requestKey);
+        cleanupCompletedControllers();
       }
     },
     [
@@ -1162,6 +1570,8 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       addActiveRequest,
       removeActiveRequest,
       loadVisualizationDataForClusters,
+      createControllerForRequest,
+      cleanupCompletedControllers,
     ]
   );
 
@@ -1189,15 +1599,26 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         `🔄 [EntityData] Bulk marking ${decisionIds.length} decisions as reviewed`
       );
 
+      // ✅ STEP 7: Generate request key and create controller
+      const requestKey = generateRequestKey(
+        "bulk-mark-reviewed",
+        { decisionIds: decisionIds.sort(), reviewerId },
+        selectedOpinionRef.current
+      );
+
+      const controller = createControllerForRequest(requestKey);
+
       try {
         const request: BulkMarkReviewedRequest = {
           decisionIds,
           reviewerId,
         };
 
+        // ✅ STEP 7: Pass controller.signal to the API call
         const response = await bulkMarkPostProcessingReviewed(
           request,
-          selectedOpinionRef.current
+          selectedOpinionRef.current,
+          controller.signal // ✅ Now actually using the signal
         );
 
         console.log(
@@ -1229,6 +1650,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           }`,
         });
       } catch (error) {
+        // ✅ STEP 7: Handle AbortError gracefully
+        if (error instanceof Error && error.name === "AbortError") {
+          console.log(
+            `🛑 [EntityData] Bulk mark reviewed request aborted: ${requestKey}`
+          );
+          return;
+        }
+
         console.error(
           "❌ [EntityData] Failed to bulk mark decisions as reviewed:",
           error
@@ -1239,6 +1668,10 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           description: (error as Error).message,
           variant: "destructive",
         });
+      } finally {
+        // Clean up controller
+        activeControllersRef.current.delete(requestKey);
+        cleanupCompletedControllers();
       }
     },
     [
@@ -1249,6 +1682,8 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       loadPostProcessingAuditData,
       loadClustersWithAuditData,
       toast,
+      createControllerForRequest,
+      cleanupCompletedControllers,
     ]
   );
 
@@ -1272,18 +1707,28 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      const requestKey = `cluster-progress-${page}-${limit}-${currentFilterStatus}-${currentWorkflowFilter}-${currentMode}-${currentOpinion}`;
+      // Generate request key and check for duplicates
+      const requestKey = generateClusterProgressKey(
+        page,
+        limit,
+        currentFilterStatus,
+        currentWorkflowFilter,
+        currentMode,
+        currentOpinion
+      );
+
       if (isRequestInProgress(requestKey)) {
         console.log(
-          "🚫 [EntityData] Duplicate cluster progress request in progress, skipping"
+          "🔄 [EntityData] Cluster progress request already in progress, skipping"
         );
         return;
       }
 
       console.log(
-        `🔄 [EntityData] Loading cluster progress: page=${page}, limit=${limit}, filter=${currentFilterStatus}, workflow=${currentWorkflowFilter}, mode=${currentMode}, opinion=${currentOpinion}`
+        `🔄 [EntityData] Loading cluster progress: page=${page}, filter=${currentFilterStatus}, workflow=${currentWorkflowFilter}`
       );
 
+      const controller = createControllerForRequest(requestKey);
       addActiveRequest(requestKey);
 
       setClusters((prev) => ({
@@ -1301,16 +1746,25 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           currentFilterStatus,
           currentWorkflowFilter,
           currentMode,
-          currentOpinion
+          currentOpinion,
+          controller.signal
         );
 
+        // Check if request was cancelled after completion
+        if (controller.signal.aborted) {
+          console.log(
+            `🛑 [EntityData] Cluster progress completed but was cancelled: ${requestKey}`
+          );
+          return;
+        }
+
         console.log(
-          `✅ [EntityData] Cluster progress loaded: ${response.clusters.length} clusters, overall progress: ${response.overallProgress.currentView.overallProgressPercentage}%`
+          `✅ [EntityData] Cluster progress loaded: ${response.clusters.length} clusters`
         );
 
         if (response.clusters.length === 0 && response.page > 1) {
           console.warn(
-            `No clusters on page ${response.page} with workflow filter ${currentWorkflowFilter}. This may indicate all clusters have been filtered out.`
+            `⚠️ [EntityData] No clusters on page ${response.page} - may be filtered out`
           );
           setClusters((prev) => ({
             ...prev,
@@ -1319,15 +1773,15 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
             data: [],
             total: 0,
           }));
-          removeActiveRequest(requestKey);
 
           toast({
             title: "No More Clusters",
-            description: `No clusters found on page ${response.page} for the current filter. All available clusters may have been reviewed.`,
+            description: `No clusters found on page ${response.page} for the current filter.`,
           });
           return;
         }
 
+        // Update progress and cluster data
         const progressMap: Record<string, ClusterProgress> = {};
         response.clusters.forEach((cluster) => {
           progressMap[cluster.id] = cluster.progress;
@@ -1348,7 +1802,8 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           error: null,
         });
 
-        const vizRequestItemsNormal: BulkVisualizationRequestItem[] = [];
+        // Pre-load visualization data for small clusters
+        const vizRequestItems: BulkVisualizationRequestItem[] = [];
         response.clusters.forEach((c) => {
           const connectionCount = c.groupCount;
           const hasEdgesForFilter = c.progress.currentView.totalEdges > 0;
@@ -1359,19 +1814,28 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
             connectionCount !== null &&
             connectionCount <= LARGE_CLUSTER_THRESHOLD
           ) {
-            vizRequestItemsNormal.push({
+            vizRequestItems.push({
               clusterId: c.id,
               itemType: currentMode,
             });
           }
         });
 
-        if (vizRequestItemsNormal.length > 0) {
+        if (vizRequestItems.length > 0) {
           setTimeout(() => {
-            loadVisualizationDataForClustersRef.current(vizRequestItemsNormal);
+            if (!controller.signal.aborted) {
+              loadVisualizationDataForClustersRef.current(vizRequestItems);
+            }
           }, 100);
         }
       } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          console.log(
+            `🛑 [EntityData] Cluster progress request cancelled: ${requestKey}`
+          );
+          return;
+        }
+
         console.error(
           "❌ [EntityData] Failed to load cluster progress:",
           error
@@ -1388,9 +1852,16 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         setOverallServerProgress(null);
       } finally {
         removeActiveRequest(requestKey);
+        // Cleanup is handled automatically by the controller's abort listener
       }
     },
-    [isRequestInProgress, addActiveRequest, removeActiveRequest, toast]
+    [
+      isRequestInProgress,
+      addActiveRequest,
+      removeActiveRequest,
+      toast,
+      createControllerForRequest,
+    ]
   );
 
   const loadClusters = loadClusterProgress;
@@ -1413,16 +1884,19 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      const requestKey = `bulk-conn-${items
-        .map((i) => i.edgeId)
-        .sort()
-        .join(",")}-${crossSystemOnly}`;
+      // 🆕 NEW: Generate request key and check for duplicates
+      const requestKey = generateConnectionKey(items, crossSystemOnly, opinion);
+
       if (isRequestInProgress(requestKey)) {
         console.log(
           `[EntityData] Duplicate bulk connection request in progress, skipping: ${requestKey}`
         );
         return;
       }
+
+      // ✅ STEP 6: Create AbortController for this request
+      const controller = createControllerForRequest(requestKey);
+
       addActiveRequest(requestKey);
 
       // ✅ FIX: Log the items being requested for debugging
@@ -1472,7 +1946,12 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
 
         console.log(`[EntityData] Sending bulk connections request:`, request);
 
-        const response = await getBulkConnections(request, opinion);
+        // ✅ STEP 6: Pass controller.signal to the API call
+        const response = await getBulkConnections(
+          request,
+          opinion,
+          controller.signal // ✅ Now actually using the signal
+        );
 
         console.log(`[EntityData] Received bulk connections response:`, {
           connectionsCount: response.connections.length,
@@ -1531,6 +2010,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           })
         );
       } catch (error) {
+        // ✅ STEP 6: Handle AbortError gracefully
+        if (error instanceof Error && error.name === "AbortError") {
+          console.log(
+            `🛑 [EntityData] Bulk connections request aborted: ${requestKey}`
+          );
+          return;
+        }
+
         const errorMessage = (error as Error).message;
         console.error(
           "❌ [EntityData] Failed to load bulk connections:",
@@ -1557,9 +2044,16 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         );
       } finally {
         removeActiveRequest(requestKey);
+        cleanupCompletedControllers();
       }
     },
-    [isRequestInProgress, addActiveRequest, removeActiveRequest]
+    [
+      isRequestInProgress,
+      addActiveRequest,
+      removeActiveRequest,
+      createControllerForRequest,
+      cleanupCompletedControllers,
+    ]
   );
 
   const loadMoreBulkConnections = useCallback(async () => {
@@ -1589,14 +2083,24 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       crossSystemOnly,
     };
 
-    const requestKey = `bulk-conn-page-${nextCursor}`;
+    // ✅ STEP 6: Generate request key and create controller
+    const requestKey = generateRequestKey(
+      "bulk-conn-page",
+      { cursor: nextCursor },
+      selectedOpinionRef.current || undefined
+    );
+
     if (isRequestInProgress(requestKey)) return;
+
+    const controller = createControllerForRequest(requestKey);
     addActiveRequest(requestKey);
 
     try {
+      // ✅ STEP 6: Pass controller.signal to the API call
       const response = await getBulkConnections(
         request,
-        selectedOpinionRef.current || undefined
+        selectedOpinionRef.current || undefined,
+        controller.signal // ✅ Now actually using the signal
       );
 
       setBulkConnectionData(
@@ -1610,6 +2114,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         })
       );
     } catch (error) {
+      // ✅ STEP 6: Handle AbortError gracefully
+      if (error instanceof Error && error.name === "AbortError") {
+        console.log(
+          `🛑 [EntityData] Load more connections request aborted: ${requestKey}`
+        );
+        return;
+      }
+
       console.error(
         "❌ [EntityData] Failed to load more bulk connections:",
         error
@@ -1622,12 +2134,15 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       );
     } finally {
       removeActiveRequest(requestKey);
+      cleanupCompletedControllers();
     }
   }, [
     bulkConnectionData,
     isRequestInProgress,
     addActiveRequest,
     removeActiveRequest,
+    createControllerForRequest,
+    cleanupCompletedControllers,
   ]);
 
   const loadSingleConnectionData = useCallback(
@@ -1799,7 +2314,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         );
         return null;
       }
-  
+
       if (auditMode === "post_processing_audit") {
         if (postProcessingAuditData.loading) {
           console.log(
@@ -1807,7 +2322,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           );
           return null;
         }
-  
+
         if (!postProcessingAuditData.data) {
           console.log(
             `🚫 [EntityData] No audit data available for cluster ${clusterId}`
@@ -1819,13 +2334,13 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
             links: [],
           };
         }
-  
+
         const affectedEdgeIds = new Set(getAuditAffectedEdges(clusterId));
-  
+
         console.log(
           `🔍 [EntityData] Filtering audit visualization for cluster ${clusterId}: ${affectedEdgeIds.size} affected edges out of ${vizState.data.links.length} total links`
         );
-  
+
         // If no affected edges are found for this cluster, return an empty graph.
         if (affectedEdgeIds.size === 0) {
           console.log(
@@ -1837,11 +2352,11 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
             links: [],
           };
         }
-  
+
         const filteredLinks = vizState.data.links.filter((link) =>
           affectedEdgeIds.has(link.id)
         );
-  
+
         const connectedNodeIds = new Set<string>();
         filteredLinks.forEach((link) => {
           const sourceId =
@@ -1851,22 +2366,22 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           connectedNodeIds.add(sourceId);
           connectedNodeIds.add(targetId);
         });
-  
+
         const filteredNodes = vizState.data.nodes.filter((node) =>
           connectedNodeIds.has(node.id)
         );
-  
+
         console.log(
           `✅ [EntityData] Audit filtered visualization: ${filteredLinks.length}/${vizState.data.links.length} links, ${filteredNodes.length}/${vizState.data.nodes.length} nodes`
         );
-  
+
         return {
           ...vizState.data,
           links: filteredLinks,
           nodes: filteredNodes,
         };
       }
-  
+
       // If not in audit mode, return the original data
       return vizState.data;
     },
@@ -1877,7 +2392,6 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       getAuditAffectedEdges,
     ]
   );
-  
 
   const loadAuditClusterRichData = useCallback(
     async (clusterId: string) => {
@@ -1887,6 +2401,15 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         );
         return;
       }
+
+      // ✅ STEP 7: Generate request key and create controller
+      const requestKey = generateRequestKey(
+        "audit-cluster-rich",
+        { clusterId },
+        selectedOpinionRef.current
+      );
+
+      const controller = createControllerForRequest(requestKey);
 
       try {
         const auditClusterInfo = clustersWithAuditData.data?.clusters.find(
@@ -1940,9 +2463,11 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
             pageParams
           );
 
+          // ✅ STEP 7: Pass controller.signal to the API call
           const pageResponse = await getPostProcessingAuditData(
             pageParams,
-            selectedOpinionRef.current
+            selectedOpinionRef.current,
+            controller.signal // ✅ Now actually using the signal
           );
 
           if (!pageResponse || pageResponse.decisions.length === 0) {
@@ -2099,6 +2624,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           `✅ [EntityData] Audit cluster rich data loaded for ${clusterId}`
         );
       } catch (error) {
+        // ✅ STEP 7: Handle AbortError gracefully
+        if (error instanceof Error && error.name === "AbortError") {
+          console.log(
+            `🛑 [EntityData] Audit cluster rich data request aborted: ${requestKey}`
+          );
+          return;
+        }
+
         console.error(
           `❌ [EntityData] Failed to load audit cluster rich data:`,
           error
@@ -2116,6 +2649,10 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           }`,
           variant: "destructive",
         });
+      } finally {
+        // Clean up controller
+        activeControllersRef.current.delete(requestKey);
+        cleanupCompletedControllers();
       }
     },
     [
@@ -2129,11 +2666,13 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       loadBulkNodeDetails,
       getAuditAffectedEdges,
       toast,
+      createControllerForRequest,
+      cleanupCompletedControllers,
     ]
   );
 
   // ========================================================================
-  // Optimistic Update Functions
+  // Optimistic Update Functions (Unchanged)
   // ========================================================================
 
   const updateProgressOptimistically = useCallback(
@@ -2419,7 +2958,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
   }, [clustersWithAuditData.error]);
 
   // ========================================================================
-  // Cache Management
+  // Cache Management (Enhanced with AbortController cleanup)
   // ========================================================================
 
   const performThreeClusterCleanup = useCallback(
@@ -2458,6 +2997,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
                 Object.keys(prev).length
               } -> ${Object.keys(cleaned).length} clusters`
             );
+
+            // 🆕 NEW: Cancel requests for clusters being cleaned up
+            const clustersToRemove = Object.keys(prev).filter(
+              (id) => !keepSet.has(id)
+            );
+            clustersToRemove.forEach((clusterId) => {
+              cancelActiveRequests(`viz-${clusterId}`);
+            });
           }
           return cleaned;
         });
@@ -2488,6 +3035,12 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         ).join(", ")}], removing [${clustersToRemove.join(", ")}]`
       );
 
+      // 🆕 NEW: Cancel requests for clusters being removed
+      clustersToRemove.forEach((clusterId) => {
+        cancelActiveRequests(`viz-${clusterId}`);
+        cancelActiveRequests(`audit-cluster-rich-${clusterId}`);
+      });
+
       setVisualizationData((prev) => {
         const cleaned = Object.fromEntries(
           Object.entries(prev).filter(([clusterId]) =>
@@ -2515,6 +3068,16 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         if (clustersToKeep.has(clusterId) && vizState.data?.links) {
           vizState.data.links.forEach((link) => edgesToKeep.add(link.id));
         }
+      });
+
+      // 🆕 NEW: Cancel connection requests for edges being removed
+      const currentEdgeIds = new Set(Object.keys(connectionData));
+      const edgesToRemove = [...currentEdgeIds].filter(
+        (edgeId) => !edgesToKeep.has(edgeId)
+      );
+
+      edgesToRemove.forEach((edgeId) => {
+        cancelActiveRequests(`connections-${edgeId}`);
       });
 
       setConnectionData((prev) => {
@@ -2547,6 +3110,16 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         }
       });
 
+      // 🆕 NEW: Cancel node detail requests for nodes being removed
+      const currentNodeIds = new Set(Object.keys(nodeDetails));
+      const nodesToRemove = [...currentNodeIds].filter(
+        (nodeId) => !nodeIdsToKeep.has(nodeId)
+      );
+
+      nodesToRemove.forEach((nodeId) => {
+        cancelActiveRequests(`node-details-${nodeId}`);
+      });
+
       setNodeDetails((prev) => {
         const cleaned = Object.fromEntries(
           Object.entries(prev).filter(([nodeId]) => nodeIdsToKeep.has(nodeId))
@@ -2567,6 +3140,9 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         );
         return cleaned;
       });
+
+      // 🆕 NEW: Clean up any remaining completed controllers
+      cleanupCompletedControllers();
     },
     [
       selectedClusterId,
@@ -2576,11 +3152,14 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       state.selectedEdgeId,
       visualizationData,
       connectionData,
+      nodeDetails,
+      cancelActiveRequests,
+      cleanupCompletedControllers,
     ]
   );
 
   // ========================================================================
-  // ENHANCED: Effects with Aggressive Refresh Handling
+  // ENHANCED: Effects with Complete Clearing and Controller Cleanup
   // ========================================================================
 
   useEffect(() => {
@@ -2737,6 +3316,68 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     performThreeClusterCleanup,
   ]);
 
+  useEffect(() => {
+    return () => {
+      console.log(
+        "🧹 [EntityData] Component unmounting - comprehensive cleanup"
+      );
+
+      // Cancel all active controllers
+      try {
+        const activeCount = activeControllersRef.current.size;
+        if (activeCount > 0) {
+          console.log(
+            `🛑 [EntityData] Unmount: Cancelling ${activeCount} active controllers`
+          );
+
+          for (const [requestKey, controller] of activeControllersRef.current) {
+            try {
+              if (!controller.signal.aborted) {
+                controller.abort();
+              }
+            } catch (error) {
+              console.warn(
+                `⚠️ [EntityData] Unmount: Error aborting ${requestKey}:`,
+                error
+              );
+            }
+          }
+
+          activeControllersRef.current.clear();
+        }
+      } catch (error) {
+        console.error(
+          "❌ [EntityData] Unmount: Error during controller cleanup:",
+          error
+        );
+      }
+
+      // Clear timeout refs
+      if (cleanupTimeoutRef.current) {
+        clearTimeout(cleanupTimeoutRef.current);
+        cleanupTimeoutRef.current = null;
+      }
+
+      // Clear tracking refs
+      activeRequestsRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    // Periodic cleanup of completed controllers
+    const cleanupInterval = setInterval(() => {
+      const activeCount = activeControllersRef.current.size;
+      if (activeCount > 10) {
+        // Only run cleanup if we have many controllers
+        cleanupCompletedControllers();
+      }
+    }, 30000); // Every 30 seconds
+
+    return () => {
+      clearInterval(cleanupInterval);
+    };
+  }, [cleanupCompletedControllers]);
+
   // ========================================================================
   // Context Value Assembly
   // ========================================================================
@@ -2775,6 +3416,10 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     invalidateConnectionData,
     performThreeClusterCleanup,
     clearAllData,
+
+    // 🆕 NEW: AbortController management
+    cancelActiveRequests,
+    cancelAllRequests,
 
     // Optimistic update functions
     updateEdgeStatusOptimistically,
@@ -2886,6 +3531,7 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         nodes: Object.keys(nodeDetails).length,
         pendingFetches: pendingNodeFetches.size,
         activeRequests: activeRequestsRef.current.size,
+        activeControllers: activeControllersRef.current.size, // 🆕 NEW
         auditData: {
           postProcessingLoaded: !!postProcessingAuditData.data,
           clustersAuditLoaded: !!clustersWithAuditData.data,

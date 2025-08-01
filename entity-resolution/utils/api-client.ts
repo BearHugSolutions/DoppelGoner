@@ -58,12 +58,20 @@ function getApiHeaders(opinionName?: string): HeadersInit {
  */
 function handleApiError(error: unknown, context?: string): never {
   const contextMsg = context ? ` (${context})` : "";
+
+  // Handle AbortError silently - these are expected during cancellation
+  if (error instanceof Error && error.name === "AbortError") {
+    console.log(`🛑 [API_CLIENT] Request cancelled${contextMsg}`);
+    throw error; // Re-throw to be handled by caller
+  }
+
   let errorMessage = "An unknown error occurred";
   if (error instanceof Error) {
     errorMessage = error.message;
   } else if (typeof error === "string") {
     errorMessage = error;
   }
+
   console.error(`[API_CLIENT] API Error${contextMsg}:`, errorMessage, error);
   throw new Error(errorMessage);
 }
@@ -83,6 +91,11 @@ async function validateResponse<T>(
     try {
       errorData = await response.json();
     } catch (e) {
+      // Check if the parse error is due to an aborted request
+      if (e instanceof Error && e.name === "AbortError") {
+        throw e; // Re-throw AbortError
+      }
+
       // If the body isn't valid JSON, use the status text.
       errorData = {
         message:
@@ -90,24 +103,38 @@ async function validateResponse<T>(
           `Request failed with status ${response.status}`,
       };
     }
+
     const errorMessage =
       errorData.message ||
       errorData.error ||
       `Request failed with status ${response.status}`;
     const fullContext = context ? `${context}: ${errorMessage}` : errorMessage;
+
     console.error(
       `[API_CLIENT] API Response Error: ${response.status} ${response.statusText}`,
       { context: context, error: errorData }
     );
     throw new Error(fullContext);
   }
+
   // Handle successful responses with no content
   if (response.status === 204) {
     return {} as T;
   }
-  const responseData = await response.json();
-  console.log(`[API_CLIENT] Successful response for ${context}:`, responseData);
-  return responseData as T;
+
+  try {
+    const responseData = await response.json();
+    if (context) {
+      console.log(`[API_CLIENT] ✅ ${context}: Success`);
+    }
+    return responseData as T;
+  } catch (e) {
+    // Check if the parse error is due to an aborted request
+    if (e instanceof Error && e.name === "AbortError") {
+      throw e; // Re-throw AbortError
+    }
+    throw new Error(`Failed to parse response JSON: ${(e as Error).message}`);
+  }
 }
 
 // --- Audit Cluster Validation Function ---
@@ -120,54 +147,36 @@ async function validateResponse<T>(
  */
 export async function validateAuditClustersHaveData(
   clusters: { id: string; itemType: ResolutionMode }[],
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<{ valid: string[]; invalid: string[] }> {
   if (clusters.length === 0) {
     return { valid: [], invalid: [] };
   }
 
-  const validationRequest: BulkVisualizationsRequest = {
-    items: clusters.map((cluster) => ({
-      clusterId: cluster.id,
-      itemType: cluster.itemType,
-    })),
-  };
+  const context = `validateAuditClustersHaveData`;
+  const url = `${API_BASE_URL}/validate-audit-clusters`;
+
+  const payload = { clusters };
 
   try {
-    const response = await getBulkVisualizations(
-      validationRequest,
-      opinionName
-    );
-
-    const validClusterIds = new Set(
-      response
-        .filter(
-          (viz) =>
-            (viz.links && (viz.links as any).links.length > 0) ||
-            (viz.nodes && viz.nodes.length > 0)
-        )
-        .map((viz) => viz.clusterId)
-    );
-
-    const valid: string[] = [];
-    const invalid: string[] = [];
-
-    clusters.forEach((cluster) => {
-      if (validClusterIds.has(cluster.id)) {
-        valid.push(cluster.id);
-      } else {
-        invalid.push(cluster.id);
-      }
+    const response = await fetch(url, {
+      method: "POST",
+      headers: getApiHeaders(opinionName),
+      body: JSON.stringify(payload),
+      signal,
     });
-
-    console.log(
-      `[API_CLIENT] Cluster validation: ${valid.length} valid, ${invalid.length} invalid`
+    const data = await validateResponse<{ valid: string[]; invalid: string[] }>(
+      response,
+      context
     );
-    return { valid, invalid };
+    return data;
   } catch (error) {
-    console.error("[API_CLIENT] Failed to validate audit clusters:", error);
-    // If the API call fails, treat all requested clusters as invalid.
-    return { valid: [], invalid: clusters.map((c) => c.id) };
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
+    return handleApiError(error, context);
   }
 }
 
@@ -175,7 +184,8 @@ export async function validateAuditClustersHaveData(
 
 export async function getPostProcessingAuditData(
   params: PostProcessingAuditParams,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<PostProcessingAuditResponse> {
   const searchParams = new URLSearchParams();
 
@@ -223,6 +233,7 @@ export async function getPostProcessingAuditData(
   try {
     const response = await fetch(url, {
       headers: getApiHeaders(opinionName),
+      signal,
     });
 
     const result = await validateResponse<PostProcessingAuditResponse>(
@@ -268,6 +279,10 @@ export async function getPostProcessingAuditData(
 
     return result;
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     console.error(`[API_CLIENT] Audit data request failed:`, {
       url,
       params,
@@ -278,7 +293,8 @@ export async function getPostProcessingAuditData(
 }
 
 export async function detectAuditDataEntityTypes(
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<{
   entityTypes: ("entity" | "service")[];
   counts: Record<string, number>;
@@ -303,7 +319,8 @@ export async function detectAuditDataEntityTypes(
           page: 1,
           limit: 1, // Just need to check if any exist
         },
-        opinionName
+        opinionName,
+        signal
       );
 
       if (
@@ -330,7 +347,8 @@ export async function detectAuditDataEntityTypes(
 
 export async function getClustersWithPostProcessingDecisions(
   params: PostProcessingAuditParams,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<ClustersWithPostProcessingResponse> {
   const searchParams = new URLSearchParams();
 
@@ -358,6 +376,7 @@ export async function getClustersWithPostProcessingDecisions(
   try {
     const response = await fetch(url, {
       headers: getApiHeaders(opinionName),
+      signal,
     });
 
     const result = await validateResponse<ClustersWithPostProcessingResponse>(
@@ -375,6 +394,10 @@ export async function getClustersWithPostProcessingDecisions(
 
     return result;
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     console.error(`[API_CLIENT] Audit clusters request failed:`, {
       url,
       params,
@@ -386,7 +409,8 @@ export async function getClustersWithPostProcessingDecisions(
 
 export async function bulkMarkPostProcessingReviewed(
   request: BulkMarkReviewedRequest,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<BulkMarkReviewedResponse> {
   const url = `${API_BASE_URL}/post-processing-audit/bulk-mark-reviewed`;
   const context = `bulkMarkPostProcessingReviewed (${request.decisionIds.length} decisions)`;
@@ -396,10 +420,15 @@ export async function bulkMarkPostProcessingReviewed(
       method: "POST",
       headers: getApiHeaders(opinionName),
       body: JSON.stringify(request),
+      signal,
     });
 
     return await validateResponse<BulkMarkReviewedResponse>(response, context);
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }
@@ -412,11 +441,10 @@ export async function getClusterProgress(
   reviewStatus: ClusterFilterStatus = "unreviewed",
   workflowFilter: WorkflowFilter,
   type: "entity" | "service" = "entity",
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<ClusterProgressResponse> {
-  const context = `getClusterProgress (page: ${page}, limit: ${limit}, reviewStatus: ${reviewStatus}, workflowFilter: ${workflowFilter}, type: ${type}, opinion: ${
-    opinionName || "none"
-  })`;
+  const context = `getClusterProgress (page: ${page}, type: ${type}, filter: ${workflowFilter})`;
 
   const searchParams = new URLSearchParams({
     page: page.toString(),
@@ -431,10 +459,16 @@ export async function getClusterProgress(
   try {
     const response = await fetch(url, {
       headers: getApiHeaders(opinionName),
+      signal,
     });
 
     return await validateResponse<ClusterProgressResponse>(response, context);
   } catch (error) {
+    // Handle AbortError silently
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`🛑 [API_CLIENT] ${context} - Request cancelled`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }
@@ -442,7 +476,8 @@ export async function getClusterProgress(
 export async function postEdgeReview(
   edgeId: string,
   payload: EdgeReviewApiPayload,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<EdgeReviewApiResponse> {
   const context = `postEdgeReview for edge ${edgeId}, opinion: ${
     opinionName || "none"
@@ -453,17 +488,23 @@ export async function postEdgeReview(
       method: "POST",
       headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
+      signal,
     });
     console.log("[API_CLIENT] Response for postEdgeReview:", response);
     return await validateResponse<EdgeReviewApiResponse>(response, context);
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }
 
 export async function postDisconnectDependentServices(
   payload: DisconnectDependentServicesRequest,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<DisconnectDependentServicesResponse> {
   const context = `postDisconnectDependentServices, opinion: ${
     opinionName || "none"
@@ -478,12 +519,17 @@ export async function postDisconnectDependentServices(
       method: "POST",
       headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
+      signal,
     });
     return await validateResponse<DisconnectDependentServicesResponse>(
       response,
       context
     );
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }
@@ -492,7 +538,8 @@ export async function postDisconnectDependentServices(
 
 export async function getBulkNodeDetails(
   payload: BulkNodeDetailsRequest,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<NodeDetailResponse[]> {
   const context = `getBulkNodeDetails, opinion: ${opinionName || "none"}`;
   const url = `${API_BASE_URL}/bulk-node-details`;
@@ -502,9 +549,14 @@ export async function getBulkNodeDetails(
       method: "POST",
       headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
+      signal,
     });
     return await validateResponse<NodeDetailResponse[]>(response, context);
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }
@@ -520,26 +572,32 @@ export async function getBulkNodeDetails(
  */
 export async function getBulkConnections(
   payload: BulkConnectionsRequest,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<PaginatedBulkConnectionsResponse> {
-  const context = `getBulkConnections, opinion: ${opinionName || "none"}`;
+  const context = `getBulkConnections (${payload.items.length} items)`;
   const url = `${API_BASE_URL}/bulk-connections`;
 
-  // ✅ FIX: Ensure payload has the correct structure with defaults
+  // Ensure payload has the correct structure with defaults
   const requestPayload: BulkConnectionsRequest = {
     items: payload.items,
-    limit: payload.limit || 50, // Default limit
+    limit: payload.limit || 50,
     cursor: payload.cursor || undefined,
-    crossSystemOnly: payload.crossSystemOnly || false, // Default to false
+    crossSystemOnly: payload.crossSystemOnly || false,
   };
 
   try {
-    console.log(`[API_CLIENT] Requesting bulk connections:`, requestPayload);
+    console.log(`[API_CLIENT] 🔄 ${context}:`, {
+      itemCount: requestPayload.items.length,
+      crossSystemOnly: requestPayload.crossSystemOnly,
+      hasCursor: !!requestPayload.cursor
+    });
 
     const response = await fetch(url, {
       method: "POST",
       headers: getApiHeaders(opinionName),
       body: JSON.stringify(requestPayload),
+      signal,
     });
 
     const result = await validateResponse<PaginatedBulkConnectionsResponse>(
@@ -547,21 +605,26 @@ export async function getBulkConnections(
       context
     );
 
-    console.log(`[API_CLIENT] Bulk connections response:`, {
-      connectionsCount: result.connections.length,
+    console.log(`[API_CLIENT] ✅ ${context}:`, {
+      connectionsReturned: result.connections.length,
       hasMore: result.hasMore,
       nextCursor: result.nextCursor ? "present" : "null",
     });
 
     return result;
   } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      console.log(`🛑 [API_CLIENT] ${context} - Request cancelled`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }
 
 export async function getBulkVisualizations(
   payload: BulkVisualizationsRequest,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<BulkVisualizationsResponse> {
   const context = `getBulkVisualizations, opinion: ${opinionName || "none"}`;
   console.log("[API_CLIENT] Requesting bulk visualizations:", payload);
@@ -571,12 +634,17 @@ export async function getBulkVisualizations(
       method: "POST",
       headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
+      signal,
     });
     return await validateResponse<BulkVisualizationsResponse>(
       response,
       context
     );
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }
@@ -584,26 +652,33 @@ export async function getBulkVisualizations(
 // --- Opinion Preferences Functions ---
 
 export async function getOpinionPreferences(
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<GetOpinionPreferencesResponse> {
   const context = `getOpinionPreferences, opinion: ${opinionName || "default"}`;
   const url = `${API_BASE_URL}/opinion-preferences`;
   try {
     const response = await fetch(url, {
       headers: getApiHeaders(opinionName),
+      signal,
     });
     return await validateResponse<GetOpinionPreferencesResponse>(
       response,
       context
     );
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }
 
 export async function updateOpinionPreferences(
   payload: UpdateOpinionPreferencesRequest,
-  opinionName?: string
+  opinionName?: string,
+  signal?: AbortSignal
 ): Promise<UpdateOpinionPreferencesResponse> {
   const context = `updateOpinionPreferences, opinion: ${
     opinionName || "default"
@@ -615,12 +690,17 @@ export async function updateOpinionPreferences(
       method: "POST",
       headers: getApiHeaders(opinionName),
       body: JSON.stringify(payload),
+      signal,
     });
     return await validateResponse<UpdateOpinionPreferencesResponse>(
       response,
       context
     );
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log(`[API_CLIENT] Request aborted: ${context}`);
+      throw error;
+    }
     return handleApiError(error, context);
   }
 }

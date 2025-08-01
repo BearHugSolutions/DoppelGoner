@@ -892,7 +892,9 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
   const handleSetSelectedClusterId = useCallback(
     async (id: string | null, isManualSelection: boolean = true) => {
-      if (id === selectedClusterId) return;
+      if (id === selectedClusterId) {
+        return;
+      }
 
       if (isManualSelection && id) {
         setManualClusterSelection({ clusterId: id, timestamp: Date.now() });
@@ -901,65 +903,100 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         );
       }
 
-      stateActions.setSelectedClusterId(id);
+      try {
+        stateActions.setSelectedClusterId(id);
 
-      if (id && selectedOpinion) {
-        if (auditMode === "post_processing_audit") {
-          // Load rich data for audit cluster
-          await loadAuditClusterRichData(id);
-        } else {
-          // Normal mode logic
-          const clusterDetail = getClusterById(id);
-          const connectionCount = clusterDetail
-            ? clusterDetail.groupCount
-            : undefined;
-          const isLarge =
-            connectionCount !== undefined &&
-            connectionCount !== null &&
-            connectionCount > LARGE_CLUSTER_THRESHOLD;
-
-          if (
-            clusterDetail?.wasReviewed ||
-            (!isLarge && getClusterProgress(id).isComplete)
-          ) {
-            stateActions.setIsAutoAdvanceEnabled(false);
+        if (id && selectedOpinion) {
+          if (auditMode === "post_processing_audit") {
+            console.log(
+              `🔄 [EntityWorkflow] Loading audit data for cluster: ${id}`
+            );
+            await loadAuditClusterRichData(id);
           } else {
-            if (!(isLarge && largeClusterConnectionsPage === 0)) {
-              stateActions.setIsAutoAdvanceEnabled(true);
+            // Normal mode logic with enhanced error handling
+            const clusterDetail = getClusterById(id);
+            const connectionCount = clusterDetail
+              ? clusterDetail.groupCount
+              : undefined;
+            const isLarge =
+              connectionCount !== undefined &&
+              connectionCount !== null &&
+              connectionCount > LARGE_CLUSTER_THRESHOLD;
+
+            // Update auto-advance state
+            if (
+              clusterDetail?.wasReviewed ||
+              (!isLarge && getClusterProgress(id).isComplete)
+            ) {
+              stateActions.setIsAutoAdvanceEnabled(false);
+            } else {
+              if (!(isLarge && largeClusterConnectionsPage === 0)) {
+                stateActions.setIsAutoAdvanceEnabled(true);
+              }
             }
-          }
 
-          if (!isLarge) {
-            // ✅ FIXED: Get correct item type for this cluster
-            const correctItemType = getCorrectItemType(id);
+            if (!isLarge) {
+              const correctItemType = getCorrectItemType(id);
+              const vizState = visualizationData[id];
 
-            const vizState = visualizationData[id];
-            if ((!vizState?.data || vizState?.error) && !vizState?.loading) {
-              await loadVisualizationDataForClusters([
-                {
-                  clusterId: id,
-                  itemType: correctItemType, // ✅ FIXED: Use correct item type
-                  limit: CONNECTION_PAGE_SIZE,
-                  crossSystemOnly: workflowFilter === "cross-source-only",
-                },
-              ]);
-            }
-          } else {
-            // ✅ FIXED: For large clusters, use correct item type for node details
-            const correctItemType = getCorrectItemType(id);
+              if ((!vizState?.data || vizState?.error) && !vizState?.loading) {
+                try {
+                  await loadVisualizationDataForClusters([
+                    {
+                      clusterId: id,
+                      itemType: correctItemType,
+                      limit: CONNECTION_PAGE_SIZE,
+                      crossSystemOnly: workflowFilter === "cross-source-only",
+                    },
+                  ]);
+                } catch (vizError) {
+                  console.error(
+                    `❌ [EntityWorkflow] Error loading visualization data for ${id}:`,
+                    vizError
+                  );
+                  toast({
+                    title: "Loading Error",
+                    description:
+                      "Failed to load visualization data for this cluster.",
+                    variant: "destructive",
+                  });
+                }
+              }
+            } else {
+              // Large cluster handling
+              const correctItemType = getCorrectItemType(id);
+              const vizState = visualizationData[id];
 
-            const vizState = visualizationData[id];
-            if (vizState?.data?.nodes) {
-              const nodeIdsFromViz = vizState.data.nodes.map(
-                (node: BaseNode) => ({
-                  id: node.id,
-                  nodeType: correctItemType, // ✅ FIXED: Use correct item type
-                })
-              );
-              await loadBulkNodeDetails(nodeIdsFromViz);
+              if (vizState?.data?.nodes) {
+                try {
+                  const nodeIdsFromViz = vizState.data.nodes.map(
+                    (node: BaseNode) => ({
+                      id: node.id,
+                      nodeType: correctItemType,
+                    })
+                  );
+                  await loadBulkNodeDetails(nodeIdsFromViz);
+                } catch (nodeError) {
+                  console.error(
+                    `❌ [EntityWorkflow] Error loading node details for ${id}:`,
+                    nodeError
+                  );
+                  // Don't show toast for node detail errors as they're not critical
+                }
+              }
             }
           }
         }
+      } catch (error) {
+        console.error(
+          `❌ [EntityWorkflow] Error setting selected cluster ${id}:`,
+          error
+        );
+        toast({
+          title: "Selection Error",
+          description: "Failed to select cluster. Please try again.",
+          variant: "destructive",
+        });
       }
     },
     [
@@ -971,11 +1008,12 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       getClusterById,
       getClusterProgress,
       largeClusterConnectionsPage,
-      getCorrectItemType, // ✅ ADDED: Include the helper function
+      getCorrectItemType,
       visualizationData,
       loadVisualizationDataForClusters,
       workflowFilter,
       loadBulkNodeDetails,
+      toast,
     ]
   );
 
@@ -1057,16 +1095,28 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
   }, [user?.id, selectedOpinion, toast, stateActions]);
 
   const advanceToNextCluster = useCallback(async () => {
-    // Check if in audit mode and handle navigation separately
+    // Handle audit mode navigation
     if (auditMode === "post_processing_audit") {
-      console.log(`🚀 [EntityWorkflow] Advancing to next audit cluster.`);
-      await findNextAuditCluster();
+      console.log("🚀 [EntityWorkflow] Advancing to next audit cluster");
+      try {
+        await findNextAuditCluster();
+      } catch (error) {
+        console.error(
+          "❌ [EntityWorkflow] Error advancing to next audit cluster:",
+          error
+        );
+        toast({
+          title: "Navigation Error",
+          description: "Failed to advance to next audit cluster.",
+          variant: "destructive",
+        });
+      }
       return;
     }
 
-    // --- Original logic for manual review mode ---
+    // Normal mode navigation
     if (!selectedClusterId) {
-      console.warn("🚫 [EntityWorkflow] No cluster selected, cannot advance.");
+      console.warn("🚫 [EntityWorkflow] No cluster selected, cannot advance");
       return;
     }
 
@@ -1074,50 +1124,67 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       `🚀 [EntityWorkflow] Advancing to next cluster from: ${selectedClusterId}`
     );
 
-    const currentIndex = clusters.data.findIndex(
-      (c: EntityCluster) => c.id === selectedClusterId
-    );
-    if (currentIndex === -1) {
-      console.warn(
-        "Current cluster not found in cluster list. Reloading clusters."
+    try {
+      const currentIndex = clusters.data.findIndex(
+        (c: EntityCluster) => c.id === selectedClusterId
       );
-      loadClusterProgress(clusters.page, clusters.limit);
-      return;
-    }
 
-    stateActions.setActivelyPagingClusterId(null);
-    stateActions.setLargeClusterConnectionsPage(0);
-
-    let nextClusterSelected = false;
-
-    for (let i = currentIndex + 1; i < clusters.data.length; i++) {
-      const nextClusterOnPage = clusters.data[i];
-      if (!nextClusterOnPage.wasReviewed) {
-        console.log(
-          `Selecting next unreviewed cluster in current page: ${nextClusterOnPage.id}`
+      if (currentIndex === -1) {
+        console.warn(
+          "⚠️ [EntityWorkflow] Current cluster not found in list - reloading"
         );
-
-        await handleSetSelectedClusterId(nextClusterOnPage.id, false);
-        nextClusterSelected = true;
-        break;
+        await loadClusterProgress(clusters.page, clusters.limit);
+        return;
       }
-    }
 
-    if (!nextClusterSelected) {
-      if (clusters.page < Math.ceil(clusters.total / clusters.limit)) {
-        const nextPageToLoad = clusters.page + 1;
-        console.log(`Loading next page (${nextPageToLoad}) of clusters.`);
+      // Reset paging state
+      stateActions.setActivelyPagingClusterId(null);
+      stateActions.setLargeClusterConnectionsPage(0);
 
-        await loadClusterProgress(nextPageToLoad, clusters.limit);
-      } else {
-        toast({
-          title: "Workflow Complete",
-          description: "All clusters have been reviewed.",
-        });
-        console.log("All clusters reviewed.");
-        stateActions.setIsAutoAdvanceEnabled(false);
-        stateActions.setSelectedClusterId(null);
+      let nextClusterSelected = false;
+
+      // Look for next unreviewed cluster on current page
+      for (let i = currentIndex + 1; i < clusters.data.length; i++) {
+        const nextClusterOnPage = clusters.data[i];
+        if (!nextClusterOnPage.wasReviewed) {
+          console.log(
+            `📍 [EntityWorkflow] Selecting next unreviewed cluster: ${nextClusterOnPage.id}`
+          );
+          await handleSetSelectedClusterId(nextClusterOnPage.id, false);
+          nextClusterSelected = true;
+          break;
+        }
       }
+
+      // If no unreviewed cluster on current page, load next page
+      if (!nextClusterSelected) {
+        if (clusters.page < Math.ceil(clusters.total / clusters.limit)) {
+          const nextPageToLoad = clusters.page + 1;
+          console.log(
+            `📄 [EntityWorkflow] Loading next page: ${nextPageToLoad}`
+          );
+          await loadClusterProgress(nextPageToLoad, clusters.limit);
+        } else {
+          // All clusters reviewed
+          toast({
+            title: "Workflow Complete",
+            description: "All clusters have been reviewed.",
+          });
+          console.log("🎉 [EntityWorkflow] All clusters reviewed");
+          stateActions.setIsAutoAdvanceEnabled(false);
+          stateActions.setSelectedClusterId(null);
+        }
+      }
+    } catch (error) {
+      console.error(
+        "❌ [EntityWorkflow] Error advancing to next cluster:",
+        error
+      );
+      toast({
+        title: "Navigation Error",
+        description: "Failed to advance to next cluster.",
+        variant: "destructive",
+      });
     }
   }, [
     auditMode,
@@ -1259,20 +1326,25 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     async (clusterId: string) => {
       const vizState = visualizationData[clusterId];
       if (!vizState || !vizState.hasMore || state.isLoadingConnectionPageData) {
+        console.log(`🚫 [EntityWorkflow] Cannot load more for cluster ${clusterId}: hasMore=${vizState?.hasMore}, isLoading=${state.isLoadingConnectionPageData}`);
         return;
       }
-
-      console.log(
-        `🔄 [EntityWorkflow] Loading more connections for cluster ${clusterId}`
-      );
-
+  
+      console.log(`🔄 [EntityWorkflow] Loading more connections for cluster ${clusterId}`);
+  
       stateActions.setIsLoadingConnectionPageData(true);
-      stateActions.setLargeClusterConnectionsPage(
-        largeClusterConnectionsPage + 1
-      );
-
+      stateActions.setLargeClusterConnectionsPage(largeClusterConnectionsPage + 1);
+  
       try {
         await dataLoadMore(clusterId);
+        console.log(`✅ [EntityWorkflow] Successfully loaded more connections for ${clusterId}`);
+      } catch (error) {
+        console.error(`❌ [EntityWorkflow] Error loading more connections for ${clusterId}:`, error);
+        toast({
+          title: "Loading Error",
+          description: "Failed to load more connections.",
+          variant: "destructive",
+        });
       } finally {
         stateActions.setIsLoadingConnectionPageData(false);
       }
@@ -1283,6 +1355,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       largeClusterConnectionsPage,
       stateActions,
       dataLoadMore,
+      toast,
     ]
   );
 
@@ -1309,13 +1382,12 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      // ✅ FIXED: Get correct item type for the current cluster
       const correctItemType = getCorrectItemType(selectedClusterId);
-
       console.log(
-        `🚀 [EntityWorkflow] Submitting edge review: ${edgeId} -> ${decision} (audit mode: ${auditMode}, itemType: ${correctItemType})`
+        `🚀 [EntityWorkflow] Submitting edge review: ${edgeId} → ${decision} (itemType: ${correctItemType})`
       );
 
+      // Set optimistic loading state
       setEdgeSubmissionStatus((prev) => ({
         ...prev,
         [edgeId]: { isSubmitting: true, error: null },
@@ -1323,16 +1395,18 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
       const newStatus: BaseLink["status"] =
         decision === "ACCEPTED" ? "CONFIRMED_MATCH" : "CONFIRMED_NON_MATCH";
-      const revertOptimisticUpdate = updateEdgeStatusOptimistically(
-        selectedClusterId,
-        edgeId,
-        newStatus,
-        true
-      );
+
+      let revertOptimisticUpdate: (() => void) | null = null;
 
       try {
-        // This function now only submits the traditional edge review.
-        // The second part of the dual action (bulk marking) is handled in the component.
+        // Apply optimistic update
+        revertOptimisticUpdate = updateEdgeStatusOptimistically(
+          selectedClusterId,
+          edgeId,
+          newStatus,
+          true
+        );
+
         const payload: EdgeReviewApiPayload = {
           decision: decision as "ACCEPTED" | "REJECTED",
           reviewerId: user.id,
@@ -1343,9 +1417,10 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
 
         const response = await postEdgeReview(edgeId, payload, selectedOpinion);
         console.log(
-          `✅ [EntityWorkflow] Traditional edge review submitted: ${edgeId}`
+          `✅ [EntityWorkflow] Edge review submitted successfully: ${edgeId}`
         );
 
+        // Handle dependent services feedback
         if (
           response.dependentServicesDisconnected &&
           response.dependentServicesDisconnected > 0
@@ -1356,6 +1431,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           });
         }
 
+        // Clear submission state
         setEdgeSubmissionStatus((prev) => ({
           ...prev,
           [edgeId]: { isSubmitting: false, error: null },
@@ -1368,36 +1444,66 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           console.log(
             `🎉 [EntityWorkflow] Cluster ${selectedClusterId} finalized`
           );
-          updateClusterCompletionOptimistically(selectedClusterId, true);
 
-          if (auditMode === "post_processing_audit") {
-            // Only reload clusters data for audit mode, not audit decisions
-            await loadClustersWithAuditData({
-              entityType: correctItemType,
-              postProcFilter: postProcessingFilter || undefined,
-              reviewedByHuman: false,
-              page: 1,
-              limit: 20,
-              workflowFilter: workflowFilter || undefined,
+          try {
+            updateClusterCompletionOptimistically(selectedClusterId, true);
+
+            if (auditMode === "post_processing_audit") {
+              await loadClustersWithAuditData({
+                entityType: correctItemType,
+                postProcFilter: postProcessingFilter || undefined,
+                reviewedByHuman: false,
+                page: 1,
+                limit: 20,
+                workflowFilter: workflowFilter || undefined,
+              });
+            }
+
+            if (isAutoAdvanceEnabled) {
+              console.log(
+                "🚀 [EntityWorkflow] Auto-advancing after cluster finalization"
+              );
+              setTimeout(() => {
+                if (auditMode === "post_processing_audit") {
+                  findNextAuditCluster().catch((error) => {
+                    console.error(
+                      "❌ [EntityWorkflow] Error finding next audit cluster:",
+                      error
+                    );
+                  });
+                } else {
+                  advanceToNextCluster().catch((error) => {
+                    console.error(
+                      "❌ [EntityWorkflow] Error advancing to next cluster:",
+                      error
+                    );
+                  });
+                }
+              }, 100);
+            }
+          } catch (finalizationError) {
+            console.error(
+              "❌ [EntityWorkflow] Error during cluster finalization:",
+              finalizationError
+            );
+            toast({
+              title: "Warning",
+              description:
+                "Edge reviewed but there was an issue with cluster finalization.",
+              variant: "destructive",
             });
           }
-
-          if (isAutoAdvanceEnabled) {
-            console.log(
-              `🚀 [EntityWorkflow] Auto-advancing to next cluster after finalization`
-            );
-            setTimeout(() => {
-              if (auditMode === "post_processing_audit") {
-                findNextAuditCluster();
-              } else {
-                advanceToNextCluster();
-              }
-            }, 100);
-          }
         } else {
-          console.log(`🔍 [EntityWorkflow] Looking for next unreviewed edge`);
+          console.log("🔍 [EntityWorkflow] Looking for next unreviewed edge");
           setTimeout(() => {
-            selectNextUnreviewedEdge(edgeId);
+            try {
+              selectNextUnreviewedEdge(edgeId);
+            } catch (error) {
+              console.error(
+                "❌ [EntityWorkflow] Error selecting next edge:",
+                error
+              );
+            }
           }, 100);
         }
       } catch (error) {
@@ -1408,7 +1514,17 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
           error
         );
 
-        revertOptimisticUpdate();
+        // Revert optimistic update on error
+        if (revertOptimisticUpdate) {
+          try {
+            revertOptimisticUpdate();
+          } catch (revertError) {
+            console.error(
+              "❌ [EntityWorkflow] Error reverting optimistic update:",
+              revertError
+            );
+          }
+        }
 
         setEdgeSubmissionStatus((prev) => ({
           ...prev,
@@ -1428,6 +1544,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       selectedOpinion,
       auditMode,
       postProcessingFilter,
+      workflowFilter,
       toast,
       disconnectDependentServicesEnabled,
       stateActions,
@@ -1438,7 +1555,6 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       findNextAuditCluster,
       advanceToNextCluster,
       selectNextUnreviewedEdge,
-      workflowFilter,
       getCorrectItemType,
     ]
   );
