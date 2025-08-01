@@ -137,49 +137,6 @@ async function validateResponse<T>(
   }
 }
 
-// --- Audit Cluster Validation Function ---
-
-/**
- * Validate that audit clusters have actual visualization data (nodes or links).
- * @param clusters - An array of objects, each with a cluster ID and its specific itemType.
- * @param opinionName - The name of the opinion to use for the API call.
- * @returns An object containing arrays of valid and invalid cluster IDs.
- */
-export async function validateAuditClustersHaveData(
-  clusters: { id: string; itemType: ResolutionMode }[],
-  opinionName?: string,
-  signal?: AbortSignal
-): Promise<{ valid: string[]; invalid: string[] }> {
-  if (clusters.length === 0) {
-    return { valid: [], invalid: [] };
-  }
-
-  const context = `validateAuditClustersHaveData`;
-  const url = `${API_BASE_URL}/validate-audit-clusters`;
-
-  const payload = { clusters };
-
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: getApiHeaders(opinionName),
-      body: JSON.stringify(payload),
-      signal,
-    });
-    const data = await validateResponse<{ valid: string[]; invalid: string[] }>(
-      response,
-      context
-    );
-    return data;
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      console.log(`[API_CLIENT] Request aborted: ${context}`);
-      throw error;
-    }
-    return handleApiError(error, context);
-  }
-}
-
 // --- Post-Processing Audit API Functions ---
 
 export async function getPostProcessingAuditData(

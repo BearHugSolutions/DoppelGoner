@@ -50,8 +50,7 @@ import {
   getClusterProgress,
   getPostProcessingAuditData,
   getClustersWithPostProcessingDecisions,
-  bulkMarkPostProcessingReviewed,
-  validateAuditClustersHaveData,
+  bulkMarkPostProcessingReviewed
 } from "@/utils/api-client";
 
 import {
@@ -1477,69 +1476,31 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           }
         }
 
-        const clustersToValidate = response.clusters.map((c) => ({
-          id: c.id,
-          itemType: c.entityType,
-        }));
+        // ✅ FIXED: Remove the hallucinated validation step
+        // Since the backend should already provide valid clusters with audit decisions,
+        // we can trust the response and proceed directly to setting the data
 
-        if (clustersToValidate.length > 0) {
-          const { valid, invalid } = await validateAuditClustersHaveData(
-            clustersToValidate,
-            selectedOpinionRef.current,
-            controller.signal // ✅ Pass signal to validation call too
-          );
+        setClustersWithAuditData({
+          data: response,
+          loading: false,
+          error: null,
+          lastUpdated: Date.now(),
+        });
 
-          if (invalid.length > 0) {
-            console.warn(
-              `[EntityData] ${invalid.length} audit clusters have no visualization data, filtering out`
-            );
-          }
+        console.log(
+          `✅ [EntityData] Loaded clusters with audit data: ${response.clusters.length} clusters`
+        );
 
-          const validClusters = response.clusters.filter((c) =>
-            valid.includes(c.id)
-          );
+        // Pre-load visualization data for first few clusters if they exist
+        if (response.clusters.length > 0) {
+          const clustersToPreload = response.clusters.slice(0, 3).map((c) => ({
+            clusterId: c.id,
+            itemType: c.entityType,
+          }));
 
-          const updatedResponse = {
-            ...response,
-            clusters: validClusters,
-            auditCounts: {
-              ...response.auditCounts,
-              totalUnreviewed: validClusters.reduce(
-                (sum, c) => sum + c.unreviewedDecisionsCount,
-                0
-              ),
-            },
-          };
-
-          setClustersWithAuditData({
-            data: updatedResponse,
-            loading: false,
-            error: null,
-            lastUpdated: Date.now(),
-          });
-
-          console.log(
-            `✅ [EntityData] Filtered clusters with audit data: ${validClusters.length} valid clusters`
-          );
-
-          if (validClusters.length > 0) {
-            const clustersToPreload = validClusters.slice(0, 3).map((c) => ({
-              clusterId: c.id,
-              itemType: c.entityType,
-            }));
-
-            setTimeout(() => {
-              loadVisualizationDataForClusters(clustersToPreload);
-            }, 100);
-          }
-        } else {
-          setClustersWithAuditData({
-            data: response,
-            loading: false,
-            error: null,
-            lastUpdated: Date.now(),
-          });
-          console.log(`✅ [EntityData] No audit clusters to validate.`);
+          setTimeout(() => {
+            loadVisualizationDataForClusters(clustersToPreload);
+          }, 100);
         }
       } catch (error) {
         // ✅ STEP 7: Handle AbortError gracefully
