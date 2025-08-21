@@ -167,6 +167,31 @@ export default function ConnectionReviewTools() {
     );
   }, [selectedClusterId, activelyPagingClusterId, largeClusterConnectionsPage]);
 
+  // Debug: log key state to detect infinite loading or selection issues
+  useEffect(() => {
+    console.log('🔍 [DEBUG] ConnectionReviewTools state:', {
+      selectedClusterId,
+      selectedEdgeId,
+      auditMode,
+      isLoadingUI,
+      isAnyGeneralOperationPending,
+      currentConnectionData: !!currentConnectionData,
+      currentVisualizationData: !!currentVisualizationData,
+      selectedClusterDetails: !!selectedClusterDetails,
+      edgeSelectionInfo
+    });
+  }, [
+    selectedClusterId,
+    selectedEdgeId,
+    auditMode,
+    isLoadingUI,
+    isAnyGeneralOperationPending,
+    currentConnectionData,
+    currentVisualizationData,
+    selectedClusterDetails,
+    edgeSelectionInfo
+  ]);
+
   // Computed values that depend on data
   const isEdgeReviewed = useMemo(() => {
     return selectedEdgeId ? queries.isEdgeReviewed(selectedEdgeId) : false;
@@ -379,6 +404,18 @@ export default function ConnectionReviewTools() {
   const handleNextUnreviewed = useCallback(() => {
     actions.selectNextUnreviewedInCluster();
   }, [actions]);
+
+  // Manual edge selection fallback
+  const handleManualEdgeSelection = useCallback(() => {
+    if (!currentVisualizationData?.links?.length) return;
+    const firstUnreviewedEdge = currentVisualizationData.links.find(
+      (link) => !link.wasReviewed
+    );
+    if (firstUnreviewedEdge) {
+      console.log('🔄 [DEBUG] Manually selecting first unreviewed edge:', firstUnreviewedEdge.id);
+      actions.setSelectedEdgeId(firstUnreviewedEdge.id);
+    }
+  }, [currentVisualizationData, actions]);
 
   // NEW: Handle marking individual audit decisions as reviewed
   const handleSingleMarkReviewed = useCallback(

@@ -771,6 +771,81 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
     return defaultInfo;
   }, [selectedEdgeId, selectedClusterId, visualizationData]);
 
+  // Debug: log edge selection and auto-advance related info
+  useEffect(() => {
+    console.log('🧭 [DEBUG][Workflow] Selection state:', {
+      selectedClusterId,
+      selectedEdgeId,
+      auditMode,
+      isAutoAdvanceEnabled,
+      activelyPagingClusterId,
+      largeClusterConnectionsPage,
+      edgeSelectionInfo,
+    });
+  }, [
+    selectedClusterId,
+    selectedEdgeId,
+    auditMode,
+    isAutoAdvanceEnabled,
+    activelyPagingClusterId,
+    largeClusterConnectionsPage,
+    edgeSelectionInfo,
+  ]);
+
+  // Watchdog: ensure connection data for selected edge gets loaded
+  useEffect(() => {
+    if (!selectedEdgeId) return;
+
+    const stateForEdge = connectionData[selectedEdgeId];
+    const edgePresentInViz = !!currentVisualizationData?.links?.some(
+      (l) => l.id === selectedEdgeId
+    );
+
+    console.log('🔎 [DEBUG][Workflow] Connection data status for selected edge:', {
+      selectedEdgeId,
+      hasState: !!stateForEdge,
+      loading: stateForEdge?.loading ?? false,
+      hasData: !!stateForEdge?.data,
+      error: stateForEdge?.error || null,
+      edgePresentInViz,
+    });
+
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    // Trigger a fallback load if missing and the edge is in the current viz
+    if (!stateForEdge && edgePresentInViz) {
+      const itemType = getCorrectItemType();
+      console.log(
+        `↩️ [DEBUG][Workflow] Fallback loading connection for edge ${selectedEdgeId} (itemType=${itemType})`
+      );
+      loadBulkConnections([{ edgeId: selectedEdgeId, itemType }], false);
+    }
+
+    // Add a timeout to log if still loading after 10s
+    if (stateForEdge?.loading) {
+      timeoutId = setTimeout(() => {
+        const stillLoading = connectionData[selectedEdgeId]?.loading;
+        if (stillLoading) {
+          console.warn(
+            `⏱️ [DEBUG][Workflow] Connection still loading after 10s for edge ${selectedEdgeId}. Consider retrying.`
+          );
+        }
+      }, 10000);
+    }
+
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, [
+    selectedEdgeId,
+    connectionData,
+    currentVisualizationData,
+    auditMode,
+    selectedClusterId,
+    loadBulkConnections,
+    getCorrectItemType,
+  ]);
+
   // ========================================================================
   // Helper Query Functions
   // ========================================================================
@@ -1210,6 +1285,47 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
         vizState?.data?.links.filter((l: BaseLink) => !l.wasReviewed).length ??
         -1;
 
+      // NEW: Detect stuck pagination state: nothing left to review in current page, but hasMore is true and not loading with a cursor present
+      const isPaginationStuck =
+        unreviewedCount === 0 &&
+        !!vizState &&
+        vizState.hasMore === true &&
+        vizState.isLoadingMore === false &&
+        !!vizState.nextCursor;
+
+      if (isPaginationStuck) {
+        console.warn(`🔧 [FAILSAFE] Pagination stuck detected for cluster ${targetClusterId}`);
+        console.warn(`  - Unreviewed count: ${unreviewedCount}`);
+        console.warn(`  - Has more: ${vizState?.hasMore}`);
+        console.warn(`  - Loading more: ${vizState?.isLoadingMore}`);
+        console.warn(
+          `  - Next cursor: ${vizState?.nextCursor ? "present" : "null"}`
+        );
+
+        // Force reset pagination flags so workflow can proceed
+        data.updateVisualizationState(targetClusterId, {
+          hasMore: false,
+          nextCursor: null,
+          isLoadingMore: false,
+        });
+
+        toast({
+          title: "Pagination reset",
+          description:
+            "Detected a stuck pagination state. We reset paging so you can continue.",
+          variant: "default",
+        });
+
+        // Auto-advance if enabled
+        setTimeout(() => {
+          if (isAutoAdvanceEnabled) {
+            void advanceToNextCluster();
+          }
+        }, 100);
+
+        return;
+      }
+
       if (unreviewedCount === 0 && vizState && !vizState.hasMore) {
         console.log(
           `✅ [EntityWorkflow] Cluster ${targetClusterId} is complete.`
@@ -1231,6 +1347,8 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       visualizationData,
       isAutoAdvanceEnabled,
       advanceToNextCluster,
+      data,
+      toast,
     ]
   );
 
@@ -1241,6 +1359,15 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       if (!viz) return;
 
       const unreviewedLinks = viz.links.filter((l: BaseLink) => !l.wasReviewed);
+      console.log('🧭 [DEBUG][Workflow] selectNextUnreviewedEdge()', {
+        selectedClusterId,
+        afterEdgeId: afterEdgeId || null,
+        selectedEdgeId,
+        lastReviewedEdgeId,
+        totalLinks: viz.links.length,
+        unreviewedCount: unreviewedLinks.length,
+        hasMore: visualizationData[selectedClusterId]?.hasMore || false,
+      });
       if (unreviewedLinks.length === 0) {
         // ✨ UPDATED: If no unreviewed links and more can be loaded, don't advance cluster
         if (visualizationData[selectedClusterId]?.hasMore) {
@@ -1249,6 +1376,7 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
             description:
               "No more unreviewed connections in the loaded set. Click 'Load More' to see more.",
           });
+          console.log('ℹ️ [DEBUG][Workflow] No unreviewed links in loaded set; hasMore=true, prompting user to load more.');
         } else {
           checkAndAdvanceIfComplete(selectedClusterId);
         }
@@ -1271,6 +1399,9 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       }
 
       if (nextEdge) {
+        console.log('➡️ [DEBUG][Workflow] Selecting next unreviewed edge:', {
+          chosenEdgeId: nextEdge.id,
+        });
         stateActions.setSelectedEdgeId(nextEdge.id);
       }
     },
@@ -1284,6 +1415,32 @@ export function EntityWorkflowProvider({ children }: { children: ReactNode }) {
       checkAndAdvanceIfComplete,
     ]
   );
+
+  // Verification: ensure selected edge exists in current cluster viz; auto-fix if not
+  useEffect(() => {
+    if (!selectedClusterId) return;
+    const vizLinks = currentVisualizationData?.links || [];
+    if (!selectedEdgeId) return;
+
+    const present = vizLinks.some((l: BaseLink) => l.id === selectedEdgeId);
+    if (!present) {
+      console.warn('🛠️ [DEBUG][Workflow] Selected edge not in current viz; attempting auto-fix', {
+        selectedClusterId,
+        selectedEdgeId,
+        vizLinksCount: vizLinks.length,
+      });
+
+      const unreviewed = vizLinks.filter((l: BaseLink) => !l.wasReviewed);
+      const candidate = unreviewed[0] || vizLinks[0];
+      if (candidate) {
+        console.log('✅ [DEBUG][Workflow] Auto-fixing by selecting edge:', candidate.id);
+        stateActions.setSelectedEdgeId(candidate.id);
+      } else {
+        console.log('⚠️ [DEBUG][Workflow] No edges available in viz; clearing selection');
+        stateActions.setSelectedEdgeId(null);
+      }
+    }
+  }, [selectedClusterId, selectedEdgeId, currentVisualizationData, stateActions]);
 
   const initializeLargeClusterConnectionPaging = useCallback(
     async (clusterId: string) => {

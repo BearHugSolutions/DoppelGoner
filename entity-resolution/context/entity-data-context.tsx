@@ -176,12 +176,20 @@ export interface EntityDataContextType {
   // Cache management
   invalidateVisualizationData: (clusterId: string) => Promise<void>;
   invalidateConnectionData: (edgeId: string) => Promise<void>;
+  // NEW: Reset a single connection state (used for timeout recovery)
+  resetConnectionState: (edgeId: string) => void;
   performThreeClusterCleanup: (force?: boolean) => void;
   clearAllData: () => void;
 
   // 🆕 NEW: AbortController management
   cancelActiveRequests: (pattern?: string) => void;
   cancelAllRequests: () => void;
+
+  // 🆕 NEW: Visualization state updater (partial)
+  updateVisualizationState: (
+    clusterId: string,
+    updates: Partial<VisualizationState>
+  ) => void;
 
   // Optimistic update functions
   updateEdgeStatusOptimistically: (
@@ -581,6 +589,25 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       activeControllersRef.current.delete(requestKey);
     }
   }, []);
+
+  // ========================================================================
+  // NEW: Visualization state partial updater
+  // ========================================================================
+  const updateVisualizationState = useCallback(
+    (clusterId: string, updates: Partial<VisualizationState>) => {
+      setVisualizationData((prev) => {
+        if (!prev[clusterId]) return prev;
+        return {
+          ...prev,
+          [clusterId]: {
+            ...prev[clusterId],
+            ...updates,
+          },
+        };
+      });
+    },
+    []
+  );
 
   /**
    * Cleanup completed/aborted controllers
@@ -1036,8 +1063,138 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       removeActiveRequest,
       createControllerForRequest,
       cleanupCompletedControllers,
+      visualizationData,
     ]
   );
+
+  // Allow consumers to reset a single edge's connection state (for stuck/infinite loads)
+  const resetConnectionState = useCallback((edgeId: string) => {
+    try {
+      // Cancel any in-flight requests that target this edge (prefix-based)
+      cancelActiveRequests(`connections-${edgeId}`);
+    } catch (e) {
+      console.warn(`[EntityData] resetConnectionState: cancel error for ${edgeId}`, e);
+    }
+
+    setConnectionData(
+      produce((draft) => {
+        if (!draft[edgeId]) {
+          // Initialize a clean slot if missing
+          draft[edgeId] = {
+            data: null,
+            loading: false,
+            error: null,
+            lastUpdated: null,
+          };
+          return;
+        }
+        draft[edgeId].data = null;
+        draft[edgeId].loading = false;
+        draft[edgeId].error = null;
+        draft[edgeId].lastUpdated = null;
+      })
+    );
+  }, [cancelActiveRequests, setConnectionData]);
+
+  // Paginate additional pages for the last bulk connections request
+  const loadMoreBulkConnections = useCallback(async () => {
+    const opinion = selectedOpinionRef.current;
+    if (!opinion) return;
+
+    const {
+      nextCursor,
+      isLoading,
+      isLoadingMore,
+      requestedEdgeIds,
+      crossSystemOnly,
+    } = bulkConnectionData;
+
+    if (!nextCursor || isLoading || isLoadingMore || requestedEdgeIds.length === 0) {
+      return;
+    }
+
+    setBulkConnectionData(
+      produce((draft) => {
+        draft.isLoadingMore = true;
+        draft.error = null;
+      })
+    );
+
+    const items: BulkConnectionRequestItem[] = requestedEdgeIds.map((id) => ({
+      edgeId: id,
+      itemType: resolutionModeRef.current,
+    }));
+
+    const request: BulkConnectionsRequest = {
+      items,
+      limit: CONNECTION_PAGE_SIZE,
+      cursor: nextCursor,
+      crossSystemOnly,
+    };
+
+    const requestKey = generateRequestKey(
+      "bulk-conn-page",
+      { cursor: nextCursor, size: items.length },
+      opinion
+    );
+
+    if (isRequestInProgress(requestKey)) return;
+
+    const controller = createControllerForRequest(requestKey);
+    addActiveRequest(requestKey);
+
+    try {
+      const response = await getBulkConnections(request, opinion, controller.signal);
+
+      // Update per-edge cache with any newly returned connections
+      setConnectionData(
+        produce((draft) => {
+          response.connections.forEach((conn) => {
+            draft[conn.edge.id] = {
+              data: conn,
+              loading: false,
+              error: null,
+              lastUpdated: Date.now(),
+            };
+          });
+        })
+      );
+
+      // Update bulk slice pagination state
+      setBulkConnectionData(
+        produce((draft) => {
+          draft.isLoadingMore = false;
+          draft.hasMore = response.hasMore;
+          draft.nextCursor = response.nextCursor;
+          response.connections.forEach((conn) => {
+            draft.connections[conn.edge.id] = conn;
+          });
+        })
+      );
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        console.log(`🛑 [EntityData] Load more bulk connections aborted: ${requestKey}`);
+        return;
+      }
+      console.error("❌ [EntityData] Failed to load more bulk connections:", error);
+      setBulkConnectionData(
+        produce((draft) => {
+          draft.isLoadingMore = false;
+          draft.error = (error as Error).message;
+        })
+      );
+    } finally {
+      removeActiveRequest(requestKey);
+      cleanupCompletedControllers();
+    }
+  }, [
+    bulkConnectionData,
+    isRequestInProgress,
+    addActiveRequest,
+    removeActiveRequest,
+    createControllerForRequest,
+    cleanupCompletedControllers,
+  ]);
 
   const loadBulkNodeDetails = useCallback(
     async (nodesToFetch: NodeIdentifier[]) => {
@@ -1046,6 +1203,28 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
           "🚫 [EntityData] No opinion selected, skipping node details fetch"
         );
         return;
+      }
+
+      // NEW: Check for excessive pending requests and perform emergency cleanup
+      if (pendingNodeFetches.size > 500) {
+        console.warn(
+          `🔧 [RequestCleanup] Too many pending node fetches (${pendingNodeFetches.size}), performing emergency cleanup`
+        );
+        // Cancel all node-details requests
+        cancelActiveRequests("node-details");
+        // Clear pending state
+        setPendingNodeFetches(new Set());
+        // Reset loading states for nodes stuck in loading
+        setNodeDetails((prev) => {
+          const cleaned = { ...prev } as typeof prev;
+          Object.keys(cleaned).forEach((nodeId) => {
+            if (cleaned[nodeId] === "loading") {
+              delete cleaned[nodeId];
+            }
+          });
+          return cleaned;
+        });
+        console.log("🧹 [RequestCleanup] Emergency node-details cleanup completed");
       }
 
       const caller =
@@ -1060,6 +1239,23 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         console.log("🚫 [EntityData] No nodes to fetch, early return");
         return;
       }
+
+      // NEW: Auto-cleanup completed pending fetches before processing
+      setPendingNodeFetches((prev) => {
+        const stillPending = new Set<string>();
+        prev.forEach((nodeId) => {
+          const state = nodeDetails[nodeId];
+          if (state === "loading") {
+            stillPending.add(nodeId);
+          }
+        });
+        if (stillPending.size < prev.size) {
+          console.log(
+            `🧹 [RequestCleanup] Cleaned ${prev.size - stillPending.size} completed node fetches`
+          );
+        }
+        return stillPending;
+      });
 
       // 🆕 NEW: Generate request key and check for duplicates
       const requestKey = generateNodeDetailsKey(
@@ -1837,7 +2033,6 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      // ✅ FIX: Validate that items array is not empty
       if (!items || items.length === 0) {
         console.warn(
           "[EntityData] No items provided for bulk connection fetch"
@@ -1845,35 +2040,18 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      // 🆕 NEW: Generate request key and check for duplicates
-      const requestKey = generateConnectionKey(items, crossSystemOnly, opinion);
+      console.log("[EntityData] Loading bulk connections:", {
+        requestedEdges: items.map((i) => ({ edgeId: i.edgeId, itemType: i.itemType })),
+        opinion,
+        crossSystemOnly,
+      });
 
-      if (isRequestInProgress(requestKey)) {
-        console.log(
-          `[EntityData] Duplicate bulk connection request in progress, skipping: ${requestKey}`
-        );
-        return;
-      }
+      const requestItems = items;
 
-      // ✅ STEP 6: Create AbortController for this request
-      const controller = createControllerForRequest(requestKey);
-
-      addActiveRequest(requestKey);
-
-      // ✅ FIX: Log the items being requested for debugging
-      console.log(
-        `[EntityData] Requesting bulk connections for ${items.length} items:`,
-        {
-          items: items.slice(0, 3), // Log first 3 items
-          crossSystemOnly,
-          opinion,
-        }
-      );
-
-      // Set loading state for the individual connections
+      // Mark all requested edges as loading
       setConnectionData(
         produce((draft) => {
-          items.forEach((item) => {
+          requestItems.forEach((item) => {
             draft[item.edgeId] = {
               data: null,
               loading: true,
@@ -1884,131 +2062,160 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         })
       );
 
+      // Initialize bulk slice
       setBulkConnectionData(
         produce((draft) => {
           draft.isLoading = true;
           draft.error = null;
           draft.crossSystemOnly = crossSystemOnly;
-          draft.requestedEdgeIds = items.map((i) => i.edgeId);
+          draft.requestedEdgeIds = requestItems.map((i) => i.edgeId);
         })
       );
 
-      try {
-        // ✅ FIX: Ensure request payload matches backend expectations
+      // Process in small batches
+      const BATCH_SIZE = requestItems.length > 50 ? 20 : 50;
+      for (let i = 0; i < requestItems.length; i += BATCH_SIZE) {
+        const batch = requestItems.slice(i, i + BATCH_SIZE);
+        const requestKey = generateConnectionKey(batch, crossSystemOnly, opinion);
+        if (isRequestInProgress(requestKey)) {
+          console.log(
+            `[EntityData] Duplicate batch request in progress, skipping: ${requestKey}`
+          );
+          continue;
+        }
+
+        const controller = createControllerForRequest(requestKey);
+        addActiveRequest(requestKey);
+
         const request: BulkConnectionsRequest = {
-          items: items.map((item) => ({
-            edgeId: item.edgeId,
-            itemType: item.itemType,
-          })),
+          items: batch.map((item) => ({ edgeId: item.edgeId, itemType: item.itemType })),
           limit: CONNECTION_PAGE_SIZE,
-          cursor: undefined, // Start without cursor for initial request
+          cursor: undefined,
           crossSystemOnly,
         };
 
-        console.log(`[EntityData] Sending bulk connections request:`, request);
-
-        // ✅ STEP 6: Pass controller.signal to the API call
-        const response = await getBulkConnections(
-          request,
-          opinion,
-          controller.signal // ✅ Now actually using the signal
-        );
-
-        console.log(`[EntityData] Received bulk connections response:`, {
-          connectionsCount: response.connections.length,
-          hasMore: response.hasMore,
-          nextCursor: response.nextCursor ? "present" : "null",
-          requestedItems: items.length,
-        });
-
-        // ✅ FIX: Handle case where no connections are returned
-        if (response.connections.length === 0) {
-          console.warn(`[EntityData] No connections returned for ${items.length} requested items. This could indicate:
-            1. The edges don't exist in the database
-            2. The edges are filtered out by crossSystemOnly=${crossSystemOnly}
-            3. There's a data consistency issue`);
-        }
-
-        // Populate the main `connectionData` state
-        setConnectionData(
-          produce((draft) => {
-            const returnedEdgeIds = new Set(
-              response.connections.map((c) => c.edge.id)
-            );
-
-            // Set data for successful responses
-            response.connections.forEach((conn) => {
-              draft[conn.edge.id] = {
-                data: conn,
-                loading: false,
-                error: null,
-                lastUpdated: Date.now(),
-              };
-            });
-
-            // Set error for items that were requested but not returned
-            items.forEach((item) => {
-              if (!returnedEdgeIds.has(item.edgeId)) {
-                if (draft[item.edgeId]) {
-                  draft[item.edgeId].loading = false;
-                  draft[item.edgeId].error =
-                    "Connection data not found in API response. Edge may not exist or may be filtered out.";
-                }
-              }
-            });
-          })
-        );
-
-        setBulkConnectionData(
-          produce((draft) => {
-            draft.isLoading = false;
-            draft.hasMore = response.hasMore;
-            draft.nextCursor = response.nextCursor;
-            draft.connections = {};
-            response.connections.forEach((conn) => {
-              draft.connections[conn.edge.id] = conn;
-            });
-          })
-        );
-      } catch (error) {
-        // ✅ STEP 6: Handle AbortError gracefully
-        if (error instanceof Error && error.name === "AbortError") {
-          console.log(
-            `🛑 [EntityData] Bulk connections request aborted: ${requestKey}`
+        // Batch timeout watchdog (10s)
+        const timeoutId = setTimeout(() => {
+          console.warn(
+            `⏱️ [EntityData] Bulk connections batch timed out after 10s: ${requestKey}`
           );
-          return;
+          setConnectionData(
+            produce((draft) => {
+              batch.forEach((item) => {
+                const state = draft[item.edgeId];
+                if (state && state.loading) {
+                  state.loading = false;
+                  state.error =
+                    state.error ||
+                    "Connection request timed out. Please retry or navigate to another edge.";
+                }
+              });
+            })
+          );
+          setBulkConnectionData(
+            produce((draft) => {
+              draft.isLoading = false;
+              draft.isLoadingMore = false;
+              draft.error =
+                draft.error ||
+                "Bulk connections request timed out. Some edges may not have loaded.";
+            })
+          );
+        }, 10000);
+
+        try {
+          const response = await getBulkConnections(
+            request,
+            opinion,
+            controller.signal
+          );
+
+          // Update per-edge data
+          setConnectionData(
+            produce((draft) => {
+              const returnedEdgeIds = new Set(
+                response.connections.map((c) => c.edge.id)
+              );
+
+              response.connections.forEach((conn) => {
+                draft[conn.edge.id] = {
+                  data: conn,
+                  loading: false,
+                  error: null,
+                  lastUpdated: Date.now(),
+                };
+              });
+
+              batch.forEach((item) => {
+                if (!returnedEdgeIds.has(item.edgeId)) {
+                  if (draft[item.edgeId]) {
+                    draft[item.edgeId].loading = false;
+                    draft[item.edgeId].error =
+                      "Connection data not found in API response. Edge may not exist or may be filtered out.";
+                  }
+                }
+              });
+            })
+          );
+
+          // Update bulk slice best-effort
+          setBulkConnectionData(
+            produce((draft) => {
+              draft.isLoading = false;
+              draft.hasMore = response.hasMore;
+              draft.nextCursor = response.nextCursor;
+              response.connections.forEach((conn) => {
+                draft.connections[conn.edge.id] = conn;
+              });
+            })
+          );
+        } catch (error) {
+          if (error instanceof Error && error.name === "AbortError") {
+            console.log(
+              `🛑 [EntityData] Bulk connections batch aborted: ${requestKey}`
+            );
+          } else {
+            const errorMessage = (error as Error).message;
+            console.error(
+              "❌ [EntityData] Failed to load bulk connections batch:",
+              error
+            );
+            setConnectionData(
+              produce((draft) => {
+                batch.forEach((item) => {
+                  if (draft[item.edgeId]) {
+                    draft[item.edgeId].loading = false;
+                    draft[item.edgeId].error = errorMessage;
+                  }
+                });
+              })
+            );
+            setBulkConnectionData(
+              produce((draft) => {
+                draft.isLoading = false;
+                draft.error = errorMessage;
+              })
+            );
+          }
+        } finally {
+          clearTimeout(timeoutId);
+          removeActiveRequest(requestKey);
+          cleanupCompletedControllers();
         }
 
-        const errorMessage = (error as Error).message;
-        console.error(
-          "❌ [EntityData] Failed to load bulk connections:",
-          error
-        );
-
-        // Set error state for the individual connections
-        setConnectionData(
-          produce((draft) => {
-            items.forEach((item) => {
-              if (draft[item.edgeId]) {
-                draft[item.edgeId].loading = false;
-                draft[item.edgeId].error = errorMessage;
-              }
-            });
-          })
-        );
-
-        setBulkConnectionData(
-          produce((draft) => {
-            draft.isLoading = false;
-            draft.error = errorMessage;
-          })
-        );
-      } finally {
-        removeActiveRequest(requestKey);
-        cleanupCompletedControllers();
+        // Delay between batches to reduce pressure
+        if (i + BATCH_SIZE < requestItems.length) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
       }
-    },
-    [
+
+      // Finalize bulk slice loading flag
+      setBulkConnectionData(
+        produce((draft) => {
+          draft.isLoading = false;
+        })
+      );
+    }, [
       isRequestInProgress,
       addActiveRequest,
       removeActiveRequest,
@@ -2016,95 +2223,6 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
       cleanupCompletedControllers,
     ]
   );
-
-  const loadMoreBulkConnections = useCallback(async () => {
-    const {
-      nextCursor,
-      requestedEdgeIds,
-      crossSystemOnly,
-      isLoading,
-      isLoadingMore,
-    } = bulkConnectionData;
-
-    if (!nextCursor || isLoading || isLoadingMore) return;
-
-    setBulkConnectionData(
-      produce((draft) => {
-        draft.isLoadingMore = true;
-      })
-    );
-
-    const request: BulkConnectionsRequest = {
-      items: requestedEdgeIds.map((id) => ({
-        edgeId: id,
-        itemType: resolutionModeRef.current,
-      })),
-      limit: CONNECTION_PAGE_SIZE,
-      cursor: nextCursor ?? undefined,
-      crossSystemOnly,
-    };
-
-    // ✅ STEP 6: Generate request key and create controller
-    const requestKey = generateRequestKey(
-      "bulk-conn-page",
-      { cursor: nextCursor },
-      selectedOpinionRef.current || undefined
-    );
-
-    if (isRequestInProgress(requestKey)) return;
-
-    const controller = createControllerForRequest(requestKey);
-    addActiveRequest(requestKey);
-
-    try {
-      // ✅ STEP 6: Pass controller.signal to the API call
-      const response = await getBulkConnections(
-        request,
-        selectedOpinionRef.current || undefined,
-        controller.signal // ✅ Now actually using the signal
-      );
-
-      setBulkConnectionData(
-        produce((draft) => {
-          draft.isLoadingMore = false;
-          draft.hasMore = response.hasMore;
-          draft.nextCursor = response.nextCursor;
-          response.connections.forEach((conn) => {
-            draft.connections[conn.edge.id] = conn;
-          });
-        })
-      );
-    } catch (error) {
-      // ✅ STEP 6: Handle AbortError gracefully
-      if (error instanceof Error && error.name === "AbortError") {
-        console.log(
-          `🛑 [EntityData] Load more connections request aborted: ${requestKey}`
-        );
-        return;
-      }
-
-      console.error(
-        "❌ [EntityData] Failed to load more bulk connections:",
-        error
-      );
-      setBulkConnectionData(
-        produce((draft) => {
-          draft.isLoadingMore = false;
-          draft.error = (error as Error).message;
-        })
-      );
-    } finally {
-      removeActiveRequest(requestKey);
-      cleanupCompletedControllers();
-    }
-  }, [
-    bulkConnectionData,
-    isRequestInProgress,
-    addActiveRequest,
-    removeActiveRequest,
-    createControllerForRequest,
-    cleanupCompletedControllers,
-  ]);
 
   const loadSingleConnectionData = useCallback(
     async (edgeId: string): Promise<EntityConnectionDataResponse | null> => {
@@ -2936,6 +3054,17 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
         return;
       }
 
+      // Preserve pagination state for active cluster before cleanup
+      const activePaginationState =
+        selectedClusterId && visualizationData[selectedClusterId]
+          ? {
+              hasMore: visualizationData[selectedClusterId].hasMore,
+              nextCursor: visualizationData[selectedClusterId].nextCursor,
+              isLoadingMore: visualizationData[selectedClusterId].isLoadingMore,
+              lastUpdated: visualizationData[selectedClusterId].lastUpdated,
+            }
+          : null;
+
       if (cleanupTimeoutRef.current) {
         clearTimeout(cleanupTimeoutRef.current);
         cleanupTimeoutRef.current = null;
@@ -3008,6 +3137,23 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
             clustersToKeep.has(clusterId)
           )
         );
+        // Restore pagination state for active cluster, if present
+        if (
+          selectedClusterId &&
+          activePaginationState &&
+          cleaned[selectedClusterId]
+        ) {
+          console.log(
+            `🔧 [EntityData] Restoring pagination state for active cluster ${selectedClusterId}`
+          );
+          cleaned[selectedClusterId] = {
+            ...cleaned[selectedClusterId],
+            hasMore: activePaginationState.hasMore,
+            nextCursor: activePaginationState.nextCursor,
+            isLoadingMore: activePaginationState.isLoadingMore,
+            lastUpdated: activePaginationState.lastUpdated,
+          };
+        }
         return cleaned;
       });
 
@@ -3339,6 +3485,28 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     };
   }, [cleanupCompletedControllers]);
 
+  // Periodic cleanup of pending node fetches to prevent accumulation
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPendingNodeFetches((prev) => {
+        const stillPending = new Set<string>();
+        prev.forEach((nodeId) => {
+          const state = nodeDetails[nodeId];
+          if (state === "loading") {
+            stillPending.add(nodeId);
+          }
+        });
+        if (stillPending.size !== prev.size) {
+          console.log(
+            `🧹 [RequestCleanup] Periodic cleanup removed ${prev.size - stillPending.size} completed node fetches`
+          );
+        }
+        return stillPending;
+      });
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [nodeDetails]);
+
   // ========================================================================
   // Context Value Assembly
   // ========================================================================
@@ -3364,8 +3532,10 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     loadMoreConnectionsForCluster, // NEW: Pagination
     loadBulkConnections,
     loadMoreBulkConnections,
+    // Note: paginated bulk connections are loaded via loadMoreConnectionsForCluster
     loadBulkNodeDetails,
     loadSingleConnectionData,
+    resetConnectionState,
 
     // Audit loading functions
     loadPostProcessingAuditData,
@@ -3381,6 +3551,8 @@ export function EntityDataProvider({ children }: { children: ReactNode }) {
     // 🆕 NEW: AbortController management
     cancelActiveRequests,
     cancelAllRequests,
+
+    updateVisualizationState,
 
     // Optimistic update functions
     updateEdgeStatusOptimistically,
